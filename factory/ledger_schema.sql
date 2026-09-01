@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS factory_schema_meta (
   schema_version INTEGER NOT NULL
 );
 INSERT OR REPLACE INTO factory_schema_meta(schema_name, schema_version)
-VALUES ('factory-ledger', 2);
+VALUES ('factory-ledger', 3);
 
 CREATE TABLE IF NOT EXISTS factory_runs (
   dispatch_id TEXT PRIMARY KEY,
@@ -55,6 +55,15 @@ CREATE TABLE IF NOT EXISTS factory_ingress_events (
 
 CREATE INDEX IF NOT EXISTS factory_ingress_pending_idx
   ON factory_ingress_events(handoff_state);
+
+CREATE TABLE IF NOT EXISTS factory_leases (
+  lease_key TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  dispatch_id TEXT NOT NULL,
+  fence INTEGER NOT NULL,
+  acquired_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS factory_events (
   event_id TEXT PRIMARY KEY,

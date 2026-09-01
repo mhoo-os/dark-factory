@@ -11,7 +11,7 @@ from factory.dispatch_contract import DispatchContract
 from factory.state_contract import TERMINAL_STATES, decide_transition
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA = Path(__file__).with_name("ledger_schema.sql").read_text()
 
 
