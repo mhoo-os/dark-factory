@@ -1,0 +1,9 @@
+# Runtime state and credentials
+.factory/STOP
+.factory/locks-runtime/
+.factory/runs/
+.factory/needs-human.md
+factory-orchestrator.log
+.env
+secrets.json
+credentials.json
