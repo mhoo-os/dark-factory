@@ -21,13 +21,15 @@ install() {
     echo "REFUSING: store the Linear credential first with bash factory/store-linear-key.sh" >&2
     exit 78
   }
-  { crontab -l 2>/dev/null || true; } | grep -vF "$TASK_NAME" | crontab -
-  { crontab -l 2>/dev/null || true; printf '%s\n' "$CRON_LINE"; } | crontab -
+  existing_crontab="$(crontab -l 2>/dev/null || true)"
+  filtered_crontab="$(printf '%s\n' "$existing_crontab" | grep -vF "$TASK_NAME" || true)"
+  printf '%s\n%s\n' "$filtered_crontab" "$CRON_LINE" | crontab -
   echo "ARMED: every 30 minutes; log: $LOGFILE"
 }
 
 remove() {
-  { crontab -l 2>/dev/null || true; } | grep -vF "$TASK_NAME" | crontab -
+  existing_crontab="$(crontab -l 2>/dev/null || true)"
+  printf '%s\n' "$existing_crontab" | grep -vF "$TASK_NAME" | crontab - || true
   echo "DISARMED: $TASK_NAME"
 }
 
