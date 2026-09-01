@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Fail-closed Linear-to-GitHub triage for one Mhoo Dark Factory candidate."""
+"""Fail-closed Linear-to-GitHub intake for one active Mhoo Dark Factory item."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import urllib.error
@@ -82,30 +81,16 @@ def remote_stop_requested() -> None:
         raise TriageError("remote factory:stop is present")
 
 
-def extract(description: str, field: str) -> str:
-    pattern = rf"(?im)^\s*[-*]\s*{re.escape(field)}\s*:\s*`?([^`\n]+?)`?\s*$"
-    match = re.search(pattern, description or "")
-    if not match:
-        raise TriageError(f"candidate has no {field}")
-    return match.group(1).strip()
-
-
 def candidate_from(issue: dict[str, Any]) -> Candidate:
     labels = tuple(label["name"] for label in issue["labels"]["nodes"])
-    if not {"Candidate", "Queued"}.issubset(labels):
-        raise TriageError("candidate lacks Candidate and Queued labels")
-    if issue["state"]["name"] != "Todo" or issue["state"]["type"] != "unstarted":
-        raise TriageError("candidate is not in Todo")
-    candidate_key = extract(issue.get("description") or "", "Candidate key")
-    repository = extract(issue.get("description") or "", "Repository target")
-    if not re.fullmatch(r"mhoo-os/[A-Za-z0-9_.-]+", repository):
-        raise TriageError("repository target must be an explicit mhoo-os/<repository>")
+    if issue["state"]["type"] != "started":
+        raise TriageError("candidate is not active")
     return Candidate(
         id=issue["id"], identifier=issue["identifier"], title=issue["title"],
         description=issue.get("description") or "", url=issue["url"],
         priority=issue.get("priority") or 3, state_id=issue["state"]["id"],
-        state_name=issue["state"]["name"], labels=labels, candidate_key=candidate_key,
-        repository=repository,
+        state_name=issue["state"]["name"], labels=labels,
+        candidate_key=issue["identifier"], repository=f"{ORG}/dark-factory",
     )
 
 
@@ -116,10 +101,10 @@ def marker(candidate: Candidate) -> str:
 def issue_body(candidate: Candidate) -> str:
     return "\n".join((
         marker(candidate), "", "## Factory execution intake", "",
-        f"- Linear candidate: [{candidate.identifier}]({candidate.url})",
-        f"- Candidate key: `{candidate.candidate_key}`",
+        f"- Linear issue: [{candidate.identifier}]({candidate.url})",
         f"- Intake key: `{candidate.bridge_key}`", "",
-        "Linear remains the operational queue. This issue is an execution intake only.",
+        "Linear remains the operational queue. This issue is an execution intake only.", "",
+        "## Linear description", "", candidate.description or "_No description provided._",
     ))
 
 
@@ -139,26 +124,17 @@ def create_issue(candidate: Candidate) -> str:
     ).strip()
 
 
-def in_progress_state_id() -> str:
-    query = "query($teamId: ID!) { workflowStates(filter: { team: { id: { eq: $teamId } } }) { nodes { id name type } } }"
-    states = graphql(query, {"teamId": TEAM_ID})["workflowStates"]["nodes"]
-    matches = [state["id"] for state in states if state["name"] == "In Progress" and state["type"] == "started"]
-    if len(matches) != 1:
-        raise TriageError("MHOO In Progress state is not uniquely available")
-    return matches[0]
-
-
 def update_linear(candidate: Candidate, github_url: str) -> None:
-    mutation = "mutation($issueId: String!, $stateId: String!, $body: String!) { issueUpdate(id: $issueId, input: { stateId: $stateId }) { success } commentCreate(input: { issueId: $issueId, body: $body }) { success } }"
+    mutation = "mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }"
     body = f"Factory intake created one GitHub execution issue: {github_url}\n\nIntake key: `{candidate.bridge_key}`"
-    data = graphql(mutation, {"issueId": candidate.id, "stateId": in_progress_state_id(), "body": body})
-    if not data["issueUpdate"]["success"] or not data["commentCreate"]["success"]:
+    data = graphql(mutation, {"issueId": candidate.id, "body": body})
+    if not data["commentCreate"]["success"]:
         raise TriageError("Linear did not confirm the intake return")
 
 
 def eligible_issues() -> list[dict[str, Any]]:
     query = """query($teamId: ID!) {
-      issues(first: 50, filter: { team: { id: { eq: $teamId } }, state: { type: { eq: \"unstarted\" } } }) {
+      issues(first: 50, filter: { team: { id: { eq: $teamId } }, state: { type: { eq: \"started\" } } }) {
         nodes { id identifier title description url priority state { id name type } labels { nodes { name } } }
       }
     }"""
@@ -176,6 +152,21 @@ def select(issues: list[dict[str, Any]]) -> Candidate | None:
     return candidates[0] if candidates else None
 
 
+def pending_candidate(issues: list[dict[str, Any]]) -> tuple[Candidate, str | None] | None:
+    candidates: list[Candidate] = []
+    for issue in issues:
+        try:
+            candidates.append(candidate_from(issue))
+        except TriageError:
+            continue
+    candidates.sort(key=lambda item: (item.priority, item.identifier))
+    for candidate in candidates:
+        existing = existing_issue(candidate)
+        if existing is None:
+            return candidate, None
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
@@ -186,16 +177,16 @@ def main() -> int:
             raise TriageError("local .factory/STOP is present")
         remote_stop_requested()
         issues = json.loads(args.fixture.read_text()) if args.fixture else eligible_issues()
-        candidate = select(issues)
-        if candidate is None:
-            print(json.dumps({"action": "noop", "reason": "no eligible Linear candidate"}))
+        selected = pending_candidate(issues)
+        if selected is None:
+            print(json.dumps({"action": "noop", "reason": "no active Linear intake pending"}))
             return 0
-        existing = existing_issue(candidate)
+        candidate, existing = selected
         plan = {"candidate": candidate.identifier, "repository": candidate.repository, "github_execution_issue": existing, "action": "unchanged" if existing else "create"}
         if args.dry_run:
             print(json.dumps(plan, sort_keys=True))
             return 0
-        github_url = existing or create_issue(candidate)
+        github_url = create_issue(candidate)
         update_linear(candidate, github_url)
         print(json.dumps({**plan, "github_execution_issue": github_url}, sort_keys=True))
         return 0

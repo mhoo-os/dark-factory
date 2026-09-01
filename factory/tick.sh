@@ -17,4 +17,5 @@ LINEAR_API_KEY="$(security find-generic-password -a "${USER:?USER must be set}" 
 export LINEAR_API_KEY
 trap 'unset LINEAR_API_KEY' EXIT
 
-exec python3 factory/linear_triage.py "$@"
+python3 factory/linear_triage.py "$@"
+bash factory/orchestrator.sh "$@"

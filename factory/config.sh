@@ -96,7 +96,7 @@ FACTORY_BACKEND="${FACTORY_BACKEND:-}"
 # The SHIPPED value is still 0, deliberately. A fresh clone must not auto-merge before a
 # single lap has been proven by hand, and `factory_doctor` refuses 3 while there is no
 # holdout, so the dial cannot outrun the evidence. Raise it here once it has.
-FACTORY_AUTONOMY="${FACTORY_AUTONOMY:-0}"
+FACTORY_AUTONOMY="${FACTORY_AUTONOMY:-4}"
 
 FACTORY_MAX_PARALLEL="${FACTORY_MAX_PARALLEL:-1}"
 FACTORY_MAX_FIX_ATTEMPTS="${FACTORY_MAX_FIX_ATTEMPTS:-2}"
