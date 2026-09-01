@@ -7,3 +7,5 @@ factory-orchestrator.log
 .env
 secrets.json
 credentials.json
+__pycache__/
+*.py[cod]
