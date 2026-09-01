@@ -14,8 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from factory.admission import AdmissionDecision, admit_linear_issue
+
 ROOT = Path(__file__).resolve().parents[1]
 TEAM_ID = os.environ.get("LINEAR_FACTORY_TEAM_ID", "085d25a0-104f-4e80-82fb-b0ea7c476b0b")
+PROJECT_ID = os.environ.get("LINEAR_FACTORY_PROJECT_ID", "2dab9206-cb92-49a4-aeef-95ec45280098")
 ORG = "mhoo-os"
 MARKER = "mhoo-dark-factory:v1"
 
@@ -37,10 +40,12 @@ class Candidate:
     labels: tuple[str, ...]
     candidate_key: str
     repository: str
+    dispatch_id: str
+    contract_digest: str
 
     @property
     def bridge_key(self) -> str:
-        return hashlib.sha256(f"{self.id}\0{self.candidate_key}".encode()).hexdigest()
+        return hashlib.sha256(f"{self.id}\0{self.dispatch_id}\0{self.contract_digest}".encode()).hexdigest()
 
 
 def graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
@@ -70,27 +75,37 @@ def gh(*args: str, stdin: str | None = None) -> str:
     return completed.stdout
 
 
-def remote_stop_requested() -> None:
-    result = subprocess.run(
-        ["gh", "issue", "list", "--repo", f"{ORG}/dark-factory", "--state", "open", "--label", "factory:stop", "--limit", "1", "--json", "number"],
-        cwd=ROOT, text=True, capture_output=True,
-    )
-    if result.returncode:
-        raise TriageError("remote stop state is unreadable")
-    if json.loads(result.stdout):
-        raise TriageError("remote factory:stop is present")
+def remote_stop_requested(repositories: set[str]) -> None:
+    for repository in sorted(repositories):
+        result = subprocess.run(
+            ["gh", "issue", "list", "--repo", repository, "--state", "open", "--label", "factory:stop", "--limit", "1", "--json", "number"],
+            cwd=ROOT, text=True, capture_output=True,
+        )
+        if result.returncode:
+            raise TriageError("remote stop state is unreadable")
+        if json.loads(result.stdout):
+            raise TriageError(f"remote factory:stop is present for {repository}")
+
+
+def admission_for(issue: dict[str, Any]) -> AdmissionDecision:
+    return admit_linear_issue(issue, expected_project_id=PROJECT_ID)
 
 
 def candidate_from(issue: dict[str, Any]) -> Candidate:
+    admission = admission_for(issue)
+    if admission.outcome != "admitted" or admission.contract is None:
+        reasons = ",".join(admission.reasons) or admission.outcome
+        raise TriageError(f"admission_{admission.outcome}:{reasons}")
+    document = admission.contract.to_dict()
+    target = document["target"]
     labels = tuple(label["name"] for label in issue["labels"]["nodes"])
-    if issue["state"]["type"] != "started":
-        raise TriageError("candidate is not active")
     return Candidate(
         id=issue["id"], identifier=issue["identifier"], title=issue["title"],
         description=issue.get("description") or "", url=issue["url"],
         priority=issue.get("priority") or 3, state_id=issue["state"]["id"],
         state_name=issue["state"]["name"], labels=labels,
-        candidate_key=issue["identifier"], repository=f"{ORG}/dark-factory",
+        candidate_key=admission.contract.dispatch_id, repository=target["repository"],
+        dispatch_id=admission.contract.dispatch_id, contract_digest=admission.contract.digest,
     )
 
 
@@ -103,6 +118,8 @@ def issue_body(candidate: Candidate) -> str:
         marker(candidate), "", "## Factory execution intake", "",
         f"- Linear issue: [{candidate.identifier}]({candidate.url})",
         f"- Intake key: `{candidate.bridge_key}`", "",
+        f"- Dispatch: `{candidate.dispatch_id}`",
+        f"- Contract digest: `{candidate.contract_digest}`", "",
         "Linear remains the operational queue. This issue is an execution intake only.", "",
         "## Linear description", "", candidate.description or "_No description provided._",
     ))
@@ -133,12 +150,26 @@ def update_linear(candidate: Candidate, github_url: str) -> None:
 
 
 def eligible_issues() -> list[dict[str, Any]]:
-    query = """query($teamId: ID!) {
-      issues(first: 50, filter: { team: { id: { eq: $teamId } }, state: { type: { eq: \"started\" } } }) {
-        nodes { id identifier title description url priority state { id name type } labels { nodes { name } } }
+    query = """query($teamId: ID!, $projectId: ID!) {
+      issues(first: 50, filter: { team: { id: { eq: $teamId } }, project: { id: { eq: $projectId } } }) {
+        nodes { id identifier title description url priority project { id } state { id name type } labels { nodes { name } } }
       }
     }"""
-    return graphql(query, {"teamId": TEAM_ID})["issues"]["nodes"]
+    return graphql(query, {"teamId": TEAM_ID, "projectId": PROJECT_ID})["issues"]["nodes"]
+
+
+def admission_report(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    report = []
+    for issue in issues:
+        decision = admission_for(issue)
+        report.append({
+            "issue": issue.get("identifier", "unknown"),
+            "outcome": decision.outcome,
+            "reasons": list(decision.reasons),
+            "dispatch_id": decision.dispatch_id,
+            "digest": decision.digest,
+        })
+    return report
 
 
 def select(issues: list[dict[str, Any]]) -> Candidate | None:
@@ -175,11 +206,17 @@ def main() -> int:
     try:
         if (ROOT / ".factory/STOP").exists():
             raise TriageError("local .factory/STOP is present")
-        remote_stop_requested()
         issues = json.loads(args.fixture.read_text()) if args.fixture else eligible_issues()
+        admitted = []
+        for issue in issues:
+            try:
+                admitted.append(candidate_from(issue))
+            except TriageError:
+                continue
+        remote_stop_requested({candidate.repository for candidate in admitted})
         selected = pending_candidate(issues)
         if selected is None:
-            print(json.dumps({"action": "noop", "reason": "no active Linear intake pending"}))
+            print(json.dumps({"action": "noop", "reason": "no_admitted_linear_contract", "admissions": admission_report(issues)}, sort_keys=True))
             return 0
         candidate, existing = selected
         plan = {"candidate": candidate.identifier, "repository": candidate.repository, "github_execution_issue": existing, "action": "unchanged" if existing else "create"}
