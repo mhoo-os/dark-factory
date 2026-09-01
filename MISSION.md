@@ -1,43 +1,40 @@
 # Mission
 
-<!--
-  Owner: humans only. This file is on the protected list; the factory cannot edit it.
-  Replace every <angle-bracket> placeholder. Delete this comment when you do.
-  If a section still contains a placeholder, the factory is not ready to run.
+**Derived from:** Mhoo Dark Factory project brief in Linear (MHO-199 through MHO-223)
+**Last reconciled with that brief:** 2026-09-02
 
-  This file is the PRD compressed to the part the agent has to obey. When the product
-  changes, this file has to change in the same commit, or the factory keeps building
-  the old scope and nothing warns you.
--->
+## What Mhoo Dark Factory is
 
-**Derived from:** <path or URL of the PRD this was compressed from>
-**Last reconciled with that PRD:** <YYYY-MM-DD>
+Mhoo Dark Factory is an internal execution system that turns already-planned,
+machine-checkable Linear issues into bounded work in approved `mhoo-os/*` repositories.
+It gives operators durable admission, scheduling, isolated execution, validation,
+evidence, and a reviewable pull request without silently inventing product decisions.
 
-## What <PRODUCT> is
-
-<One paragraph, in the language a product manager would use. What it does, for whom,
-and what a user gets out of it. Not the architecture.>
-
-<A second short paragraph naming any assumption baked into the design - single tenant,
-single channel, one deployment - because those become invariants below.>
+Linear remains the planning and operational queue. The factory starts disabled and
+begins at autonomy level 0; every increase in execution, concurrency, or merge authority
+requires separate evidence and human approval.
 
 ## Who it is for
 
-- <the user, and the specific thing they are trying to do>
-- <a second, if there genuinely is one>
+- Mhoo maintainers who need an approved Linear execution contract carried through a
+  repository change with durable receipts.
+- Operators who need to stop, inspect, reconcile, or recover factory work without
+  granting an agent broad authority.
 
-<PRODUCT> is not <the nearest adjacent thing people will mistake it for>.
+Mhoo Dark Factory is not a product-planning assistant, autonomous roadmap author, or
+general-purpose coding service.
 
 ## Core capabilities (in scope)
 
 The factory may accept issues in these areas.
 
-**<Capability area>**
-- <specific capability>
-- <specific capability>
+**Contracted execution**
+- materialize and validate Factory Dispatch Contract v1 without inference;
+- bind repository, base, profile, dependencies, scope, risk, and merge policy.
 
-**<Capability area>**
-- <specific capability>
+**Durable operations**
+- admit, schedule, execute, validate, reconcile, and preserve evidence for one issue;
+- stop and recover work with explicit leases, idempotency, and human escalation.
 
 ## Out of scope (the factory must never build this)
 
@@ -49,62 +46,63 @@ it lands on the roadmap. Anything that is merely deferred belongs in the backlog
 in this list. Copying a PRD's non-goals across without doing that sort is the most
 common way this section quietly becomes wrong.
 
-<Aim for at least five, grouped. Suggested categories to consider:
- new data sources · additional providers · monetization · mobile or desktop clients ·
- personalization and theming · social features · public APIs and integrations ·
- alternate input modes>
+**Product and planning**
+- inventing product requirements, roadmaps, PRDs, or Linear issues;
+- replacing human/Sol planning or deciding unspecified product value.
 
-**<Category>**
-- <thing>
-- <thing>
+**Authority and data**
+- changing identity, permissions, credentials, Workspace authority, or provider ownership;
+- migrating, deleting, or importing legacy/customer data without a separate decision.
 
-**<Category>**
-- <thing>
+**Execution effects**
+- arbitrary repositories, non-`mhoo-os` targets, unapproved providers, or broad network access;
+- automatic merge, production cutover, money movement, or irreversible external effects.
 
 ## Hard invariants (not tunable by any issue)
 
-These are not features. They are properties that define what <PRODUCT> is. The factory
+These are not features. They are properties that define what the factory is. The factory
 cannot modify them even if an issue asks nicely, gives a good reason, or calls it a
 bug. Changing one requires a human commit.
 
-1. **<Invariant>.** <Why it exists, in one sentence, so a reader can tell whether an
-   edge case is covered.>
-2. **<Invariant>.**
-3. **The factory cannot modify governance files.** `MISSION.md`, `FACTORY_RULES.md`
-   and <conventions file> are the constitution. A PR touching any of them is an
-   automatic reject.
+1. **Linear is the planning authority.** Dispatch fields come from the admitted contract;
+   the factory never guesses missing repository, dependency, authority, or acceptance data.
+2. **Every run is bounded and reviewable.** One issue binds one target, one base, one
+   profile, one idempotency identity, and one durable evidence trail.
+3. **The factory cannot modify governance files.** `MISSION.md`, `FACTORY_RULES.md`,
+   `FACTORY.md`, and `CLAUDE.md` are human-owned constitution files.
 
 ## Allowed evolutions
 
 Explicitly in scope, so the factory does not reject them as architectural drift:
 
-- <the one architectural change you are willing to let it make, if any>
-- <areas where quality can be improved freely>
+- add an explicitly reviewed execution or validation profile for an existing repository;
+- improve deterministic checks, receipts, recovery, and evidence without weakening authority.
 
 ## Definition of done
 
 Every change the factory ships clears all three gates. A PR that skips any of them is
 not done.
 
-**Gate 1 - static checks and tests pass.** <the exact commands>
+**Gate 1 - static checks and tests pass.** `python3 -m unittest discover -s tests -v`
+and `python3 -m py_compile factory/*.py` pass.
 
-**Gate 2 - <the product-level quality bar>.** <e.g. any new user-facing feature is
-usable without documentation.>
+**Gate 2 - the contract-level quality bar.** The selected issue's contract, scope,
+authority, validation profile, and evidence requirements are explicit and fail closed.
 
 **Gate 3 - the end-to-end path passes as a real user.**
 
-1. <start the app>
-2. <the first user action>
-3. <...>
-4. <the observable result a user would notice>
+1. Start from a clean checkout with the factory still disabled.
+2. Run `bash factory/tick.sh --dry-run` against the approved Linear intake.
+3. The dispatcher reads only an eligible, unambiguous contract and makes no mutation.
+4. The output names the exact candidate or the exact fail-closed reason.
 
 This runs on every change that touches runnable code, including ones that "seem
 unrelated". It is not optional.
 
 ## Non-goals
 
-<PRODUCT> is explicitly not trying to be: <a platform · a multi-tenant SaaS · a
-general assistant · a developer tool with an API · ...>.
+Mhoo Dark Factory is explicitly not trying to be a platform, multi-tenant business
+application, general assistant, provider credential vault, or autonomous merge authority.
 
 When in doubt, the answer is "that is out of scope."
 
@@ -129,14 +127,14 @@ These are undecided, not forbidden. **The factory may propose an answer to any o
 build against it, and record what it assumed - the merge is then held for a human, so
 nothing ships on a guess and nothing stops for one. See `FACTORY_RULES.md` §7.
 
-- **Q1** <the question, as a decision rather than a topic>
-- **Q2** <...>
+- **Q1** Which approved execution profiles should be supported after the first held-out pilot?
+- **Q2** What evidence threshold should permit any future concurrency increase?
 
 **Except these, which do stop the factory** - they are on the irreversible list
 (`FACTORY_RULES.md` §7.3) rather than open in the ordinary sense:
 
-- <the one about identity, auth, or who may act as whom>
-- <the one about migrating or deleting stored data>
+- identity, authentication, authorization, credential custody, or who may act as whom;
+- importing, migrating, deleting, or destroying stored data.
 
 Once answered, an entry moves to `.factory/decisions.md` with its answer and date, and
 stops being asked. **A decision is asked once.**
@@ -152,10 +150,9 @@ stops being asked. **A decision is asked once.**
   "not yet" - they are a different kind of work, and it stays with a person.
 -->
 
-- <does it FEEL right - weight, pacing, difficulty, tone>
-- <does it LOOK right - layout, hierarchy, whether two states read as different>
-- <is it UNDERSTANDABLE - can a first-time user work it out without being told>
+- whether a product decision is strategically or aesthetically right;
+- whether an operator experience is clear beyond the deterministic checks;
+- whether a proposed product change should exist at all.
 
-The factory owns <the simulation · the domain rules · the data model>: the layer whose
-correctness can be asserted. That is usually where most of the risk lives, and it is the
-half that can be defended. The list above is reviewed by a human, on purpose, forever.
+The factory owns deterministic contract handling, bounded execution, validation,
+reconciliation, and evidence. Humans retain product judgment and irreversible authority.
