@@ -152,5 +152,9 @@ def accept_webhook(
         return WebhookResult(202, "accepted", "durable_handoff_complete", envelope.event_id)
     except IngressError as error:
         return WebhookResult(401 if "signature" in str(error) or "expired" in str(error) else 400, "rejected", str(error))
-    except (LedgerConflict, OSError) as error:
+    except LedgerConflict as error:
+        if str(error) == "ingress_identity_conflict":
+            return WebhookResult(409, "rejected", str(error))
+        return WebhookResult(503, "retry", "durable_handoff_unavailable")
+    except OSError:
         return WebhookResult(503, "retry", "durable_handoff_unavailable")

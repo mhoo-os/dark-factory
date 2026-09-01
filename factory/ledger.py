@@ -203,9 +203,11 @@ class Ledger:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self.connection.execute(
-                "SELECT handoff_state FROM factory_ingress_events WHERE event_id = ?", (event_id,)
+                "SELECT provider, event_type, payload_digest, handoff_state FROM factory_ingress_events WHERE event_id = ?", (event_id,)
             ).fetchone()
             if existing is not None:
+                if (existing["provider"], existing["event_type"], existing["payload_digest"]) != (provider, event_type, payload_digest):
+                    raise LedgerConflict("ingress_identity_conflict")
                 self.connection.commit()
                 return IngressReceipt(event_id, existing["handoff_state"], True)
             self.connection.execute(

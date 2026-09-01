@@ -74,6 +74,16 @@ class IngressTests(unittest.TestCase):
         self.assertEqual(self.queue.messages, [])
         self.assertEqual(self.ledger.pending_ingress(), [])
 
+    def test_reused_delivery_id_with_changed_body_is_rejected(self):
+        headers, body = linear_request(event_id="linear-evt-conflict")
+        first = accept_webhook("linear", headers, body, SECRET, ledger=self.ledger, queue=self.queue, now=NOW)
+        changed_body = json.dumps({"action": "update", "data": {"id": "issue-2"}}, separators=(",", ":")).encode()
+        changed_headers = dict(headers, **{"Linear-Signature": hmac.new(SECRET, changed_body, hashlib.sha256).hexdigest()})
+        second = accept_webhook("linear", changed_headers, changed_body, SECRET, ledger=self.ledger, queue=self.queue, now=NOW)
+        self.assertEqual(first.status, 202)
+        self.assertEqual((second.status, second.reason), (409, "ingress_identity_conflict"))
+        self.assertEqual(len(self.queue.messages), 1)
+
     def test_linear_timestamp_and_event_shape_are_bounded(self):
         headers, body = linear_request(timestamp=NOW - 61)
         expired = accept_webhook("linear", headers, body, SECRET, ledger=self.ledger, queue=self.queue, now=NOW)
