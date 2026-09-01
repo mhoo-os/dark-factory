@@ -4,8 +4,8 @@ CREATE TABLE IF NOT EXISTS factory_schema_meta (
   schema_name TEXT PRIMARY KEY,
   schema_version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO factory_schema_meta(schema_name, schema_version)
-VALUES ('factory-ledger', 1);
+INSERT OR REPLACE INTO factory_schema_meta(schema_name, schema_version)
+VALUES ('factory-ledger', 2);
 
 CREATE TABLE IF NOT EXISTS factory_runs (
   dispatch_id TEXT PRIMARY KEY,
@@ -42,6 +42,19 @@ CREATE TABLE IF NOT EXISTS factory_runs (
 );
 
 CREATE INDEX IF NOT EXISTS factory_runs_issue_idx ON factory_runs(linear_issue_id);
+
+CREATE TABLE IF NOT EXISTS factory_ingress_events (
+  event_id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  handoff_state TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  enqueued_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS factory_ingress_pending_idx
+  ON factory_ingress_events(handoff_state);
 
 CREATE TABLE IF NOT EXISTS factory_events (
   event_id TEXT PRIMARY KEY,

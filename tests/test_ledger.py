@@ -7,7 +7,7 @@ import sqlite3
 import unittest
 
 from factory.dispatch_contract import validate_dispatch_contract
-from factory.ledger import Ledger, LedgerConflict
+from factory.ledger import Ledger, LedgerConflict, SCHEMA_VERSION
 
 
 ROOT = Path(__file__).parents[1]
@@ -80,7 +80,7 @@ class LedgerTests(unittest.TestCase):
         )
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(factory_runs)")}
         self.assertFalse(any(name.lower() in {"secret", "credential", "access_token", "token_value"} for name in columns))
-        self.assertEqual(self.connection.execute("SELECT schema_version FROM factory_schema_meta").fetchone()[0], 1)
+        self.assertEqual(self.connection.execute("SELECT schema_version FROM factory_schema_meta").fetchone()[0], SCHEMA_VERSION)
 
 
 if __name__ == "__main__":
