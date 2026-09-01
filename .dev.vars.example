@@ -1,0 +1,6 @@
+LINEAR_WEBHOOK_SECRET=replace-locally
+GITHUB_WEBHOOK_SECRET=replace-locally
+FACTORY_ADMIN_SECRET=replace-locally
+GITHUB_TOKEN=replace-locally
+OPENROUTER_API_KEY=replace-locally
+OPENROUTER_MODEL=replace-with-an-OpenRouter-model-slug

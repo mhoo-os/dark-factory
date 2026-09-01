@@ -1,3 +1,7 @@
+node_modules/
+.dev.vars
+.wrangler/
+dist/
 # Runtime state and credentials
 .factory/STOP
 .factory/locks-runtime/
