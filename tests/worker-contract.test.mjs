@@ -73,3 +73,10 @@ test("runtime carries the admitted identity through independent validation and p
   assert.match(dockerfile, /apt-get install -y --no-install-recommends python3/);
   assert.match(source, /MAX_FIX_ATTEMPTS/);
 });
+
+test("PR reconciliation binds both head and base to the target repository", () => {
+  assert.match(source, /function pullRequest\(value: unknown, expectedRepository: string\)/);
+  assert.match(source, /headRepository !== expectedRepository/);
+  assert.match(source, /baseRepository !== expectedRepository/);
+  assert.match(source, /pullRequest\(value, job\.repository\)/);
+});

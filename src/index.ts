@@ -1082,12 +1082,16 @@ async function githubRequest(token: string, method: string, path: string, body?:
   return await jsonResponse(result);
 }
 
-function pullRequest(value: unknown): PullRequest {
+function pullRequest(value: unknown, expectedRepository: string): PullRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("pull_request_invalid");
   const item = value as ObjectValue;
   const head = item.head as ObjectValue | undefined;
   const base = item.base as ObjectValue | undefined;
-  if (typeof item.number !== "number" || !Number.isSafeInteger(item.number) || item.number < 1 || typeof item.html_url !== "string" || !/^https:\/\/github\.com\/mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}\/pull\/[1-9][0-9]*$/.test(item.html_url) || (item.state !== "open" && item.state !== "closed") || typeof item.merged !== "boolean" || !head || typeof head.ref !== "string" || !BRANCH.test(head.ref) || typeof head.sha !== "string" || !SHA40.test(head.sha) || !base || typeof base.ref !== "string" || base.ref.length === 0 || base.ref.length > 256 || typeof base.sha !== "string" || !SHA40.test(base.sha)) throw new Error("pull_request_invalid");
+  const headRepo = head?.repo;
+  const baseRepo = base?.repo;
+  const headRepository = headRepo && typeof headRepo === "object" && !Array.isArray(headRepo) ? (headRepo as ObjectValue).full_name : undefined;
+  const baseRepository = baseRepo && typeof baseRepo === "object" && !Array.isArray(baseRepo) ? (baseRepo as ObjectValue).full_name : undefined;
+  if (!REPOSITORY.test(expectedRepository) || headRepository !== expectedRepository || baseRepository !== expectedRepository || typeof item.number !== "number" || !Number.isSafeInteger(item.number) || item.number < 1 || typeof item.html_url !== "string" || !/^https:\/\/github\.com\/mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}\/pull\/[1-9][0-9]*$/.test(item.html_url) || (item.state !== "open" && item.state !== "closed") || typeof item.merged !== "boolean" || !head || typeof head.ref !== "string" || !BRANCH.test(head.ref) || typeof head.sha !== "string" || !SHA40.test(head.sha) || !base || typeof base.ref !== "string" || base.ref.length === 0 || base.ref.length > 256 || typeof base.sha !== "string" || !SHA40.test(base.sha)) throw new Error("pull_request_invalid");
   return { number: item.number, html_url: item.html_url, state: item.state, merged: item.merged, head: { ref: head.ref, sha: head.sha }, base: { ref: base.ref, sha: base.sha } };
 }
 
@@ -1106,7 +1110,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
   if (!Array.isArray(existingValue)) throw new Error("pull_request_list_invalid");
   if (existingValue.length > 1) throw new Error("duplicate_pull_requests");
   if (existingValue.length === 1) {
-    const existing = pullRequest(existingValue[0]);
+    const existing = pullRequest(existingValue[0], job.contract.target.repository);
     if (existing.state !== "open" || existing.merged) throw new Error("pull_request_terminal");
     if (existing.head.sha !== agent.head_sha) throw new Error("pull_request_head_mismatch");
     if (existing.base.ref !== defaultBranch || existing.base.sha !== job.contract.target.base_sha) throw new Error("publication_base_changed");
@@ -1119,7 +1123,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
     base: defaultBranch,
     body: `${marker}\n\nFactory execution for ${job.contract.linear.identifier}.\n\n- Run: \`${job.runId}\`\n- Contract digest: \`${job.contractDigest}\`\n- Base: \`${job.contract.target.base_sha}\`\n- Head: \`${agent.head_sha}\`\n\nAutomatic merge is disabled; human review is required.`,
   });
-  const pull = pullRequest(created);
+  const pull = pullRequest(created, job.contract.target.repository);
   if (pull.head.sha !== agent.head_sha) throw new Error("created_pull_request_head_mismatch");
   return pull;
 }
@@ -1203,10 +1207,10 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
     if (!Array.isArray(candidates)) throw new Error("reconciliation_pull_request_list_invalid");
     if (candidates.length === 0) return "ignored";
     if (candidates.length > 1) throw new Error("duplicate_pull_requests");
-    prNumber = pullRequest(candidates[0]).number;
+    prNumber = pullRequest(candidates[0], job.repository).number;
   }
   const value = await githubRequest(token, "GET", `/repos/${repositoryPath(job.repository)}/pulls/${prNumber}`);
-  const pull = pullRequest(value);
+  const pull = pullRequest(value, job.repository);
   if (pull.number !== prNumber || pull.html_url !== `https://github.com/${job.repository}/pull/${prNumber}`) throw new Error("reconciliation_pr_identity_conflict");
   const contract = storedContract(run);
   if (await digest(contract) !== run.contract_digest) throw new Error("reconciliation_contract_digest_conflict");
