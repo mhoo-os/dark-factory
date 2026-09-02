@@ -22,7 +22,8 @@
     {
       "binding": "DB",
       "database_name": "mhoo-dark-factory-ledger",
-      "database_id": "e76d5f65-a33c-41cf-9f82-622c1d53cf43"
+      "database_id": "e76d5f65-a33c-41cf-9f82-622c1d53cf43",
+      "migrations_dir": "migrations"
     }
   ],
   "queues": {
