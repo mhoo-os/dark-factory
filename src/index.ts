@@ -259,6 +259,13 @@ function text(value: unknown, label: string, max = 512): string {
   return value;
 }
 
+function descriptionValue(value: unknown, label: string, max = 100_000): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > max) {
+    throw new AdmissionError(`${label}_invalid`);
+  }
+  return value;
+}
+
 function integer(value: unknown, label: string, max: number): number {
   if (!Number.isInteger(value) || typeof value !== "number" || value < 1 || value > max) {
     throw new AdmissionError(`${label}_invalid`);
@@ -267,7 +274,7 @@ function integer(value: unknown, label: string, max: number): number {
 }
 
 function contractFromDescription(description: unknown, issue: ObjectValue, env: Env): Contract {
-  const source = text(description, "description", 100_000);
+  const source = descriptionValue(description, "description", 100_000);
   if (source.split(CONTRACT_OPEN).length - 1 !== 1 || source.split(CONTRACT_CLOSE).length - 1 !== 1) {
     throw new AdmissionError("contract_block_missing_or_ambiguous");
   }

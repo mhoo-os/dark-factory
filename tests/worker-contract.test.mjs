@@ -19,6 +19,12 @@ test("production defaults keep the factory stopped", () => {
   assert.equal(config.vars.LINEAR_PROJECT_SLUG, undefined);
 });
 
+test("multiline Linear descriptions remain valid contract input", () => {
+  assert.match(source, /function descriptionValue\(/);
+  assert.match(source, /const source = descriptionValue\(description, "description", 100_000\)/);
+  assert.doesNotMatch(source, /const source = text\(description, "description"/);
+});
+
 test("reviewable source binds the safety boundaries", () => {
   for (const marker of ["Linear-Signature", "X-Hub-Signature-256", "factory:accepted", "mhoo-factory-dispatch:v1", "factory_ingress_events", "factory_leases", "ExecutionWorkflow", "getSandbox", "reconcileGithubEvent"]) {
     assert.match(source, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
