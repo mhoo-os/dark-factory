@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Mhoo Dark Factory trust and authority boundaries",
+    "output": "docs/diagrams/factory-threat-model.html",
+    "quality_profile": "showcase",
+    "views": [
+      {"id":"admission","label":"Admission path","focus":["linear","worker","queue","d1"],"note":"Linear remains the planning authority; admission persists before dispatch."},
+      {"id":"isolated-run","label":"Isolated execution","focus":["queue","workflow","sandbox","github","r2"],"note":"A durable Workflow runs bounded work with scoped credentials and evidence custody."},
+      {"id":"recovery","label":"Recovery and oversight","focus":["worker","d1","evaluator","operator"],"note":"Stop, reconciliation, and independent evaluation remain outside model authority."}
+    ]
+  },
+  "components": [
+    {"id":"linear","type":"external","label":"Linear","sublabel":"Planning authority","tag":"signed events","pos":[40,260],"size":[150,70]},
+    {"id":"github","type":"external","label":"GitHub","sublabel":"Repository + PR state","tag":"signed events","pos":[40,500],"size":[150,70]},
+    {"id":"worker","type":"cloud","label":"Worker ingress","sublabel":"Deterministic admission","tag":"fail closed","pos":[270,260],"size":[170,70]},
+    {"id":"queue","type":"messagebus","label":"Cloudflare Queue","sublabel":"Durable handoff","tag":"at-least-once","pos":[510,260],"size":[170,70]},
+    {"id":"d1","type":"database","label":"D1 ledger","sublabel":"Runs, leases, receipts","tag":"no secrets","pos":[510,100],"size":[170,70]},
+    {"id":"workflow","type":"cloud","label":"Workflow","sublabel":"One run per issue","tag":"durable state","pos":[750,260],"size":[170,70]},
+    {"id":"sandbox","type":"security","label":"Sandbox","sublabel":"Bounded repository work","tag":"scoped tools","pos":[990,260],"size":[170,70]},
+    {"id":"r2","type":"cloud","label":"R2 evidence","sublabel":"Artifacts + provenance","tag":"redacted only","pos":[990,100],"size":[170,70]},
+    {"id":"evaluator","type":"backend","label":"Independent evaluators","sublabel":"Product + trajectory","tag":"observer only","pos":[1150,500],"size":[170,70]},
+    {"id":"operator","type":"external","label":"Human operator","sublabel":"Stop + override","tag":"human authority","pos":[270,500],"size":[170,70]}
+  ],
+  "boundaries": [
+    {"kind":"security-group","label":"Untrusted provider content","wraps":["linear","github"],"pad":24},
+    {"kind":"region","label":"Deterministic control plane","wraps":["worker","queue","d1","workflow","r2","evaluator"],"pad":28},
+    {"kind":"security-group","label":"Isolated execution boundary","wraps":["sandbox"],"pad":22}
+  ],
+  "connections": [
+    {"id":"linear-to-worker","from":"linear","to":"worker","label":"signed planning event","variant":"security","fromSide":"right","toSide":"left","labelAt":[470,380]},
+    {"id":"github-to-worker","from":"github","to":"worker","label":"signed PR event","variant":"security","fromSide":"right","toSide":"left","labelAt":[220,420]},
+    {"id":"worker-to-queue","from":"worker","to":"queue","label":"persist then enqueue","variant":"emphasis","labelDy":-42},
+    {"id":"worker-to-d1","from":"worker","to":"d1","label":"admission + idempotency","variant":"security","fromSide":"top","toSide":"bottom","labelAt":[470,245]},
+    {"id":"queue-to-workflow","from":"queue","to":"workflow","label":"one issue / one run","labelDy":-42},
+    {"id":"workflow-to-sandbox","from":"workflow","to":"sandbox","label":"scoped execution","labelAt":[870,340]},
+    {"id":"sandbox-to-github","from":"sandbox","to":"github","label":"approved branch / PR","variant":"dashed","fromSide":"bottom","toSide":"bottom","labelDy":28},
+    {"id":"sandbox-to-r2","from":"sandbox","to":"r2","label":"hash + provenance","variant":"dashed","fromSide":"top","toSide":"bottom","labelAt":[1190,215]},
+    {"id":"evaluator-to-d1","from":"evaluator","to":"d1","label":"separate evidence","variant":"security","fromSide":"right","toSide":"bottom","via":[[1350,535],[1350,80],[480,80],[480,200],[595,200]],"labelAt":[1100,70]},
+    {"id":"operator-to-worker","from":"operator","to":"worker","label":"stop / human override","variant":"security","fromSide":"top","toSide":"bottom","labelDx":115}
+  ],
+  "cards": [
+    {"dot":"rose","title":"Authority","items":["Linear owns planning and issue intent.","The deterministic Worker owns admission; models cannot invent protected fields.","Human override is required for reserved states and autonomy promotion."]},
+    {"dot":"amber","title":"Credential custody","items":["D1 and R2 never store provider secrets.","Sandbox credentials are scoped to the declared repository and attempt.","Provider content and evaluator output are data, never instructions."]},
+    {"dot":"cyan","title":"Failure behavior","items":["Invalid signatures, stale leases, replayed events, and unknown profiles fail closed.","Queue delivery is acknowledged only after durable handoff.","Cron reconciles missed work; it does not invent dispatches."]}
+  ]
+}
