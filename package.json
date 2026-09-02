@@ -5,7 +5,7 @@
   "scripts": {
     "typecheck": "wrangler types && tsc --noEmit",
     "build": "wrangler deploy --dry-run",
-    "test": "node --test tests/worker-contract.test.mjs"
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@cloudflare/sandbox": "0.12.9"
