@@ -11,7 +11,7 @@ from factory.dispatch_contract import DispatchContract
 from factory.state_contract import TERMINAL_STATES, decide_transition
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = Path(__file__).with_name("ledger_schema.sql").read_text()
 
 
@@ -37,6 +37,13 @@ class TransitionReceipt:
     reason: str
     state: str
     sequence: int
+
+
+@dataclass(frozen=True)
+class IngressReceipt:
+    event_id: str
+    handoff_state: str
+    duplicate: bool
 
 
 def utc_now() -> str:
@@ -187,4 +194,50 @@ class Ledger:
         self._run(dispatch_id)
         return [dict(row) for row in self.connection.execute(
             "SELECT * FROM factory_events WHERE dispatch_id = ? ORDER BY rowid", (dispatch_id,)
+        )]
+
+    def reserve_ingress(self, event_id: str, provider: str, event_type: str, payload_digest: str, *, now: str | None = None) -> IngressReceipt:
+        if not event_id or not provider or not event_type or not payload_digest:
+            raise LedgerConflict("ingress_identity_missing")
+        timestamp = now or utc_now()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT provider, event_type, payload_digest, handoff_state FROM factory_ingress_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if existing is not None:
+                if (existing["provider"], existing["event_type"], existing["payload_digest"]) != (provider, event_type, payload_digest):
+                    raise LedgerConflict("ingress_identity_conflict")
+                self.connection.commit()
+                return IngressReceipt(event_id, existing["handoff_state"], True)
+            self.connection.execute(
+                "INSERT INTO factory_ingress_events(event_id, provider, event_type, payload_digest, handoff_state, received_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+                (event_id, provider, event_type, payload_digest, timestamp),
+            )
+            self.connection.commit()
+            return IngressReceipt(event_id, "pending", False)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def mark_ingress_enqueued(self, event_id: str, *, now: str | None = None) -> None:
+        updated = self.connection.execute(
+            "UPDATE factory_ingress_events SET handoff_state = 'enqueued', enqueued_at = ? WHERE event_id = ? AND handoff_state = 'pending'",
+            (now or utc_now(), event_id),
+        ).rowcount
+        self.connection.commit()
+        if updated != 1:
+            raise LedgerConflict("ingress_handoff_not_pending")
+
+    def ingress(self, event_id: str) -> Mapping[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM factory_ingress_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            raise LedgerNotFound(event_id)
+        return dict(row)
+
+    def pending_ingress(self) -> list[Mapping[str, Any]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM factory_ingress_events WHERE handoff_state = 'pending' ORDER BY received_at, event_id"
         )]
