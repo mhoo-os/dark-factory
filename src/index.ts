@@ -22,6 +22,7 @@ const BRANCH = /^factory\/[a-z0-9][a-z0-9-]{0,127}$/;
 const RUN_ID = /^run-v1-[0-9a-f]{32}$/;
 const GITHUB_API_VERSION = "2022-11-28";
 const MAX_PROVIDER_BODY_BYTES = 64 * 1024;
+const PROVIDER_TIMEOUT_MS = 30_000;
 const GITHUB_EVENT_TYPES = new Set(["pull_request", "workflow_run"]);
 const PROFILE_DIGEST = "sha256:e56a438c8feb33cd39b03aca75a3b8596d63de5c90662f87a16729b9d467acfb";
 const SUPPORTED_TARGETS = {
@@ -583,7 +584,7 @@ async function dependenciesReady(job: Job, env: Env): Promise<"ready" | "blocked
   if (!token) return "unavailable";
   const query = "query($ids:[ID!]!){issues(filter:{id:{in:$ids}}){nodes{id,state{type}}}}";
   try {
-    const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables: { ids: job.contract.dependencies.map((item) => item.issue_id) } }) });
+    const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables: { ids: job.contract.dependencies.map((item) => item.issue_id) } }), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
     if (!result.ok) return "unavailable";
     const body = await result.json() as ObjectValue;
     if (Array.isArray(body.errors) && body.errors.length > 0) return "unavailable";
@@ -1077,17 +1078,22 @@ async function githubRequest(token: string, method: string, path: string, body?:
     method,
     headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": GITHUB_API_VERSION, "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
   });
   if (!result.ok) throw new Error(`github_request_failed_${result.status}`);
   return await jsonResponse(result);
 }
 
-function pullRequest(value: unknown): PullRequest {
+function pullRequest(value: unknown, expectedRepository: string): PullRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("pull_request_invalid");
   const item = value as ObjectValue;
   const head = item.head as ObjectValue | undefined;
   const base = item.base as ObjectValue | undefined;
-  if (typeof item.number !== "number" || !Number.isSafeInteger(item.number) || item.number < 1 || typeof item.html_url !== "string" || !/^https:\/\/github\.com\/mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}\/pull\/[1-9][0-9]*$/.test(item.html_url) || (item.state !== "open" && item.state !== "closed") || typeof item.merged !== "boolean" || !head || typeof head.ref !== "string" || !BRANCH.test(head.ref) || typeof head.sha !== "string" || !SHA40.test(head.sha) || !base || typeof base.ref !== "string" || base.ref.length === 0 || base.ref.length > 256 || typeof base.sha !== "string" || !SHA40.test(base.sha)) throw new Error("pull_request_invalid");
+  const headRepo = head?.repo;
+  const baseRepo = base?.repo;
+  const headRepository = headRepo && typeof headRepo === "object" && !Array.isArray(headRepo) ? (headRepo as ObjectValue).full_name : undefined;
+  const baseRepository = baseRepo && typeof baseRepo === "object" && !Array.isArray(baseRepo) ? (baseRepo as ObjectValue).full_name : undefined;
+  if (!REPOSITORY.test(expectedRepository) || headRepository !== expectedRepository || baseRepository !== expectedRepository || typeof item.number !== "number" || !Number.isSafeInteger(item.number) || item.number < 1 || typeof item.html_url !== "string" || !/^https:\/\/github\.com\/mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}\/pull\/[1-9][0-9]*$/.test(item.html_url) || (item.state !== "open" && item.state !== "closed") || typeof item.merged !== "boolean" || !head || typeof head.ref !== "string" || !BRANCH.test(head.ref) || typeof head.sha !== "string" || !SHA40.test(head.sha) || !base || typeof base.ref !== "string" || base.ref.length === 0 || base.ref.length > 256 || typeof base.sha !== "string" || !SHA40.test(base.sha)) throw new Error("pull_request_invalid");
   return { number: item.number, html_url: item.html_url, state: item.state, merged: item.merged, head: { ref: head.ref, sha: head.sha }, base: { ref: base.ref, sha: base.sha } };
 }
 
@@ -1106,7 +1112,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
   if (!Array.isArray(existingValue)) throw new Error("pull_request_list_invalid");
   if (existingValue.length > 1) throw new Error("duplicate_pull_requests");
   if (existingValue.length === 1) {
-    const existing = pullRequest(existingValue[0]);
+    const existing = pullRequest(existingValue[0], job.contract.target.repository);
     if (existing.state !== "open" || existing.merged) throw new Error("pull_request_terminal");
     if (existing.head.sha !== agent.head_sha) throw new Error("pull_request_head_mismatch");
     if (existing.base.ref !== defaultBranch || existing.base.sha !== job.contract.target.base_sha) throw new Error("publication_base_changed");
@@ -1119,7 +1125,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
     base: defaultBranch,
     body: `${marker}\n\nFactory execution for ${job.contract.linear.identifier}.\n\n- Run: \`${job.runId}\`\n- Contract digest: \`${job.contractDigest}\`\n- Base: \`${job.contract.target.base_sha}\`\n- Head: \`${agent.head_sha}\`\n\nAutomatic merge is disabled; human review is required.`,
   });
-  const pull = pullRequest(created);
+  const pull = pullRequest(created, job.contract.target.repository);
   if (pull.head.sha !== agent.head_sha) throw new Error("created_pull_request_head_mismatch");
   return pull;
 }
@@ -1127,7 +1133,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
 async function linearGraphql(env: Env, query: string, variables: ObjectValue): Promise<ObjectValue> {
   const token = secret(env, "LINEAR_API_KEY");
   if (!token) throw new Error("linear_credentials_missing");
-  const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables }) });
+  const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
   if (!result.ok) throw new Error("linear_request_failed");
   const body = await jsonResponse(result);
   if (Array.isArray(body) || (Array.isArray(body.errors) && body.errors.length > 0) || !body.data || typeof body.data !== "object") throw new Error("linear_response_invalid");
@@ -1136,11 +1142,21 @@ async function linearGraphql(env: Env, query: string, variables: ObjectValue): P
 
 async function ensureLinearReceipt(env: Env, job: Job, pull: PullRequest, state = "pr-open", reason = "pr_published"): Promise<"created" | "existing"> {
   const marker = `<!-- mhoo-dark-factory-receipt:v1 run=${job.runId} -->`;
-  const query = "query($issueId:ID!){issue(id:$issueId){comments(first:50){nodes{id body}}}}";
-  const data = await linearGraphql(env, query, { issueId: job.contract.linear.issue_id });
-  const issue = data.issue as ObjectValue | undefined;
-  const comments = issue?.comments as ObjectValue | undefined;
-  const nodes = comments && Array.isArray(comments.nodes) ? comments.nodes : [];
+  const query = "query($issueId:ID!,$after:String){issue(id:$issueId){comments(first:50,after:$after){nodes{id body}pageInfo{hasNextPage endCursor}}}}";
+  const nodes: unknown[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < 10; page += 1) {
+    const data = await linearGraphql(env, query, { issueId: job.contract.linear.issue_id, after });
+    const issue = data.issue as ObjectValue | undefined;
+    const comments = issue?.comments as ObjectValue | undefined;
+    const pageInfo = comments?.pageInfo as ObjectValue | undefined;
+    if (!comments || !Array.isArray(comments.nodes) || !pageInfo || typeof pageInfo.hasNextPage !== "boolean") throw new Error("linear_receipts_pagination_invalid");
+    nodes.push(...comments.nodes);
+    if (!pageInfo.hasNextPage) break;
+    if (typeof pageInfo.endCursor !== "string" || pageInfo.endCursor.length === 0 || pageInfo.endCursor.length > 256) throw new Error("linear_receipts_pagination_invalid");
+    after = pageInfo.endCursor;
+    if (page === 9) throw new Error("linear_receipts_pagination_limit");
+  }
   const body = `${marker}\n\nFactory execution for ${job.contract.linear.identifier}: ${state}.\n\n- Run: \`${job.runId}\`\n- Reason: \`${reason}\`\n- Contract digest: \`${job.contractDigest}\`\n- Repository: \`${job.contract.target.repository}\`\n- PR: ${pull.html_url}\n- PR head: \`${pull.head.sha}\`\n\nAutomatic merge is disabled; human review is required.`;
   const matches = nodes.filter((item) => {
     if (!item || typeof item !== "object") return false;
@@ -1203,10 +1219,10 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
     if (!Array.isArray(candidates)) throw new Error("reconciliation_pull_request_list_invalid");
     if (candidates.length === 0) return "ignored";
     if (candidates.length > 1) throw new Error("duplicate_pull_requests");
-    prNumber = pullRequest(candidates[0]).number;
+    prNumber = pullRequest(candidates[0], job.repository).number;
   }
   const value = await githubRequest(token, "GET", `/repos/${repositoryPath(job.repository)}/pulls/${prNumber}`);
-  const pull = pullRequest(value);
+  const pull = pullRequest(value, job.repository);
   if (pull.number !== prNumber || pull.html_url !== `https://github.com/${job.repository}/pull/${prNumber}`) throw new Error("reconciliation_pr_identity_conflict");
   const contract = storedContract(run);
   if (await digest(contract) !== run.contract_digest) throw new Error("reconciliation_contract_digest_conflict");
