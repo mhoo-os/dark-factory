@@ -52,18 +52,18 @@ class LedgerTests(unittest.TestCase):
 
     def test_transition_history_is_append_only_and_replay_safe(self) -> None:
         self.ledger.admit(self.dispatch, "run-1")
-        accepted = self.ledger.transition("MHO-900@r1", "queued", actor="admission", event_id="evt-1", event_sequence=1)
-        replay = self.ledger.transition("MHO-900@r1", "queued", actor="admission", event_id="evt-1", event_sequence=1)
+        accepted = self.ledger.transition("MHO-900@r1", "queued", actor="admission", event_id="evt-1", event_sequence=2)
+        replay = self.ledger.transition("MHO-900@r1", "queued", actor="admission", event_id="evt-1", event_sequence=2)
         stale = self.ledger.transition("MHO-900@r1", "admitted", actor="admission", event_id="evt-2", event_sequence=1)
         self.assertEqual(accepted.outcome, "accepted")
         self.assertEqual(replay.reason, "replayed_event")
         self.assertEqual(stale.reason, "stale_event")
         self.assertEqual(self.ledger.run("MHO-900@r1")["current_state"], "queued")
-        self.assertEqual(len(self.ledger.events("MHO-900@r1")), 2)
+        self.assertEqual(len(self.ledger.events("MHO-900@r1")), 3)
 
     def test_illegal_transition_does_not_change_run_state(self) -> None:
         self.ledger.admit(self.dispatch, "run-1")
-        result = self.ledger.transition("MHO-900@r1", "pr-merged", actor="workflow", event_id="evt-illegal", event_sequence=1)
+        result = self.ledger.transition("MHO-900@r1", "pr-merged", actor="workflow", event_id="evt-illegal", event_sequence=2)
         self.assertEqual(result.reason, "illegal_or_unauthorized_transition")
         self.assertEqual(self.ledger.run("MHO-900@r1")["current_state"], "admitted")
 

@@ -4,8 +4,10 @@ import { readFile } from "node:fs/promises";
 
 const config = JSON.parse(await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
 const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
+const stateContract = JSON.parse(await readFile(new URL("../factory/state_contract.json", import.meta.url), "utf8"));
 const migration = await readFile(new URL("../migrations/0001_factory.sql", import.meta.url), "utf8");
 const retryMigration = await readFile(new URL("../migrations/0002_ingress-retry-state.sql", import.meta.url), "utf8");
+const stateMigration = await readFile(new URL("../migrations/0003-state-history-and-active-issue.sql", import.meta.url), "utf8");
 const dockerfile = await readFile(new URL("../Dockerfile", import.meta.url), "utf8");
 
 test("production defaults keep the factory stopped", () => {
@@ -31,6 +33,31 @@ test("durable migration has separate ingress, run, lease, and step state", () =>
   }
   assert.match(migration, /INSERT OR IGNORE INTO control_flags/);
   assert.match(retryMigration, /ALTER TABLE factory_ingress_events ADD COLUMN updated_at/);
+});
+
+test("runtime state changes have append-only history and an atomic issue guard", () => {
+  assert.match(stateMigration, /CREATE TABLE IF NOT EXISTS factory_transitions/);
+  assert.match(stateMigration, /PRIMARY KEY \(dispatch_id, event_sequence\)/);
+  assert.match(stateMigration, /CREATE UNIQUE INDEX IF NOT EXISTS factory_runs_active_issue_unique_idx/);
+  assert.match(stateMigration, /WHERE current_state NOT IN \('not-admitted',\s*'failed',\s*'pr-merged',\s*'pr-canceled'\)/);
+  assert.match(stateMigration, /VALUES \('factory-ledger', 3\)/);
+  for (const marker of ["TRANSITION_ACTORS", "transitionRun", "state_transition_denied", "state_transition_raced", "lease_fenced"]) {
+    assert.match(source, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.doesNotMatch(source, /UPDATE factory_runs SET current_state/);
+});
+
+test("worker actor permissions stay aligned with the canonical state contract", () => {
+  const start = source.indexOf("const TRANSITION_ACTORS");
+  const end = source.indexOf("};", start);
+  assert.ok(start >= 0 && end > start);
+  const actual = {};
+  for (const line of source.slice(start, end).split("\n")) {
+    const match = line.match(/"([^"]+)": \[(.*)\]/);
+    if (match) actual[match[1]] = match[2].split(",").map((value) => value.trim().replaceAll('"', "")).filter(Boolean);
+  }
+  const expected = Object.fromEntries(stateContract.transitions.map((item) => [`${item.from}->${item.to}`, item.actors]));
+  assert.deepEqual(actual, expected);
 });
 
 test("runtime carries the admitted identity through independent validation and publication", () => {

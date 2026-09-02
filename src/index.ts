@@ -32,6 +32,77 @@ const SUPPORTED_TARGETS = {
   },
 } as const;
 
+type TransitionActor =
+  | "admission"
+  | "scheduler"
+  | "workflow"
+  | "validator"
+  | "reconciler"
+  | "external-github"
+  | "external-linear"
+  | "human-override"
+  | "human-planning";
+
+// Keep the Worker-side authorization table explicit. The Python reference
+// implementation and this table must agree before a state write is allowed.
+const TRANSITION_ACTORS: Readonly<Record<string, readonly TransitionActor[]>> = {
+  "proposed->admitted": ["admission"],
+  "proposed->not-admitted": ["admission"],
+  "proposed->needs-human": ["admission", "human-override"],
+  "not-admitted->proposed": ["human-planning", "human-override"],
+  "admitted->queued": ["admission", "scheduler"],
+  "admitted->blocked-by-dependency": ["scheduler"],
+  "admitted->needs-replan": ["reconciler"],
+  "admitted->needs-human": ["reconciler", "human-override"],
+  "blocked-by-dependency->queued": ["scheduler", "reconciler"],
+  "blocked-by-dependency->needs-replan": ["reconciler"],
+  "blocked-by-dependency->needs-human": ["reconciler", "human-override"],
+  "queued->blocked-by-dependency": ["scheduler", "reconciler"],
+  "queued->leased": ["scheduler"],
+  "queued->needs-human": ["scheduler", "reconciler", "human-override"],
+  "queued->stopped": ["human-override"],
+  "leased->running": ["workflow"],
+  "leased->queued": ["reconciler"],
+  "leased->needs-human": ["reconciler", "human-override"],
+  "leased->stopped": ["human-override"],
+  "running->validating": ["workflow"],
+  "running->needs-replan": ["workflow", "reconciler"],
+  "running->needs-human": ["workflow", "reconciler", "human-override"],
+  "running->failed": ["workflow", "reconciler"],
+  "running->stopped": ["human-override"],
+  "validating->pr-open": ["workflow"],
+  "validating->fixable-failure": ["validator"],
+  "validating->failed": ["validator"],
+  "validating->needs-human": ["validator", "reconciler", "human-override"],
+  "validating->stopped": ["human-override"],
+  "fixable-failure->running": ["workflow"],
+  "fixable-failure->failed": ["workflow", "validator"],
+  "fixable-failure->needs-human": ["workflow", "validator", "human-override"],
+  "pr-open->pr-passed": ["validator"],
+  "pr-open->pr-merged": ["external-github", "reconciler"],
+  "pr-open->reconciliation-only": ["external-github", "external-linear", "reconciler"],
+  "pr-open->needs-replan": ["external-linear", "reconciler"],
+  "pr-open->needs-human": ["reconciler", "human-override"],
+  "pr-open->pr-canceled": ["external-github", "human-override"],
+  "pr-open->stopped": ["human-override"],
+  "pr-passed->pr-merged": ["external-github", "reconciler"],
+  "pr-passed->pr-open": ["external-github", "reconciler"],
+  "pr-passed->needs-replan": ["reconciler"],
+  "pr-passed->reconciliation-only": ["external-github", "external-linear", "reconciler"],
+  "pr-passed->needs-human": ["reconciler", "human-override"],
+  "pr-passed->pr-canceled": ["external-github", "human-override"],
+  "reconciliation-only->pr-open": ["external-github", "external-linear", "reconciler"],
+  "reconciliation-only->pr-merged": ["external-github", "reconciler"],
+  "reconciliation-only->pr-canceled": ["external-github", "reconciler"],
+  "reconciliation-only->needs-replan": ["reconciler"],
+  "reconciliation-only->queued": ["reconciler"],
+  "reconciliation-only->needs-human": ["reconciler", "human-override"],
+  "needs-replan->proposed": ["human-planning", "human-override"],
+  "needs-human->proposed": ["human-override"],
+  "failed->proposed": ["human-override"],
+  "stopped->queued": ["human-override"],
+};
+
 type ObjectValue = Record<string, unknown>;
 type Contract = {
   contract_version: "v1";
@@ -355,12 +426,34 @@ async function insertRun(db: D1Database, job: Job): Promise<"inserted" | "duplic
   const c = job.contract;
   const active = await db.prepare("SELECT dispatch_id FROM factory_runs WHERE linear_issue_id=? AND current_state NOT IN ('not-admitted','failed','pr-merged','pr-canceled') LIMIT 1").bind(c.linear.issue_id).first<{ dispatch_id: string }>();
   if (active && active.dispatch_id !== job.dispatchId) return "conflict";
-  const result = await db.prepare("INSERT OR IGNORE INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, ?)")
-    .bind(job.dispatchId, job.runId, job.contractDigest, PROFILE_DIGEST, stable(c), c.linear.project_id, c.linear.issue_id, c.linear.identifier, c.target.repository, c.target.collision_group, c.target.base_sha, "admitted", new Date().toISOString(), new Date().toISOString()).run();
-  if (result.meta.changes === 1) return "inserted";
   const existing = await db.prepare("SELECT contract_digest,linear_issue_id FROM factory_runs WHERE dispatch_id=?")
     .bind(job.dispatchId).first<{ contract_digest: string; linear_issue_id: string }>();
-  if (existing?.contract_digest === job.contractDigest && existing.linear_issue_id === c.linear.issue_id) return "duplicate";
+  if (existing) return existing.contract_digest === job.contractDigest && existing.linear_issue_id === c.linear.issue_id ? "duplicate" : "conflict";
+  const timestamp = new Date().toISOString();
+  const admissionEventId = `admission:${job.dispatchId}`;
+  let results: D1Result<unknown>[];
+  try {
+    results = await db.batch([
+      db.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(job.dispatchId, job.runId, job.contractDigest, PROFILE_DIGEST, stable(c), c.linear.project_id, c.linear.issue_id, c.linear.identifier, c.target.repository, c.target.collision_group, c.target.base_sha, "admitted", timestamp, timestamp),
+      db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,? FROM factory_runs WHERE dispatch_id=? AND current_state='admitted'")
+        .bind(admissionEventId, job.dispatchId, 1, "state:admitted", job.contractDigest, 1, "accepted", timestamp, job.dispatchId),
+      db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
+        .bind(job.dispatchId, 1, admissionEventId, "proposed", "admitted", "admission", timestamp, admissionEventId),
+    ]);
+  } catch (error) {
+    const raced = await db.prepare("SELECT contract_digest,linear_issue_id FROM factory_runs WHERE dispatch_id=?")
+      .bind(job.dispatchId).first<{ contract_digest: string; linear_issue_id: string }>();
+    if (raced) return raced.contract_digest === job.contractDigest && raced.linear_issue_id === c.linear.issue_id ? "duplicate" : "conflict";
+    const competing = await db.prepare("SELECT dispatch_id FROM factory_runs WHERE linear_issue_id=? AND current_state NOT IN ('not-admitted','failed','pr-merged','pr-canceled') LIMIT 1")
+      .bind(c.linear.issue_id).first<{ dispatch_id: string }>();
+    if (competing && competing.dispatch_id !== job.dispatchId) return "conflict";
+    throw error;
+  }
+  if (results[0].meta.changes === 1 && results[1].meta.changes === 1 && results[2].meta.changes === 1) return "inserted";
+  const committed = await db.prepare("SELECT contract_digest,linear_issue_id FROM factory_runs WHERE dispatch_id=?")
+    .bind(job.dispatchId).first<{ contract_digest: string; linear_issue_id: string }>();
+  if (committed?.contract_digest === job.contractDigest && committed.linear_issue_id === c.linear.issue_id) return "duplicate";
   return "conflict";
 }
 
@@ -369,13 +462,110 @@ async function recordStep(db: D1Database, runId: string, stepKey: string, status
     .bind(runId, stepKey, status, stable(result), new Date().toISOString()).run();
 }
 
-async function updateRun(db: D1Database, runId: string, state: string, result?: ObjectValue, leaseFence?: number | null): Promise<void> {
+type RunFields = {
+  workflowId?: string | null;
+  branch?: string | null;
+  headSha?: string | null;
+  prNumber?: number | null;
+  prUrl?: string | null;
+  reconciledAt?: string | null;
+};
+
+async function updateRunMetadata(db: D1Database, runId: string, result: ObjectValue, leaseFence?: number, fields: RunFields = {}): Promise<void> {
   const now = new Date().toISOString();
-  const statement = leaseFence === undefined
-    ? db.prepare("UPDATE factory_runs SET current_state=?, result_json=COALESCE(?,result_json), updated_at=? WHERE run_id=?").bind(state, result ? stable(result) : null, now, runId)
-    : db.prepare("UPDATE factory_runs SET current_state=?, result_json=COALESCE(?,result_json), updated_at=? WHERE run_id=? AND lease_fence=?").bind(state, result ? stable(result) : null, now, runId, leaseFence);
+  const set = ["result_json=COALESCE(?,result_json)", "updated_at=?"];
+  const values: unknown[] = [stable(result), now];
+  for (const [column, value] of [["workflow_id", fields.workflowId], ["branch", fields.branch], ["head_sha", fields.headSha], ["pr_number", fields.prNumber], ["pr_url", fields.prUrl], ["reconciled_at", fields.reconciledAt]] as const) {
+    if (value !== undefined) {
+      set.push(`${column}=?`);
+      values.push(value);
+    }
+  }
+  const where = ["run_id=?"];
+  values.push(runId);
+  if (leaseFence !== undefined) {
+    where.push("lease_fence=?");
+    values.push(leaseFence);
+  }
+  const statement = db.prepare(`UPDATE factory_runs SET ${set.join(",")} WHERE ${where.join(" AND ")}`).bind(...values);
   const changed = await statement.run();
-  if (leaseFence !== undefined && changed.meta.changes !== 1) throw new Error("lease_fenced");
+  if (changed.meta.changes !== 1) throw new Error(leaseFence === undefined ? "run_missing" : "lease_fenced");
+}
+
+type TransitionPatch = {
+  result?: ObjectValue;
+  leaseFence?: number;
+  leaseExpiredAt?: string;
+  lease?: { owner: string; fence: number; expiresAt: string } | null;
+  fields?: RunFields;
+};
+
+async function transitionRun(
+  db: D1Database,
+  runId: string,
+  toState: string,
+  actor: TransitionActor,
+  eventId: string,
+  patch: TransitionPatch = {},
+): Promise<"applied" | "duplicate" | "noop"> {
+  const run = await runById(db, runId);
+  if (!run) throw new Error("run_missing");
+  const existingEvent = await db.prepare("SELECT dispatch_id,event_type,accepted FROM factory_events WHERE event_id=?")
+    .bind(eventId).first<{ dispatch_id: string; event_type: string; accepted: number }>();
+  if (existingEvent) {
+    if (existingEvent.dispatch_id !== run.dispatch_id || existingEvent.event_type !== `state:${toState}` || existingEvent.accepted !== 1) throw new Error("state_transition_event_conflict");
+    return "duplicate";
+  }
+  if (run.current_state === toState) {
+    if (patch.result) await updateRunMetadata(db, runId, patch.result, patch.leaseFence, patch.fields);
+    return "noop";
+  }
+  const actors = TRANSITION_ACTORS[`${run.current_state}->${toState}`];
+  if (!actors?.includes(actor)) throw new Error(`state_transition_denied:${run.current_state}->${toState}:${actor}`);
+  if (!/^[A-Za-z0-9._:@/-]{1,256}$/.test(eventId)) throw new Error("state_transition_event_invalid");
+  const sequenceRow = await db.prepare("SELECT COALESCE(MAX(event_sequence),0) AS sequence FROM factory_transitions WHERE dispatch_id=?")
+    .bind(run.dispatch_id).first<{ sequence: number }>();
+  const sequence = (sequenceRow?.sequence ?? 0) + 1;
+  const now = new Date().toISOString();
+  const resultJson = patch.result ? stable(patch.result) : null;
+  const set = ["current_state=?", "result_json=COALESCE(?,result_json)", "updated_at=?"];
+  const updateValues: unknown[] = [toState, resultJson, now];
+  if (patch.lease !== undefined) {
+    if (patch.lease === null) {
+      set.push("lease_owner=NULL", "lease_fence=NULL", "lease_expires_at=NULL");
+    } else {
+      set.push("lease_owner=?", "lease_fence=?", "lease_expires_at=?");
+      updateValues.push(patch.lease.owner, patch.lease.fence, patch.lease.expiresAt);
+    }
+  }
+  for (const [column, value] of [["workflow_id", patch.fields?.workflowId], ["branch", patch.fields?.branch], ["head_sha", patch.fields?.headSha], ["pr_number", patch.fields?.prNumber], ["pr_url", patch.fields?.prUrl], ["reconciled_at", patch.fields?.reconciledAt]] as const) {
+    if (value !== undefined) {
+      set.push(`${column}=?`);
+      updateValues.push(value);
+    }
+  }
+  const where = ["run_id=?", "current_state=?"];
+  updateValues.push(runId, run.current_state);
+  if (patch.leaseFence !== undefined) {
+    where.push("lease_fence=?");
+    updateValues.push(patch.leaseFence);
+  }
+  if (patch.leaseExpiredAt !== undefined) {
+    where.push("lease_expires_at<=?");
+    updateValues.push(patch.leaseExpiredAt);
+  }
+  const payloadDigest = patch.result ? await digest(patch.result) : null;
+  const results = await db.batch([
+    db.prepare(`UPDATE factory_runs SET ${set.join(",")} WHERE ${where.join(" AND ")}`).bind(...updateValues),
+    db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,? FROM factory_runs WHERE run_id=? AND current_state=? AND updated_at=?")
+      .bind(eventId, run.dispatch_id, sequence, `state:${toState}`, payloadDigest, 1, "accepted", now, runId, toState, now),
+    db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
+      .bind(run.dispatch_id, sequence, eventId, run.current_state, toState, actor, now, eventId),
+  ]);
+  if (results[0].meta.changes !== 1 || results[1].meta.changes !== 1 || results[2].meta.changes !== 1) {
+    throw new Error(patch.leaseFence === undefined ? "state_transition_raced" : "lease_fenced");
+  }
+  return "applied";
 }
 
 async function stopped(db: D1Database): Promise<boolean> { return (await db.prepare("SELECT value FROM control_flags WHERE key='stop'").first<{ value: string }>())?.value === "true"; }
@@ -522,13 +712,18 @@ async function recoverStaleLeases(env: Env): Promise<void> {
   const now = new Date().toISOString();
   const rows = await env.DB.prepare("SELECT run_id,repository,collision_group,lease_fence,current_state,workflow_id FROM factory_runs WHERE current_state IN ('leased','running','validating') AND lease_fence IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY updated_at,run_id LIMIT 16").bind(now).all<{ run_id: string; repository: string; collision_group: string; lease_fence: number; current_state: string; workflow_id: string | null }>();
   for (const row of rows.results ?? []) {
-    const targetState = row.current_state === "leased" && row.workflow_id === null ? "queued" : "needs-human";
-    const updated = await env.DB.prepare("UPDATE factory_runs SET current_state=?,lease_owner=NULL,lease_fence=NULL,lease_expires_at=NULL,escalation_reason=?,updated_at=? WHERE run_id=? AND current_state=? AND lease_fence=? AND lease_expires_at<=?")
-      .bind(targetState, targetState === "queued" ? "stale_lease_requeued" : "stale_workflow_lease", now, row.run_id, row.current_state, row.lease_fence, now).run();
-    if (updated.meta.changes !== 1) continue;
+    const targetState = row.current_state === "leased" ? "queued" : "needs-human";
+    const reason = row.current_state === "leased" && row.workflow_id === null ? "stale_lease_requeued" : "stale_workflow_lease";
+    const actor: TransitionActor = targetState === "queued" ? "reconciler" : row.current_state === "validating" ? "validator" : "reconciler";
+    await transitionRun(env.DB, row.run_id, targetState, actor, `recovery:stale-lease:${row.run_id}:${row.lease_fence}`, {
+      result: { reason, previous_state: row.current_state, previous_fence: row.lease_fence },
+      leaseFence: row.lease_fence,
+      leaseExpiredAt: now,
+      lease: null,
+    });
     const leaseKey = `${row.repository}#${row.collision_group}`;
     await env.DB.prepare("DELETE FROM factory_leases WHERE lease_key=? AND dispatch_id=? AND fence=?").bind(leaseKey, row.run_id, row.lease_fence).run();
-    await recordStep(env.DB, row.run_id, "recovery-stale-lease", targetState, { reason: targetState === "queued" ? "stale_lease_requeued" : "stale_workflow_lease", previous_state: row.current_state, previous_fence: row.lease_fence });
+    await recordStep(env.DB, row.run_id, "recovery-stale-lease", targetState, { reason, previous_state: row.current_state, previous_fence: row.lease_fence });
   }
 }
 
@@ -543,42 +738,66 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     if (run.profile_digest !== PROFILE_DIGEST || run.dispatch_id !== job.dispatchId || run.contract_digest !== job.contractDigest || await digest(contract) !== run.contract_digest) throw new Error("dispatch_identity_conflict");
     job = { ...job, dispatchId: run.dispatch_id, runId: run.run_id, contractDigest: run.contract_digest, contract };
   } catch (error) {
-    await updateRun(env.DB, job.runId, "needs-human", { reason: error instanceof Error ? error.message : "dispatch_identity_conflict" });
-    return "needs-human";
+    try {
+      await transitionRun(env.DB, job.runId, "needs-human", "reconciler", `schedule:identity-conflict:${job.runId}`, { result: { reason: error instanceof Error ? error.message : "dispatch_identity_conflict" } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
   }
   if (await stopped(env.DB) || String(env.FACTORY_ENABLED) !== "true" || String(env.FACTORY_AUTONOMY) !== "1") {
-    if (["admitted", "queued", "blocked-by-dependency"].includes(run.current_state)) await updateRun(env.DB, job.runId, "stopped", { reason: "factory_stopped_before_dispatch" });
+    if (["admitted", "blocked-by-dependency"].includes(run.current_state)) {
+      await transitionRun(env.DB, job.runId, "queued", "scheduler", `schedule:queue-before-stop:${job.runId}`);
+      run = await runById(env.DB, job.runId);
+      if (!run) return "missing";
+    }
+    if (run.current_state === "queued") await transitionRun(env.DB, job.runId, "stopped", "human-override", `schedule:stop:${job.runId}`, { result: { reason: "factory_stopped_before_dispatch" } });
     return "stopped";
   }
   if (!["admitted", "queued", "blocked-by-dependency"].includes(run.current_state)) return "already-handled";
+  const dependencyState = await dependenciesReady(job, env);
+  if (dependencyState === "unavailable") return "retryable";
+  if (dependencyState === "blocked") {
+    await transitionRun(env.DB, job.runId, "blocked-by-dependency", "scheduler", `schedule:blocked:${job.runId}`);
+    return "blocked-by-dependency";
+  }
   if (run.current_state === "admitted" || run.current_state === "blocked-by-dependency") {
-    await updateRun(env.DB, job.runId, "queued");
+    await transitionRun(env.DB, job.runId, "queued", "scheduler", `schedule:queue:${job.runId}`);
     run = await runById(env.DB, job.runId);
     if (!run) return "missing";
   }
-  const dependencyState = await dependenciesReady(job, env);
-  if (dependencyState === "unavailable") return "retryable";
-  if (dependencyState === "blocked") { await updateRun(env.DB, job.runId, "blocked-by-dependency"); return "blocked-by-dependency"; }
   const maxConcurrency = configInteger(env, "MAX_GLOBAL_CONCURRENCY", 1, 32);
-  if (maxConcurrency === null) { await updateRun(env.DB, job.runId, "needs-human", { reason: "global_concurrency_config_invalid" }); return "needs-human"; }
+  if (maxConcurrency === null) {
+    try {
+      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:invalid-concurrency:${job.runId}`, { result: { reason: "global_concurrency_config_invalid" } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
+  }
   const active = await env.DB.prepare("SELECT COUNT(*) AS count FROM factory_runs WHERE current_state IN ('leased','running','validating')").first<{ count: number }>();
   if ((active?.count ?? 0) >= maxConcurrency) return "global-busy";
   const leaseFence = await acquireLease(env.DB, run);
   if (leaseFence === null) return "repo-busy";
-  const leased = await env.DB.prepare("UPDATE factory_runs SET current_state='leased',lease_owner='workflow',lease_fence=?,lease_expires_at=?,updated_at=? WHERE run_id=? AND current_state='queued'").bind(leaseFence, new Date(Date.now() + 30 * 60_000).toISOString(), new Date().toISOString(), job.runId).run();
-  if (leased.meta.changes !== 1) {
+  const leaseExpiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
+  try {
+    await transitionRun(env.DB, job.runId, "leased", "scheduler", `schedule:lease:${job.runId}:${leaseFence}`, {
+      lease: { owner: "workflow", fence: leaseFence, expiresAt: leaseExpiresAt },
+    });
+  } catch {
     try { await releaseLease(env.DB, { ...run, lease_fence: leaseFence }); } catch { /* the competing state remains authoritative */ }
     return "already-handled";
   }
   try {
     const instance = await env.EXECUTION_WORKFLOW.create({ id: job.runId, params: job });
-    const running = await env.DB.prepare("UPDATE factory_runs SET workflow_id=?,current_state='running',updated_at=? WHERE run_id=? AND current_state='leased' AND lease_fence=?").bind(instance.id, new Date().toISOString(), job.runId, leaseFence).run();
-    if (running.meta.changes !== 1) throw new Error("lease_fenced");
+    await transitionRun(env.DB, job.runId, "running", "workflow", `schedule:running:${job.runId}:${leaseFence}`, { leaseFence, fields: { workflowId: instance.id } });
     return "dispatched";
   } catch {
-    await updateRun(env.DB, job.runId, "needs-human", { reason: "workflow_create_failed" }, leaseFence);
+    try {
+      await transitionRun(env.DB, job.runId, "queued", "reconciler", `schedule:workflow-failed:${job.runId}:${leaseFence}`, { result: { reason: "workflow_create_failed" }, leaseFence, lease: null });
+    } catch { /* the next recovery pass will surface any fenced write */ }
     try { await releaseLease(env.DB, { ...run, lease_fence: leaseFence }); } catch { /* the next recovery pass will surface the stale lease */ }
-    return "needs-human";
+    return "retryable";
   }
 }
 
@@ -998,7 +1217,7 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
     state = "needs-human";
     reason = "github_branch_identity_unavailable";
   } else if (run.current_state === "pr-merged" || run.current_state === "pr-canceled") {
-    state = "needs-human";
+    state = run.current_state;
     reason = "terminal_pr_reopened_or_reappeared";
   } else if (!run.head_sha) {
     state = "needs-human";
@@ -1015,8 +1234,10 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
   } else {
     state = "pr-open";
   }
-  await env.DB.prepare("UPDATE factory_runs SET current_state=?,head_sha=?,pr_number=?,pr_url=?,result_json=?,reconciled_at=?,updated_at=? WHERE run_id=?")
-    .bind(state, pull.head.sha, pull.number, pull.html_url, stable({ reason, action: job.action, base_sha: pull.base.sha, head_sha: pull.head.sha }), new Date().toISOString(), new Date().toISOString(), run.run_id).run();
+  await transitionRun(env.DB, run.run_id, state, "reconciler", `github:${job.eventId}`, {
+    result: { reason, action: job.action, base_sha: pull.base.sha, head_sha: pull.head.sha },
+    fields: { headSha: pull.head.sha, prNumber: pull.number, prUrl: pull.html_url, reconciledAt: new Date().toISOString() },
+  });
   await recordStep(env.DB, run.run_id, "reconciliation", state, { reason, action: job.action, pr_number: pull.number, base_sha: pull.base.sha, head_sha: pull.head.sha });
   const dispatchJob: Job = { kind: "dispatch", dispatchId: run.dispatch_id, runId: run.run_id, contractDigest: run.contract_digest, contract };
   await ensureLinearReceipt(env, dispatchJob, pull, state, reason);
@@ -1044,6 +1265,12 @@ function reconciliationJob(eventId: string, selector: ObjectValue): GitHubReconc
   } as GitHubReconciliationJob;
   if (!isGitHubReconciliationJob(job)) throw new Error("github_selector_invalid");
   return job;
+}
+
+function workflowActor(fromState: string, toState: string): TransitionActor {
+  if (toState === "stopped") return "human-override";
+  if (fromState === "validating" && ["fixable-failure", "failed", "needs-human"].includes(toState)) return "validator";
+  return "workflow";
 }
 
 async function rehydrateLinearJob(env: Env, selector: ObjectValue): Promise<Job> {
@@ -1100,7 +1327,10 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
     let leaseHeld = false;
     const finish = async (state: string, reason: string, extra: ObjectValue = {}): Promise<ObjectValue> => {
       await step.do("finalize", async () => {
-        await updateRun(this.env.DB, job.runId, state, { reason, ...extra }, run?.lease_fence);
+        const latest = await runById(this.env.DB, job.runId);
+        if (!latest) throw new Error("run_missing");
+        const fence = latest.lease_fence === null ? undefined : latest.lease_fence;
+        await transitionRun(this.env.DB, job.runId, state, workflowActor(latest.current_state, state), `workflow:final:${job.runId}`, { result: { reason, ...extra }, leaseFence: fence });
         await recordStep(this.env.DB, job.runId, "final", state, { reason, ...extra });
         return { recorded: true };
       });
@@ -1143,7 +1373,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
           return await finish(state, execution.reason, { head_sha: execution.head_sha ?? null, branch: execution.branch ?? null });
         }
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_validation", { head_sha: execution.head_sha, branch: execution.branch });
-        await updateRun(this.env.DB, job.runId, "validating", undefined, run.lease_fence);
+        await transitionRun(this.env.DB, job.runId, "validating", "workflow", `workflow:validating:${job.runId}:${attempt}`, { leaseFence: run.lease_fence ?? undefined });
 
         validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: "16 minutes" }, async (): Promise<ValidationResult> => {
           const result = await validateInFreshSandbox(this.env, job, execution as AgentResult);
@@ -1152,8 +1382,8 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         });
         if (validation.status !== "passed") {
           if (validation.fixable && attempt < maxFixAttempts) {
-            await updateRun(this.env.DB, job.runId, "fixable-failure", { reason: validation.reason, validation_digest: validation.output_digest, validation_bytes: validation.output_bytes }, run.lease_fence);
-            await updateRun(this.env.DB, job.runId, "running", { reason: "bounded_fix_attempt", attempt: attempt + 1 }, run.lease_fence);
+            await transitionRun(this.env.DB, job.runId, "fixable-failure", "validator", `workflow:validation-fixable:${job.runId}:${attempt}`, { result: { reason: validation.reason, validation_digest: validation.output_digest, validation_bytes: validation.output_bytes }, leaseFence: run.lease_fence ?? undefined });
+            await transitionRun(this.env.DB, job.runId, "running", "workflow", `workflow:validation-retry:${job.runId}:${attempt}`, { result: { reason: "bounded_fix_attempt", attempt: attempt + 1 }, leaseFence: run.lease_fence ?? undefined });
             continue;
           }
           return await finish("failed", validation.reason, { validation_digest: validation.output_digest, validation_bytes: validation.output_bytes, head_sha: execution.head_sha });
@@ -1168,8 +1398,8 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         if (review.status !== "passed") {
           if (attempt < maxFixAttempts) {
             validation = { status: "failed", exit_code: 78, output_digest: review.digest, output_bytes: review.bytes, reason: review.reason, fixable: true };
-            await updateRun(this.env.DB, job.runId, "fixable-failure", { reason: review.reason, review_digest: review.digest, review_bytes: review.bytes }, run.lease_fence);
-            await updateRun(this.env.DB, job.runId, "running", { reason: "bounded_fix_attempt", attempt: attempt + 1 }, run.lease_fence);
+            await transitionRun(this.env.DB, job.runId, "fixable-failure", "validator", `workflow:review-fixable:${job.runId}:${attempt}`, { result: { reason: review.reason, review_digest: review.digest, review_bytes: review.bytes }, leaseFence: run.lease_fence ?? undefined });
+            await transitionRun(this.env.DB, job.runId, "running", "workflow", `workflow:review-retry:${job.runId}:${attempt}`, { result: { reason: "bounded_fix_attempt", attempt: attempt + 1 }, leaseFence: run.lease_fence ?? undefined });
             continue;
           }
           return await finish("needs-human", review.reason, { review_digest: review.digest, review_bytes: review.bytes, head_sha: execution.head_sha });
@@ -1192,9 +1422,11 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       });
       await step.do("finalize-pr", async () => {
         const pull = published as PullRequest;
-        const finalized = await this.env.DB.prepare("UPDATE factory_runs SET current_state='pr-open',branch=?,head_sha=?,pr_number=?,pr_url=?,result_json=?,updated_at=? WHERE run_id=? AND lease_fence=?")
-          .bind(execution?.branch ?? null, pull.head.sha, pull.number, pull.html_url, stable({ reason: "pr_published", validation_digest: validation.output_digest, validation_bytes: validation.output_bytes, review_digest: review?.digest, review_bytes: review?.bytes, linear_receipt: receipt }), new Date().toISOString(), job.runId, run?.lease_fence).run();
-        if (finalized.meta.changes !== 1) throw new Error("lease_fenced");
+        await transitionRun(this.env.DB, job.runId, "pr-open", "workflow", `workflow:publish:${job.runId}`, {
+          result: { reason: "pr_published", validation_digest: validation.output_digest, validation_bytes: validation.output_bytes, review_digest: review?.digest, review_bytes: review?.bytes, linear_receipt: receipt },
+          leaseFence: run?.lease_fence ?? undefined,
+          fields: { branch: execution?.branch ?? null, headSha: pull.head.sha, prNumber: pull.number, prUrl: pull.html_url },
+        });
         await recordStep(this.env.DB, job.runId, "final", "pr-open", { pr_number: pull.number, pr_url: pull.html_url, head_sha: pull.head.sha });
         return { recorded: true };
       });
@@ -1202,8 +1434,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
     } catch (error) {
       const reason = error instanceof Error && ["publication_base_changed", "grounding_base_unavailable", "base_sha_unavailable", "fix_branch_base_changed"].includes(error.message) ? error.message : "workflow_step_failed";
       const state = reason === "publication_base_changed" || reason === "grounding_base_unavailable" || reason === "base_sha_unavailable" || reason === "fix_branch_base_changed" ? "needs-replan" : "needs-human";
-      await step.do("finalize", async () => { await updateRun(this.env.DB, job.runId, state, { reason, pr_url: published?.html_url ?? null, pr_number: published?.number ?? null }, run?.lease_fence); await recordStep(this.env.DB, job.runId, "final", state, { reason }); return { recorded: true }; });
-      return { status: state, runId: job.runId, reason };
+      return await finish(state, reason, { pr_url: published?.html_url ?? null, pr_number: published?.number ?? null });
     } finally {
       if (leaseHeld) await step.do("release-lease", async () => {
         const latest = await runById(this.env.DB, job.runId);
