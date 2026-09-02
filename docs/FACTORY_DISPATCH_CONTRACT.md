@@ -16,3 +16,27 @@ Validation has three outcomes:
 `execution_failed` is deliberately not a contract outcome. It is a later runtime result after an admitted contract has entered execution.
 
 Admission may supply the current revision/base and the supported profile registry to `validate_dispatch_contract`; it must persist the returned digest and outcome without reinterpreting prose.
+
+## Linear admission envelope
+
+The Linear description must contain exactly one explicit envelope:
+
+```text
+<!-- mhoo-factory-dispatch:v1 -->
+{complete v1 contract JSON}
+<!-- /mhoo-factory-dispatch:v1 -->
+```
+
+`factory/admission.py` checks the exact configured Linear project, issue ID, and
+identifier before calling the contract validator. The repository, profiles,
+collision group, dependencies, authority, acceptance, scope, merge policy, base
+revision, and planning fingerprint all come from the envelope. Missing,
+duplicated, malformed, or mismatched fields are refused; no description prose
+can fill a field.
+
+The admission decision is pure and has no model or provider-write path. It
+returns `admitted`, `not-admitted`, `needs-replan`, or `needs-human`. A stable
+dispatch identity is bound to `IDENTIFIER@PLANNING_REVISION`; the canonical
+contract digest is the identity of the exact admitted contents. Existing ledger
+identities and replayed event IDs must be supplied by the caller before any
+queue handoff.

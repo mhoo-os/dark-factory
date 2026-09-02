@@ -1,0 +1,7 @@
+{
+  "valid": {
+    "project_id": "2dab9206-cb92-49a4-aeef-95ec45280098",
+    "issue": {"id":"issue-900","identifier":"MHO-900","project":{"id":"2dab9206-cb92-49a4-aeef-95ec45280098"},"state":{"type":"unstarted"}},
+    "contract": {"contract_version":"v1","dispatch_id":"MHO-900@r1","linear":{"project_id":"2dab9206-cb92-49a4-aeef-95ec45280098","issue_id":"issue-900","identifier":"MHO-900","planning_revision":"r1","planning_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"target":{"repository":"mhoo-os/dark-factory","work_type":"implementation","execution_profile":"python-tests-v1","collision_group":"dark-factory-runtime","base_sha":"0123456789abcdef0123456789abcdef01234567"},"dependencies":[],"risk":{"risk_class":"low","authority_class":"repository-local"},"acceptance_criteria":["Admission is deterministic"],"validation_profile":"python-tests-v1","allowed_scope":{"paths":["factory/admission.py","tests/**"],"max_files":4,"max_changed_lines":300},"merge_policy":"human","stale_conditions":["planning_revision_changed","planning_fingerprint_changed","base_sha_changed"]}
+  }
+}

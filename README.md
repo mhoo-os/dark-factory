@@ -1,8 +1,10 @@
 # Mhoo Dark Factory
 
-Cole-style factory tooling for Mhoo OS. Its scheduled intake reads only explicit
-MHOO connector candidates from Linear and creates a single linked GitHub execution
-issue in the candidate's declared `mhoo-os/<repository>` target.
+Cole-style factory tooling for Mhoo OS. Its scheduled intake reads only issues in
+the configured Linear factory project that contain one explicit Factory Dispatch
+Contract v1 block. Deterministic admission validates that contract and, when
+the factory is enabled for that stage, creates one linked GitHub execution issue
+in the contract's declared `mhoo-os/<repository>` target.
 
 The initial schedule is **triage-only**: it does not edit product code, merge pull
 requests, or change repository protection. Target repositories must earn their own
@@ -23,13 +25,17 @@ bash factory/install-linear-trigger.sh --status
 bash factory/install-linear-trigger.sh --remove
 ```
 
-Create a Linear candidate from the MHOO template, place it in `Todo`, and include:
+Create a Linear candidate in the configured factory project, place it in `Todo` or
+`In Progress`, and include exactly one machine-readable contract block:
 
-```markdown
-* Repository target: `mhoo-os/<repository>`
-* Candidate key: `<stable-key>`
+```text
+<!-- mhoo-factory-dispatch:v1 -->
+{the complete Factory Dispatch Contract v1 JSON}
+<!-- /mhoo-factory-dispatch:v1 -->
 ```
 
-The factory fails closed when the candidate is ambiguous, the target is outside
-`mhoo-os`, the local stop file exists, the Linear credential is unavailable, or the
-remote GitHub stop label is present.
+The factory fails closed when the project or issue identity is wrong, the contract
+is missing or ambiguous, the target/profile is unsupported, the planning snapshot
+is stale, the local stop file exists, the Linear credential is unavailable, or a
+target repository's remote stop label is present. Admission does not invoke a
+model or write to Linear, GitHub, or the execution queue.
