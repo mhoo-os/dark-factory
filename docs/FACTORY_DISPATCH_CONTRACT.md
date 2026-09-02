@@ -1,0 +1,20 @@
+# Factory Dispatch Contract v1
+
+The factory executes only a normalized contract produced from an already-planned
+Linear issue. It never fills missing fields by guessing.
+
+The machine-readable schema is [`factory/dispatch_contract.schema.json`](../factory/dispatch_contract.schema.json), and the pure validator is [`factory/dispatch_contract.py`](../factory/dispatch_contract.py).
+
+Required data binds one Linear issue and planning revision to one `mhoo-os/<repository>`, base commit, execution/validation profiles, dependency list, risk and authority class, acceptance criteria, allowed scope, merge policy, and explicit stale conditions. `dispatch_id` is the idempotency identity; the canonical JSON digest binds the exact contract contents.
+
+The `linear.issue_id` field is the immutable provider identity for the Linear issue, while `linear.identifier` is its human-readable key (for example, `MHO-199`). Admission must verify that both values refer to the same issue; neither value is accepted as a substitute for the other.
+
+Validation has three outcomes:
+
+- `admitted`: the contract is complete and current.
+- `not-admitted`: the shape, profile, duplicate identity, or declared value is invalid.
+- `needs-replan`: the contract was valid, but its Linear revision, planning fingerprint, or base commit is no longer current.
+
+`execution_failed` is deliberately not a contract outcome. It is a later runtime result after an admitted contract has entered execution.
+
+Admission may supply the current revision/base and the supported profile registry to `validate_dispatch_contract`; it must persist the returned digest and outcome without reinterpreting prose.
