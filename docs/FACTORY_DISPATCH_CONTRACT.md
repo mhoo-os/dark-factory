@@ -7,6 +7,8 @@ The machine-readable schema is [`factory/dispatch_contract.schema.json`](../fact
 
 Required data binds one Linear issue and planning revision to one `mhoo-os/<repository>`, base commit, execution/validation profiles, dependency list, risk and authority class, acceptance criteria, allowed scope, merge policy, and explicit stale conditions. `dispatch_id` is the idempotency identity; the canonical JSON digest binds the exact contract contents.
 
+The `linear.issue_id` field is the immutable provider identity for the Linear issue, while `linear.identifier` is its human-readable key (for example, `MHO-199`). Admission must verify that both values refer to the same issue; neither value is accepted as a substitute for the other.
+
 Validation has three outcomes:
 
 - `admitted`: the contract is complete and current.
@@ -16,7 +18,6 @@ Validation has three outcomes:
 `execution_failed` is deliberately not a contract outcome. It is a later runtime result after an admitted contract has entered execution.
 
 Admission may supply the current revision/base and the supported profile registry to `validate_dispatch_contract`; it must persist the returned digest and outcome without reinterpreting prose.
-
 ## Linear admission envelope
 
 The Linear description must contain exactly one explicit envelope:
