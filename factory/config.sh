@@ -50,13 +50,13 @@ FACTORY_MAX_BUDGET_USD="${FACTORY_MAX_BUDGET_USD:-8}"
 # and it is the thing this template deliberately does NOT give you: what "working"
 # means for your app is the one part nobody can write for you.
 #
-# It must exit non-zero when the software is broken, and it must print a positive marker
-# for every check that RAN. See references/validation-harness.md.
-FACTORY_VALIDATE_CMD="${FACTORY_VALIDATE_CMD:-python harness/ci.py}"
+# It must exit non-zero when the software is broken. Contract tests and the full suite
+# are the source-level validation available in this reference repository.
+FACTORY_VALIDATE_CMD="${FACTORY_VALIDATE_CMD:-python3 -m unittest discover -s tests -v}"
 
 # The cheap subset an implementing node may run on itself while it works. Keep it fast;
 # the real gate runs independently afterwards regardless of what this said.
-FACTORY_VALIDATE_QUICK="${FACTORY_VALIDATE_QUICK:-python harness/ci.py --quick}"
+FACTORY_VALIDATE_QUICK="${FACTORY_VALIDATE_QUICK:-python3 -m unittest discover -s tests -v}"
 
 # EMPTY IS NOT PASS, expressed as data.
 #
@@ -80,23 +80,11 @@ FACTORY_E2E_FLOOR_KEY="${FACTORY_E2E_FLOOR_KEY:-e2e_steps_asserted}"
 FACTORY_BACKEND="${FACTORY_BACKEND:-}"
 
 # --- the dial ----------------------------------------------------------------
-# 0 workflows exist, run by hand   <- where every factory starts, and stays until a lap
-#                                     has been proven by hand
-# 1 accepted issue -> branch and PR open
-# 2 + the validator runs and writes a verdict
-# 3 + the validator AUTO-MERGES on green structural gates   <- THE TARGET. Build for this.
-# 4 + self-triage, and a scheduled run files its own bugs
-# 5 + writes its own issues from the mission
-#
-# LEVEL 3 IS THE RECOMMENDED DESTINATION and 1 and 2 are the way there, not places to
-# stop: at 2 a person still merges every PR, which is the bottleneck the factory was
-# built to remove. Everything expensive in this repo - the holdout, the mutation set, the
-# ratchet, the two gates that are code - exists to earn 3.
-#
-# The SHIPPED value is still 0, deliberately. A fresh clone must not auto-merge before a
-# single lap has been proven by hand, and `factory_doctor` refuses 3 while there is no
-# holdout, so the dial cannot outrun the evidence. Raise it here once it has.
-FACTORY_AUTONOMY="${FACTORY_AUTONOMY:-4}"
+# 0 = no dispatch; 1 = admitted issue opens a bounded PR; 2 = independent validation;
+# 3 = human-approved auto-merge under the ratchet; 4 = self-triage; 5 = self-authored work.
+# The shipped default is deliberately 0. It may rise only after the held-out evidence
+# and human approval required by MISSION.md and FACTORY.md exist.
+FACTORY_AUTONOMY="${FACTORY_AUTONOMY:-0}"
 
 FACTORY_MAX_PARALLEL="${FACTORY_MAX_PARALLEL:-1}"
 FACTORY_MAX_FIX_ATTEMPTS="${FACTORY_MAX_FIX_ATTEMPTS:-2}"
@@ -185,15 +173,15 @@ FACTORY_NOTIFY_CMD="${FACTORY_NOTIFY_CMD:-}"
 # has already happened by the time this is called.
 # THE CONTRACT, because getting it wrong produces a useless notification rather than none:
 #
-#   STDIN   "<target> needs a human: <reason>"   <- the whole message. Read this.
-#   argv[1] "<target>"                           <- for routing or a subject line only
+#   STDIN   "target needs a human: reason"       <- the whole message. Read this.
+#   argv[1] "target"                              <- for routing or a subject line only
 #
 # Every example in references/setup.md reads stdin (`xargs`, `curl -d @-`, `tee`) and is
 # correct. Somebody writing their own reaches for "$1" by reflex - a one-line Slack curl
 # is the obvious case - and gets a 3am alert whose entire body is `.factory/prs/0001.md`:
 # it tells you something is wrong and not what, which is close to no notification at all.
 # Observed while testing this path. If you write your own, read stdin.
-factory_notify() {              # factory_notify <target> <reason...>
+factory_notify() {              # factory_notify target reason...
   local target="$1"; shift
   if [ -z "${FACTORY_NOTIFY_CMD:-}" ]; then
     echo "NOT NOTIFIED - FACTORY_NOTIFY_CMD unset; this waits in .factory/needs-human.md"
