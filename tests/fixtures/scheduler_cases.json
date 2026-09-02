@@ -1,0 +1,8 @@
+{
+  "runs": [
+    {"dispatch_id":"run-c","identifier":"MHO-30","repository":"mhoo-os/dark-factory","collision_groups":["runtime"],"priority":3,"state":"admitted","dependency_states":{}},
+    {"dispatch_id":"run-a","identifier":"MHO-10","repository":"mhoo-os/dark-factory","collision_groups":["governance"],"priority":1,"state":"admitted","dependency_states":{}},
+    {"dispatch_id":"run-b","identifier":"MHO-20","repository":"mhoo-os/other","collision_groups":["runtime"],"priority":2,"state":"admitted","dependency_states":{"MHO-9":"queued"}},
+    {"dispatch_id":"run-d","identifier":"MHO-40","repository":"mhoo-os/other","collision_groups":["docs"],"priority":2,"state":"queued","dependency_states":{}}
+  ]
+}
