@@ -3,13 +3,13 @@
 <!--
   Owner: humans only. On the protected list. The factory cannot edit this file.
   Every workflow reads it at run start, so edits take effect on the next cycle with
-  no restart. Replace every <angle-bracket> placeholder.
+  no restart. Keep this file complete and free of template placeholders.
 -->
 
 This file governs how the factory operates on this repository. Every workflow reads
 it, and so does the dispatcher.
 
-**Hierarchy.** `MISSION.md` defines *what* this is. <conventions file> defines *how the
+**Hierarchy.** `MISSION.md` defines *what* this is. `CLAUDE.md` defines *how the
 code is written*. This file defines *how the factory operates safely*. On conflict:
 MISSION wins on scope, conventions win on style, this file wins on process.
 
@@ -44,8 +44,8 @@ have to notice.
 **Priority:** exactly one of `priority:critical` / `high` / `medium` / `low`.
 critical = production broken, data loss, or a live security issue.
 
-**Flood protection:** max <3> issues per calendar day from any non-owner author;
-excess gets `factory:rate-limited` and waits. Triage processes at most <10> issues per
+**Flood protection:** max 3 issues per calendar day from any non-owner author;
+excess gets `factory:rate-limited` and waits. Triage processes at most 10 issues per
 run; bigger backlogs drain over multiple cycles.
 
 ## 2. Implementation
@@ -62,11 +62,12 @@ run; bigger backlogs drain over multiple cycles.
    "while I was in here".
 6. **Never commit secrets, keys, tokens, or env files.**
 7. **Never weaken authentication or authorization.**
-8. **Never modify <the security invariant>** or its enforcement path.
+8. **Never modify the authority, authentication, stop-control, or scope enforcement
+   paths** without a human-owned governance change.
 
 **Every PR must:**
 
-- change at most **<500>** lines (additions + deletions). Over the cap, stop and file
+- change at most **500** lines (additions + deletions). Over the cap, stop and file
   a sub-issue splitting the work rather than shipping something unreviewable.
 - link its issue with `Fixes #N` / `Closes #N` / `Resolves #N`. The validator extracts
   this; a PR without it cannot be validated.
@@ -78,17 +79,17 @@ run; bigger backlogs drain over multiple cycles.
 The validator merges only when **every** gate is true. Gates marked **[CODE]** are
 enforced by a script and cannot be argued past.
 
-1. Static checks pass - <commands>
-2. Unit and integration tests pass - <command>
+1. Static checks pass - `python3 -m py_compile factory/*.py`.
+2. Unit and integration tests pass - `python3 -m unittest discover -s tests -v`.
 3. **[CODE]** The app started. `APP_STARTED` appears in the run output.
 4. **[CODE]** The end-to-end path ran and passed. `E2E_PASSED` appears, with a step
-   count at or above <N>.
+   count at or above 3.
 5. Behavioural verdict is `solves_issue: yes` against the original issue.
 6. Security check passes: no new secrets, no protected-file changes, no weakened auth.
 7. Code review finds no critical or high findings.
 8. **[CODE]** No protected file touched (§5).
 9. PR within the size cap.
-10. Fix attempts ≤ <2>.
+10. Fix attempts ≤ 2.
 
 **Merge mechanism:** squash only, performed by a script that reads the verdict file.
 Never by a model deciding to merge.
@@ -96,7 +97,11 @@ Never by a model deciding to merge.
 ## 4. The mandatory end-to-end regression
 
 Every PR touching runnable code must pass the full user path from `MISSION.md`'s Gate
-3, driven by <the E2E tool> against a running instance.
+3, driven by `factory/tick.sh --dry-run` and the applicable repository validation
+profile. A live execution path additionally requires the held-out pilot gate.
+
+Cron is a reconciliation mechanism for missed events, stale leases, retries, and
+dead-letter recovery; it is never the primary intake or an authority to invent work.
 
 - Runs after static checks and unit tests, as the final step of every validation run.
 - Also runs on a schedule against the deployed app.
@@ -110,13 +115,13 @@ Every PR touching runnable code must pass the full user path from `MISSION.md`'s
 
 Rejected outright with no fix attempt; the PR closes and the issue escalates.
 
-**Governance:** `MISSION.md`, `FACTORY_RULES.md`, `<conventions file>`
+**Governance:** `MISSION.md`, `FACTORY_RULES.md`, `FACTORY.md`, `CLAUDE.md`
 **CI and repo config:** `.github/**`
 **Infrastructure:** `Dockerfile*`, `docker-compose*.yml`, `deploy/**`, `infra/**`,
-  `*.service`, `*.timer`, `<platform config>`
-**Secrets and auth:** `.env*`, `<agent/tool config holding a token>`, `secrets.*`,
-  `credentials.*`, `<the auth module>`
-**Security invariants:** `<the file defining the limit>`, `<CORS/CSRF/auth middleware>`
+  `*.service`, `*.timer`, `factory/config.sh`
+**Secrets and auth:** `.env*`, `factory/store-linear-key.sh`, `secrets.*`,
+  `credentials.*`, and authentication/stop-control code
+**Security invariants:** `factory/guard.py`, `factory/state.py`, and the dispatch scope checks
 
 If solving an issue requires touching any of these, the issue is by definition out of
 scope for the factory and escalates to `factory:needs-human`.
@@ -128,7 +133,7 @@ config file that could hold a token. **Empty output means the next run publishes
 
 1. Any protected-file modification
 2. Critical or high security finding
-3. Any change to <the hard invariant> or an attempt to make it configurable
+3. Any change to Linear planning authority, the hard scope invariant, or an attempt to make it configurable
 4. Any change disabling auth on an endpoint or adding an anonymous path
 5. Any change adding a new public surface that MISSION excludes
 6. Any change whose primary effect is editing tests so they pass
@@ -169,7 +174,7 @@ rather than an abstract one about nothing.
 3. a **MISSION invariant** would have to change, or the issue contradicts one
 4. the blast radius is on the **irreversible list** in §7.3
 5. two governance statements genuinely contradict, so every plan violates one
-6. <2> failed validation cycles on the same PR, or the fix step cannot resolve the findings
+6. 2 failed validation cycles on the same PR, or the fix step cannot resolve the findings
 7. a critical or high security finding
 
 **Not on the list:** an open question in MISSION or the PRD, an unspecified product value,
@@ -181,10 +186,10 @@ an ambiguity that can be resolved defensibly, a thing you would merely prefer co
      short: everything on it costs throughput, and everything missing from it costs more
      than throughput. -->
 
-- <schema migrations and any destructive data change>
-- <anything that moves money>
-- <auth, permissions, and secret handling>
-- <a public/irreversible external side effect - a sent email, a published package>
+- schema migrations and any destructive data change;
+- anything that moves money;
+- auth, permissions, secret handling, or credential custody;
+- a public or irreversible external side effect, including a published package or production cutover.
 
 ### 7.4 When it does stop
 
@@ -198,13 +203,13 @@ carries on - it does not re-ask.
 
 ## 8. Cost and throughput
 
-- Triage batch: <10> issues per run
-- Concurrency: <1> workflow at a time. Above one, a per-target lock is mandatory - never dispatch a workflow whose (workflow, target) pair is already in flight.
-- Fix attempts per PR: <2>
-- PR size: <500> lines
+- Triage batch: 10 issues per run
+- Concurrency: 1 workflow at a time. Above one, a per-target lock is mandatory - never dispatch a workflow whose (workflow, target) pair is already in flight.
+- Fix attempts per PR: 2
+- PR size: 500 lines
 - **Dispatcher priority order:** fix a PR → validate a PR → implement an issue →
   triage. Finish in-flight work before starting new work.
-- **Stop button:** <the mechanism>. Documented, and tested once on purpose.
+- **Stop button:** create `.factory/STOP`. It is checked before any dispatch and must be tested in the held-out drill.
 
 ## 9. Separation of concerns - the holdout
 

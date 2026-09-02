@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mhoo.app/schemas/factory-profile-registry-v1.json",
+  "title": "Mhoo Factory Profile Registry v1",
+  "type": "object",
+  "required": ["version", "execution_profiles", "validation_profiles", "collision_groups", "targets"],
+  "properties": {
+    "version": {"const":"v1"},
+    "execution_profiles": {"type":"array","minItems":1,"items":{"type":"object","required":["id","runtime","checkout_steps","allowed_tools","model_policy","limits","artifacts"]}},
+    "validation_profiles": {"type":"array","minItems":1,"items":{"type":"object","required":["id","quick_checks","full_checks","required_markers","governance_checks","holdout_hooks","merge_eligibility"]}},
+    "collision_groups": {"type":"array","minItems":1,"items":{"type":"object","required":["id","paths"]}},
+    "targets": {"type":"array","minItems":1,"items":{"type":"object","required":["repository","execution_profile","validation_profile","collision_groups"]}}
+  }
+}

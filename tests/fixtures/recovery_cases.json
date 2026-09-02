@@ -1,0 +1,8 @@
+{
+  "healthy": {"dispatch_id":"run-healthy","state":"running","workflow_expected":true,"workflow_live":true,"lease_owner":"worker-1","lease_expires_at":200,"owner_live":true},
+  "killed_workflow": {"dispatch_id":"run-killed","state":"leased","workflow_expected":true,"workflow_live":false,"lease_owner":"worker-1","lease_expires_at":90,"owner_live":false},
+  "unblocked": {"dispatch_id":"run-unblocked","state":"blocked-by-dependency","dependency_ready":true},
+  "missed_webhook": {"dispatch_id":"run-missed","state":"queued","missed_webhook":true},
+  "stopped": {"dispatch_id":"run-stopped","state":"queued","stop_requested":true},
+  "dead_letter": {"dispatch_id":"run-dlq","state":"running","failure_class":"provider_5xx","attempts":2,"max_attempts":2}
+}
