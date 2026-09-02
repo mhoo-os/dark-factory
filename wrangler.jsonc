@@ -1,0 +1,55 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mhoo-dark-factory-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "vars": {
+    "ALLOWED_REPOSITORY_PREFIX": "mhoo-os/",
+    "AUTO_MERGE": "false",
+    "FACTORY_AUTONOMY": "0",
+    "FACTORY_ENABLED": "false",
+    "LINEAR_PROJECT_ID": "2dab9206-cb92-49a4-aeef-95ec45280098",
+    "MAX_COST_USD": "8",
+    "MAX_FIX_ATTEMPTS": "2",
+    "MAX_GLOBAL_CONCURRENCY": "1",
+    "MAX_PAYLOAD_BYTES": "262144",
+    "OPENROUTER_MODEL": "z-ai/glm-5.3-flash",
+    "SANDBOX_COMMAND": "node /opt/mhoo-factory-agent.mjs"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mhoo-dark-factory-ledger",
+      "database_id": "e76d5f65-a33c-41cf-9f82-622c1d53cf43"
+    }
+  ],
+  "queues": {
+    "producers": [{ "binding": "EXECUTION_QUEUE", "queue": "mhoo-dark-factory-execution" }],
+    "consumers": [{
+      "queue": "mhoo-dark-factory-execution",
+      "max_batch_size": 1,
+      "max_batch_timeout": 5,
+      "max_retries": 3,
+      "dead_letter_queue": "mhoo-dark-factory-execution-dlq"
+    }]
+  },
+  "workflows": [{
+    "name": "mhoo-dark-factory-execution",
+    "binding": "EXECUTION_WORKFLOW",
+    "class_name": "ExecutionWorkflow"
+  }],
+  "durable_objects": {
+    "bindings": [{ "name": "Sandbox", "class_name": "Sandbox" }]
+  },
+  "containers": [{
+    "class_name": "Sandbox",
+    "image": "./Dockerfile",
+    "instance_type": "lite",
+    "max_instances": 1
+  }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sandbox"] }],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+}
