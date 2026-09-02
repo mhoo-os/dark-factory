@@ -22,6 +22,7 @@ const BRANCH = /^factory\/[a-z0-9][a-z0-9-]{0,127}$/;
 const RUN_ID = /^run-v1-[0-9a-f]{32}$/;
 const GITHUB_API_VERSION = "2022-11-28";
 const MAX_PROVIDER_BODY_BYTES = 64 * 1024;
+const PROVIDER_TIMEOUT_MS = 30_000;
 const GITHUB_EVENT_TYPES = new Set(["pull_request", "workflow_run"]);
 const PROFILE_DIGEST = "sha256:e56a438c8feb33cd39b03aca75a3b8596d63de5c90662f87a16729b9d467acfb";
 const SUPPORTED_TARGETS = {
@@ -583,7 +584,7 @@ async function dependenciesReady(job: Job, env: Env): Promise<"ready" | "blocked
   if (!token) return "unavailable";
   const query = "query($ids:[ID!]!){issues(filter:{id:{in:$ids}}){nodes{id,state{type}}}}";
   try {
-    const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables: { ids: job.contract.dependencies.map((item) => item.issue_id) } }) });
+    const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables: { ids: job.contract.dependencies.map((item) => item.issue_id) } }), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
     if (!result.ok) return "unavailable";
     const body = await result.json() as ObjectValue;
     if (Array.isArray(body.errors) && body.errors.length > 0) return "unavailable";
@@ -1077,6 +1078,7 @@ async function githubRequest(token: string, method: string, path: string, body?:
     method,
     headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": GITHUB_API_VERSION, "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
   });
   if (!result.ok) throw new Error(`github_request_failed_${result.status}`);
   return await jsonResponse(result);
@@ -1131,7 +1133,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
 async function linearGraphql(env: Env, query: string, variables: ObjectValue): Promise<ObjectValue> {
   const token = secret(env, "LINEAR_API_KEY");
   if (!token) throw new Error("linear_credentials_missing");
-  const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables }) });
+  const result = await fetch("https://api.linear.app/graphql", { method: "POST", headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
   if (!result.ok) throw new Error("linear_request_failed");
   const body = await jsonResponse(result);
   if (Array.isArray(body) || (Array.isArray(body.errors) && body.errors.length > 0) || !body.data || typeof body.data !== "object") throw new Error("linear_response_invalid");

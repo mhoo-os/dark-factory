@@ -86,3 +86,8 @@ test("Linear receipt lookup paginates and fails closed on an unbounded history",
   assert.match(source, /linear_receipts_pagination_invalid/);
   assert.match(source, /linear_receipts_pagination_limit/);
 });
+
+test("provider calls have an explicit timeout", () => {
+  const timeouts = source.match(/signal: AbortSignal\.timeout\(PROVIDER_TIMEOUT_MS\)/g) ?? [];
+  assert.equal(timeouts.length, 3);
+});
