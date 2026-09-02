@@ -17,5 +17,7 @@ LINEAR_API_KEY="$(security find-generic-password -a "${USER:?USER must be set}" 
 export LINEAR_API_KEY
 trap 'unset LINEAR_API_KEY' EXIT
 
-python3 factory/linear_triage.py "$@"
+# Run the triage module from the repository root so its `factory.*` imports resolve
+# exactly as they do under the test runner and in the Worker-side control plane.
+python3 -m factory.linear_triage "$@"
 bash factory/orchestrator.sh "$@"

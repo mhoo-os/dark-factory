@@ -107,6 +107,15 @@ class Ledger:
                     target["base_sha"], timestamp, timestamp,
                 ),
             )
+            admission_event_id = f"admission:{contract.dispatch_id}"
+            self.connection.execute(
+                "INSERT INTO factory_events(event_id, dispatch_id, event_sequence, event_type, payload_digest, accepted, reason, received_at) VALUES (?, ?, 1, 'state:admitted', ?, 1, 'accepted', ?)",
+                (admission_event_id, contract.dispatch_id, contract.digest, timestamp),
+            )
+            self.connection.execute(
+                "INSERT INTO factory_transitions(dispatch_id, event_sequence, event_id, from_state, to_state, actor, created_at) VALUES (?, 1, ?, 'proposed', 'admitted', 'admission', ?)",
+                (contract.dispatch_id, admission_event_id, timestamp),
+            )
             self.connection.commit()
             return AdmissionReceipt(contract.dispatch_id, run_id, contract.digest, True)
         except Exception:
