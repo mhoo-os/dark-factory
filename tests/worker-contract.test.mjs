@@ -80,3 +80,9 @@ test("PR reconciliation binds both head and base to the target repository", () =
   assert.match(source, /baseRepository !== expectedRepository/);
   assert.match(source, /pullRequest\(value, job\.repository\)/);
 });
+
+test("Linear receipt lookup paginates and fails closed on an unbounded history", () => {
+  assert.match(source, /comments\(first:50,after:\$after\)/);
+  assert.match(source, /linear_receipts_pagination_invalid/);
+  assert.match(source, /linear_receipts_pagination_limit/);
+});

@@ -1140,11 +1140,21 @@ async function linearGraphql(env: Env, query: string, variables: ObjectValue): P
 
 async function ensureLinearReceipt(env: Env, job: Job, pull: PullRequest, state = "pr-open", reason = "pr_published"): Promise<"created" | "existing"> {
   const marker = `<!-- mhoo-dark-factory-receipt:v1 run=${job.runId} -->`;
-  const query = "query($issueId:ID!){issue(id:$issueId){comments(first:50){nodes{id body}}}}";
-  const data = await linearGraphql(env, query, { issueId: job.contract.linear.issue_id });
-  const issue = data.issue as ObjectValue | undefined;
-  const comments = issue?.comments as ObjectValue | undefined;
-  const nodes = comments && Array.isArray(comments.nodes) ? comments.nodes : [];
+  const query = "query($issueId:ID!,$after:String){issue(id:$issueId){comments(first:50,after:$after){nodes{id body}pageInfo{hasNextPage endCursor}}}}";
+  const nodes: unknown[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < 10; page += 1) {
+    const data = await linearGraphql(env, query, { issueId: job.contract.linear.issue_id, after });
+    const issue = data.issue as ObjectValue | undefined;
+    const comments = issue?.comments as ObjectValue | undefined;
+    const pageInfo = comments?.pageInfo as ObjectValue | undefined;
+    if (!comments || !Array.isArray(comments.nodes) || !pageInfo || typeof pageInfo.hasNextPage !== "boolean") throw new Error("linear_receipts_pagination_invalid");
+    nodes.push(...comments.nodes);
+    if (!pageInfo.hasNextPage) break;
+    if (typeof pageInfo.endCursor !== "string" || pageInfo.endCursor.length === 0 || pageInfo.endCursor.length > 256) throw new Error("linear_receipts_pagination_invalid");
+    after = pageInfo.endCursor;
+    if (page === 9) throw new Error("linear_receipts_pagination_limit");
+  }
   const body = `${marker}\n\nFactory execution for ${job.contract.linear.identifier}: ${state}.\n\n- Run: \`${job.runId}\`\n- Reason: \`${reason}\`\n- Contract digest: \`${job.contractDigest}\`\n- Repository: \`${job.contract.target.repository}\`\n- PR: ${pull.html_url}\n- PR head: \`${pull.head.sha}\`\n\nAutomatic merge is disabled; human review is required.`;
   const matches = nodes.filter((item) => {
     if (!item || typeof item !== "object") return false;
