@@ -21,49 +21,52 @@ def valid_issue() -> dict[str, object]:
 
 class AdmissionTests(unittest.TestCase):
     def test_positive_fixture_materializes_stable_contract_and_digest(self) -> None:
-        first = admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID)
-        second = admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID)
+        first = admit_linear_issue(valid_issue())
+        second = admit_linear_issue(valid_issue())
         self.assertEqual(first.outcome, "admitted")
         self.assertEqual(first.dispatch_id, "MHO-900@r1")
         self.assertEqual(first.digest, second.digest)
-        self.assertEqual(first.contract.to_dict(), CASE["contract"])
+        self.assertEqual(first.contract.to_dict()["registry"]["factory_id"], "foundation-pilot")
+        self.assertEqual(first.contract.to_dict()["target"], CASE["contract"]["target"])
 
     def test_missing_or_ambiguous_repository_fails_closed(self) -> None:
         missing = copy.deepcopy(CASE["contract"])
         missing["target"].pop("repository")
         issue = copy.deepcopy(CASE["issue"])
         issue["description"] = contract_block(missing)
-        self.assertEqual(admit_linear_issue(issue, expected_project_id=PROJECT_ID).outcome, "not-admitted")
+        self.assertEqual(admit_linear_issue(issue).outcome, "not-admitted")
 
         ambiguous = copy.deepcopy(CASE["contract"])
         ambiguous["target"]["repository"] = ["mhoo-os/dark-factory", "mhoo-os/other"]
         issue["description"] = contract_block(ambiguous)
-        self.assertIn("target.repository.string", admit_linear_issue(issue, expected_project_id=PROJECT_ID).reasons)
+        self.assertIn("target.repository.string", admit_linear_issue(issue).reasons)
 
     def test_project_identity_and_replayed_event_are_rejected(self) -> None:
         issue = valid_issue()
         issue["project"] = {"id": "another-project"}
-        self.assertIn("issue_not_in_expected_project", admit_linear_issue(issue, expected_project_id=PROJECT_ID).reasons)
+        contract = copy.deepcopy(CASE["contract"])
+        contract["linear"]["project_id"] = "another-project"
+        issue["description"] = contract_block(contract)
+        self.assertIn("registry_unknown_project", admit_linear_issue(issue).reasons)
         self.assertIn(
             "replayed_event",
-            admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID, event_id="evt-1", seen_event_ids={"evt-1"}).reasons,
+            admit_linear_issue(valid_issue(), event_id="evt-1", seen_event_ids={"evt-1"}).reasons,
         )
 
     def test_duplicate_and_conflicting_admissions_are_not_silent(self) -> None:
-        admitted = admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID)
+        admitted = admit_linear_issue(valid_issue())
         self.assertEqual(
-            admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID, existing_dispatch_ids={admitted.dispatch_id}).outcome,
+            admit_linear_issue(valid_issue(), existing_dispatch_ids={admitted.dispatch_id}).outcome,
             "not-admitted",
         )
         conflict = admit_linear_issue(
             valid_issue(),
-            expected_project_id=PROJECT_ID,
             existing_issue_dispatches={"issue-900": (("MHO-900@older", "sha256:old"),)},
         )
         self.assertEqual(conflict.outcome, "needs-human")
 
     def test_changed_planning_revision_needs_replan(self) -> None:
-        decision = admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID, current_planning_revision="r2")
+        decision = admit_linear_issue(valid_issue(), current_planning_revision="r2")
         self.assertEqual(decision.outcome, "needs-replan")
         self.assertNotIn("execution_failed", decision.reasons)
 
@@ -72,7 +75,9 @@ class AdmissionTests(unittest.TestCase):
         contract["risk"]["authority_class"] = "cross-system"
         issue = copy.deepcopy(CASE["issue"])
         issue["description"] = contract_block(contract)
-        self.assertEqual(admit_linear_issue(issue, expected_project_id=PROJECT_ID).outcome, "needs-human")
+        decision = admit_linear_issue(issue)
+        self.assertEqual(decision.outcome, "not-admitted")
+        self.assertEqual(decision.reasons, ("registry_authority_ceiling_exceeded",))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Linear issue. It never fills missing fields by guessing.
 
 The machine-readable schema is [`factory/dispatch_contract.schema.json`](../factory/dispatch_contract.schema.json), and the pure validator is [`factory/dispatch_contract.py`](../factory/dispatch_contract.py).
 
-Required data binds one Linear issue and planning revision to one `mhoo-os/<repository>`, base commit, execution/validation profiles, dependency list, risk and authority class, acceptance criteria, allowed scope, merge policy, and explicit stale conditions. `dispatch_id` is the idempotency identity; the canonical JSON digest binds the exact contract contents.
+Required issue-authored data binds one Linear issue and planning revision to one `mhoo-os/<repository>`, base commit, execution/validation profiles, dependency list, risk and authority class, acceptance criteria, allowed scope, merge policy, and explicit stale conditions. Admission then materializes the trusted `factory_id`, registry version, entry version, and registry digest into the normalized contract. `dispatch_id` is the idempotency identity; the canonical JSON digest binds both the requested contents and resolved registry authority.
 
 The `linear.issue_id` field is the immutable provider identity for the Linear issue, while `linear.identifier` is its human-readable key (for example, `MHO-199`). Admission must verify that both values refer to the same issue; neither value is accepted as a substitute for the other.
 
@@ -18,6 +18,11 @@ Validation has three outcomes:
 `execution_failed` is deliberately not a contract outcome. It is a later runtime result after an admitted contract has entered execution.
 
 Admission may supply the current revision/base and the supported profile registry to `validate_dispatch_contract`; it must persist the returned digest and outcome without reinterpreting prose.
+
+An optional `factory_request` may request a credential profile, concurrency class,
+model-policy key, escalation class, and explicit effect classes. Missing values normalize to the least
+privileged v1 defaults. `factory_id` and `registry` are never accepted from issue
+content; they come only from `factory/factory_registry.json`.
 ## Linear admission envelope
 
 The Linear description must contain exactly one explicit envelope:

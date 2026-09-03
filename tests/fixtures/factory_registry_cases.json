@@ -1,0 +1,18 @@
+{
+  "unknown_project": "registry_unknown_project",
+  "disabled_factory": "registry_factory_disabled",
+  "ambiguous_project": "registry_ambiguous_project",
+  "forged_factory_id": "issue_factory_identity_forbidden",
+  "unregistered_repository": "registry_repository_not_allowed",
+  "unregistered_profile": "registry_execution_profile_not_allowed",
+  "unregistered_collision_group": "registry_collision_group_not_allowed",
+  "risk_above_ceiling": "registry_risk_ceiling_exceeded",
+  "authority_above_ceiling": "registry_authority_ceiling_exceeded",
+  "merge_above_ceiling": "registry_merge_ceiling_exceeded",
+  "credential_above_ceiling": "registry_credential_profile_not_allowed",
+  "concurrency_above_ceiling": "registry_concurrency_ceiling_exceeded",
+  "forbidden_effect": "registry_effect_class_forbidden",
+  "stale_revision": "registry_stale_re_admission_required",
+  "disabled_after_admission": "registry_factory_disabled",
+  "cross_vertical_repository": "registry_repository_not_allowed"
+}

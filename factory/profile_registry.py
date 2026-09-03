@@ -5,10 +5,9 @@ import fnmatch
 import hashlib
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable
 
-REGISTRY = json.loads(Path(__file__).with_name("profile_registry.json").read_text())
+from factory.factory_registry import REGISTRY, registry_digest, validate_registry
 
 
 class UnknownProfileError(ValueError):
@@ -41,10 +40,18 @@ def _one(items: list[dict[str, Any]], profile_id: str, kind: str) -> dict[str, A
 
 def resolve_profiles(repository: str, execution_profile: str, validation_profile: str) -> ProfileBundle:
     """Resolve only a declared target/profile tuple; never infer a target."""
-    target = next((item for item in REGISTRY["targets"] if item.get("repository") == repository), None)
-    if target is None:
+    validate_registry()
+    targets = [
+        target
+        for factory in REGISTRY["factories"]
+        if factory["state"] != "disabled"
+        for target in factory["repositories"]
+        if target.get("repository") == repository
+    ]
+    if len(targets) != 1:
         raise UnknownProfileError(f"unsupported_repository:{repository}")
-    if target.get("execution_profile") != execution_profile or target.get("validation_profile") != validation_profile:
+    target = targets[0]
+    if execution_profile not in target.get("execution_profiles", []) or validation_profile not in target.get("validation_profiles", []):
         raise UnknownProfileError("profile_not_declared_for_repository")
     execution = _one(REGISTRY["execution_profiles"], execution_profile, "execution")
     validation = _one(REGISTRY["validation_profiles"], validation_profile, "validation")
@@ -54,7 +61,7 @@ def resolve_profiles(repository: str, execution_profile: str, validation_profile
         if group is None:
             raise UnknownProfileError(f"unknown_collision_group:{group_id}")
         groups.append(group)
-    binding = {"version": REGISTRY["version"], "repository": repository, "execution": execution, "validation": validation, "collision_groups": groups}
+    binding = {"registry_version": REGISTRY["registry_version"], "registry_digest": registry_digest(), "repository": repository, "execution": execution, "validation": validation, "collision_groups": groups}
     return ProfileBundle(repository, execution, validation, tuple(groups), _digest(binding))
 
 

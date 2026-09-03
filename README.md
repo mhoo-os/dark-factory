@@ -1,7 +1,7 @@
 # Mhoo Dark Factory
 
-Cole-style factory tooling for Mhoo OS. Its scheduled intake reads only issues in
-the configured Linear factory project that contain one explicit Factory Dispatch
+Cole-style factory tooling for Mhoo OS. Its scheduled intake resolves issues through
+the human-owned trusted Factory Registry and accepts only entries that contain one explicit Factory Dispatch
 Contract v1 block. Deterministic admission validates that contract and, when
 the factory is enabled for that stage, creates one linked GitHub execution issue
 in the contract's declared `mhoo-os/<repository>` target.
@@ -34,7 +34,8 @@ Create a Linear candidate in the configured factory project, place it in `Todo` 
 <!-- /mhoo-factory-dispatch:v1 -->
 ```
 
-The factory fails closed when the project or issue identity is wrong, the contract
+The factory fails closed when the project/team cannot resolve to exactly one enabled
+registry entry, the issue identity is wrong, the contract
 is missing or ambiguous, the target/profile is unsupported, the planning snapshot
 is stale, the local stop file exists, the Linear credential is unavailable, or a
 target repository's remote stop label is present. Admission does not invoke a

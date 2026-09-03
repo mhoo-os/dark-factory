@@ -19,8 +19,9 @@ def issue(**overrides):
     value = {
         "id": "uuid", "identifier": "MHO-1", "title": "Candidate", "url": "https://linear.app/mhoo/issue/MHO-1", "priority": 3,
         "project": {"id": triage.PROJECT_ID},
+        "team": {"id": triage.TEAM_ID},
         "state": {"id": "in-progress", "name": "In Progress", "type": "started"},
-        "labels": {"nodes": []},
+        "labels": {"nodes": [{"name": "factory:accepted"}]},
     }
     value.update(overrides)
     value["description"] = contract_block({

@@ -5,13 +5,17 @@ CREATE TABLE IF NOT EXISTS factory_schema_meta (
   schema_version INTEGER NOT NULL
 );
 INSERT OR REPLACE INTO factory_schema_meta(schema_name, schema_version)
-VALUES ('factory-ledger', 3);
+VALUES ('factory-ledger', 4);
 
 CREATE TABLE IF NOT EXISTS factory_runs (
   dispatch_id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL UNIQUE,
   contract_version TEXT NOT NULL,
   contract_digest TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  registry_version TEXT NOT NULL,
+  registry_digest TEXT NOT NULL,
+  registry_entry_version TEXT NOT NULL,
   linear_project_id TEXT NOT NULL,
   linear_issue_id TEXT NOT NULL,
   linear_identifier TEXT NOT NULL,
@@ -42,12 +46,17 @@ CREATE TABLE IF NOT EXISTS factory_runs (
 );
 
 CREATE INDEX IF NOT EXISTS factory_runs_issue_idx ON factory_runs(linear_issue_id);
+CREATE INDEX IF NOT EXISTS factory_runs_registry_idx ON factory_runs(factory_id, registry_version, registry_digest);
 
 CREATE TABLE IF NOT EXISTS factory_ingress_events (
   event_id TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
   event_type TEXT NOT NULL,
   payload_digest TEXT NOT NULL,
+  factory_id TEXT,
+  registry_version TEXT,
+  registry_digest TEXT,
+  registry_entry_version TEXT,
   handoff_state TEXT NOT NULL,
   received_at TEXT NOT NULL,
   enqueued_at TEXT
@@ -60,6 +69,10 @@ CREATE TABLE IF NOT EXISTS factory_leases (
   lease_key TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
   dispatch_id TEXT NOT NULL,
+  factory_id TEXT,
+  registry_version TEXT,
+  registry_digest TEXT,
+  registry_entry_version TEXT,
   fence INTEGER NOT NULL,
   acquired_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
@@ -70,6 +83,10 @@ CREATE TABLE IF NOT EXISTS factory_events (
   dispatch_id TEXT NOT NULL REFERENCES factory_runs(dispatch_id),
   event_sequence INTEGER NOT NULL,
   event_type TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  registry_version TEXT NOT NULL,
+  registry_digest TEXT NOT NULL,
+  registry_entry_version TEXT NOT NULL,
   payload_digest TEXT,
   accepted INTEGER NOT NULL,
   reason TEXT NOT NULL,
@@ -83,6 +100,10 @@ CREATE TABLE IF NOT EXISTS factory_transitions (
   from_state TEXT NOT NULL,
   to_state TEXT NOT NULL,
   actor TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  registry_version TEXT NOT NULL,
+  registry_digest TEXT NOT NULL,
+  registry_entry_version TEXT NOT NULL,
   created_at TEXT NOT NULL,
   PRIMARY KEY (dispatch_id, event_sequence)
 );
@@ -93,8 +114,39 @@ CREATE TABLE IF NOT EXISTS factory_evidence (
   run_id TEXT NOT NULL,
   attempt INTEGER NOT NULL,
   kind TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  registry_version TEXT NOT NULL,
+  registry_digest TEXT NOT NULL,
+  registry_entry_version TEXT NOT NULL,
   digest TEXT NOT NULL,
   artifact_ref TEXT NOT NULL,
   redacted INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS factory_pr_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  dispatch_id TEXT NOT NULL REFERENCES factory_runs(dispatch_id),
+  run_id TEXT NOT NULL,
+  pr_number INTEGER NOT NULL,
+  pr_url TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  registry_version TEXT NOT NULL,
+  registry_digest TEXT NOT NULL,
+  registry_entry_version TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS factory_linear_reconciliations (
+  reconciliation_id TEXT PRIMARY KEY,
+  dispatch_id TEXT NOT NULL REFERENCES factory_runs(dispatch_id),
+  run_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  registry_version TEXT NOT NULL,
+  registry_digest TEXT NOT NULL,
+  registry_entry_version TEXT NOT NULL,
   created_at TEXT NOT NULL
 );

@@ -25,6 +25,10 @@ class SchedulableRun:
     attempts: int = 0
     max_attempts: int = 2
     stop_requested: bool = False
+    factory_id: str | None = None
+    registry_version: str | None = None
+    registry_digest: str | None = None
+    registry_entry_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,4 +94,10 @@ def acquire_run_lease(
     return coordinator.acquire(
         lease_keys(run.repository, run.collision_groups),
         owner=owner, dispatch_id=run.dispatch_id, now=now, ttl_seconds=ttl_seconds,
+        registry_identity={
+            "factory_id": run.factory_id,
+            "registry_version": run.registry_version,
+            "registry_digest": run.registry_digest,
+            "entry_version": run.registry_entry_version,
+        } if run.factory_id and run.registry_version and run.registry_digest and run.registry_entry_version else None,
     )

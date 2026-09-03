@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mhoo.app/schemas/factory-registry-v1.json",
+  "title": "Mhoo Trusted Factory Registry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "registry_version", "governance", "execution_profiles", "validation_profiles", "collision_groups", "factories"],
+  "properties": {
+    "schema_version": {"const": "v1"},
+    "registry_version": {"type": "string", "minLength": 1},
+    "governance": {"type": "object", "additionalProperties": false, "required": ["owner", "approval_record", "promotion_rule", "rollback_rule"], "properties": {"owner": {"type": "string"}, "approval_record": {"type": "string"}, "promotion_rule": {"type": "string"}, "rollback_rule": {"type": "string"}}},
+    "execution_profiles": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "model_policy", "limits"]}},
+    "validation_profiles": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "merge_eligibility"]}},
+    "collision_groups": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "paths"]}},
+    "factories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["factory_id", "display_name", "owner", "entry_version", "state", "approval_record", "rollout_phase", "rollback_path", "linear", "repositories", "model_policy_keys", "escalation_ceiling", "risk", "credentials", "capacity", "evidence"],
+        "properties": {
+          "factory_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+          "display_name": {"type": "string", "minLength": 1},
+          "owner": {"type": "string", "minLength": 1},
+          "entry_version": {"type": "string", "minLength": 1},
+          "state": {"enum": ["disabled", "pilot", "limited", "enabled"]},
+          "approval_record": {"type": "string", "minLength": 1},
+          "rollout_phase": {"type": "string", "minLength": 1},
+          "rollback_path": {"type": "string", "minLength": 1},
+          "linear": {"type": "object", "additionalProperties": false, "required": ["project_ids", "team_ids", "eligible_state_types", "required_contract_versions", "required_labels"], "properties": {"project_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "team_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "eligible_state_types": {"type": "array", "uniqueItems": true, "items": {"enum": ["unstarted", "started"]}}, "required_contract_versions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}, "required_labels": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}}},
+          "repositories": {"type": "array", "items": {"type": "object", "required": ["repository", "work_types", "execution_profiles", "validation_profiles", "collision_groups", "scope"]}},
+          "model_policy_keys": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+          "escalation_ceiling": {"enum": ["none", "human"]},
+          "risk": {"type": "object", "required": ["maximum_risk_class", "maximum_authority_class", "merge_ceiling", "forbidden_work_effect_classes", "autonomous_merge_exclusions"]},
+          "credentials": {"type": "object", "required": ["boundary_id", "sandbox_secret_profiles", "tenant_boundary", "default_denials"]},
+          "capacity": {"type": "object", "required": ["per_factory_concurrency", "global_concurrency", "per_repository_concurrency", "collision_group_concurrency", "cost_usd", "timeout_seconds", "max_changed_lines", "max_files"]},
+          "evidence": {"type": "object", "required": ["evaluator_ids", "policy_id", "rollout_status", "minimum_promotion_evidence"]}
+        }
+      }
+    }
+  }
+}

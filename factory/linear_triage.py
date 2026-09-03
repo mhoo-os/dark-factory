@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from factory.admission import AdmissionDecision, admit_linear_issue
+from factory.factory_registry import REGISTRY
 
 ROOT = Path(__file__).resolve().parents[1]
-TEAM_ID = os.environ.get("LINEAR_FACTORY_TEAM_ID", "085d25a0-104f-4e80-82fb-b0ea7c476b0b")
-PROJECT_ID = os.environ.get("LINEAR_FACTORY_PROJECT_ID", "2dab9206-cb92-49a4-aeef-95ec45280098")
+FOUNDATION = next(item for item in REGISTRY["factories"] if item["factory_id"] == "foundation-pilot")
+TEAM_ID = FOUNDATION["linear"]["team_ids"][0]
+PROJECT_ID = FOUNDATION["linear"]["project_ids"][0]
 ORG = "mhoo-os"
 MARKER = "mhoo-dark-factory:v1"
 
@@ -88,7 +90,7 @@ def remote_stop_requested(repositories: set[str]) -> None:
 
 
 def admission_for(issue: dict[str, Any]) -> AdmissionDecision:
-    return admit_linear_issue(issue, expected_project_id=PROJECT_ID)
+    return admit_linear_issue(issue)
 
 
 def candidate_from(issue: dict[str, Any]) -> Candidate:
@@ -152,7 +154,7 @@ def update_linear(candidate: Candidate, github_url: str) -> None:
 def eligible_issues() -> list[dict[str, Any]]:
     query = """query($teamId: ID!, $projectId: ID!) {
       issues(first: 50, filter: { team: { id: { eq: $teamId } }, project: { id: { eq: $projectId } } }) {
-        nodes { id identifier title description url priority project { id } state { id name type } labels { nodes { name } } }
+        nodes { id identifier title description url priority project { id } team { id } state { id name type } labels { nodes { name } } }
       }
     }"""
     return graphql(query, {"teamId": TEAM_ID, "projectId": PROJECT_ID})["issues"]["nodes"]

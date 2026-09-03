@@ -8,6 +8,7 @@ import unittest
 from factory.ledger import Ledger
 from factory.leases import LeaseCoordinator, LeaseDenied, LeaseFenced, lease_keys
 from factory.scheduler import SchedulableRun, acquire_run_lease, choose_eligible
+from factory.factory_registry import REGISTRY, registry_digest
 
 
 ROOT = Path(__file__).parents[1]
@@ -60,6 +61,21 @@ class SchedulerTests(unittest.TestCase):
         run = runs()[0]
         grant = acquire_run_lease(coordinator, run, owner="worker-1", now=100, ttl_seconds=10)
         self.assertEqual(set(grant.fences), {"repository:mhoo-os/dark-factory", "collision:runtime"})
+        connection.close()
+
+    def test_registry_aware_lease_retains_admission_identity(self):
+        connection = sqlite3.connect(":memory:")
+        Ledger(connection)
+        coordinator = LeaseCoordinator(connection)
+        run = SchedulableRun(
+            "run-registry", "MHO-224", "mhoo-os/dark-factory", ("runtime",), 1, "admitted", {},
+            factory_id="foundation-pilot", registry_version=REGISTRY["registry_version"],
+            registry_digest=registry_digest(), registry_entry_version="1",
+        )
+        acquire_run_lease(coordinator, run, owner="worker-1", now=100, ttl_seconds=10)
+        lease = connection.execute("SELECT * FROM factory_leases WHERE dispatch_id='run-registry'").fetchone()
+        self.assertEqual(lease["factory_id"], "foundation-pilot")
+        self.assertEqual(lease["registry_digest"], registry_digest())
         connection.close()
 
 

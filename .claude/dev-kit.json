@@ -1,0 +1,25 @@
+{
+  "tracker": {
+    "type": "linear",
+    "teamKey": "MHOO",
+    "workspace": "mhoo",
+    "reviewState": "In Review"
+  },
+  "stacks": [
+    "node",
+    "python"
+  ],
+  "prHost": "github",
+  "gates": {
+    "coverage": {
+      "mode": "auto",
+      "min": 95
+    },
+    "e2e": {
+      "mode": "auto"
+    }
+  },
+  "test": {
+    "coverageCommands": []
+  }
+}

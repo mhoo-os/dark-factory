@@ -11,7 +11,7 @@ from factory.dispatch_contract import DispatchContract
 from factory.state_contract import TERMINAL_STATES, decide_transition
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA = Path(__file__).with_name("ledger_schema.sql").read_text()
 
 
@@ -71,6 +71,9 @@ class Ledger:
         document = contract.to_dict()
         linear = document["linear"]
         target = document["target"]
+        registry = document.get("registry")
+        if not isinstance(registry, Mapping):
+            raise LedgerConflict("registry_identity_missing")
         timestamp = now or utc_now()
         terminals = tuple(sorted(TERMINAL_STATES))
         placeholders = ",".join("?" for _ in terminals)
@@ -94,13 +97,15 @@ class Ledger:
             self.connection.execute(
                 """INSERT INTO factory_runs(
                   dispatch_id, run_id, contract_version, contract_digest,
+                  factory_id, registry_version, registry_digest, registry_entry_version,
                   linear_project_id, linear_issue_id, linear_identifier,
                   planning_revision, planning_fingerprint, repository,
                   execution_profile, validation_profile, collision_group,
                   current_state, base_sha, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, ?, ?)""",
                 (
                     contract.dispatch_id, run_id, document["contract_version"], contract.digest,
+                    registry["factory_id"], registry["registry_version"], registry["registry_digest"], registry["entry_version"],
                     linear["project_id"], linear["issue_id"], linear["identifier"],
                     linear["planning_revision"], linear["planning_fingerprint"], target["repository"],
                     target["execution_profile"], document["validation_profile"], target["collision_group"],
@@ -109,12 +114,12 @@ class Ledger:
             )
             admission_event_id = f"admission:{contract.dispatch_id}"
             self.connection.execute(
-                "INSERT INTO factory_events(event_id, dispatch_id, event_sequence, event_type, payload_digest, accepted, reason, received_at) VALUES (?, ?, 1, 'state:admitted', ?, 1, 'accepted', ?)",
-                (admission_event_id, contract.dispatch_id, contract.digest, timestamp),
+                "INSERT INTO factory_events(event_id, dispatch_id, event_sequence, event_type, factory_id, registry_version, registry_digest, registry_entry_version, payload_digest, accepted, reason, received_at) VALUES (?, ?, 1, 'state:admitted', ?, ?, ?, ?, ?, 1, 'accepted', ?)",
+                (admission_event_id, contract.dispatch_id, registry["factory_id"], registry["registry_version"], registry["registry_digest"], registry["entry_version"], contract.digest, timestamp),
             )
             self.connection.execute(
-                "INSERT INTO factory_transitions(dispatch_id, event_sequence, event_id, from_state, to_state, actor, created_at) VALUES (?, 1, ?, 'proposed', 'admitted', 'admission', ?)",
-                (contract.dispatch_id, admission_event_id, timestamp),
+                "INSERT INTO factory_transitions(dispatch_id, event_sequence, event_id, from_state, to_state, actor, factory_id, registry_version, registry_digest, registry_entry_version, created_at) VALUES (?, 1, ?, 'proposed', 'admitted', 'admission', ?, ?, ?, ?, ?)",
+                (contract.dispatch_id, admission_event_id, registry["factory_id"], registry["registry_version"], registry["registry_digest"], registry["entry_version"], timestamp),
             )
             self.connection.commit()
             return AdmissionReceipt(contract.dispatch_id, run_id, contract.digest, True)
@@ -154,15 +159,15 @@ class Ledger:
                 self.connection.rollback()
                 return TransitionReceipt("rejected", decision.reason, row["current_state"], current_sequence)
             self.connection.execute(
-                "INSERT INTO factory_events(event_id, dispatch_id, event_sequence, event_type, payload_digest, accepted, reason, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (event_id, dispatch_id, event_sequence, f"state:{to_state}", payload_digest, decision.outcome == "accepted", decision.reason, timestamp),
+                "INSERT INTO factory_events(event_id, dispatch_id, event_sequence, event_type, factory_id, registry_version, registry_digest, registry_entry_version, payload_digest, accepted, reason, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, dispatch_id, event_sequence, f"state:{to_state}", row["factory_id"], row["registry_version"], row["registry_digest"], row["registry_entry_version"], payload_digest, decision.outcome == "accepted", decision.reason, timestamp),
             )
             if decision.outcome != "accepted":
                 self.connection.commit()
                 return TransitionReceipt("rejected", decision.reason, row["current_state"], current_sequence)
             self.connection.execute(
-                "INSERT INTO factory_transitions(dispatch_id, event_sequence, event_id, from_state, to_state, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (dispatch_id, event_sequence, event_id, row["current_state"], to_state, actor, timestamp),
+                "INSERT INTO factory_transitions(dispatch_id, event_sequence, event_id, from_state, to_state, actor, factory_id, registry_version, registry_digest, registry_entry_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (dispatch_id, event_sequence, event_id, row["current_state"], to_state, actor, row["factory_id"], row["registry_version"], row["registry_digest"], row["registry_entry_version"], timestamp),
             )
             self.connection.execute(
                 "UPDATE factory_runs SET current_state = ?, updated_at = ? WHERE dispatch_id = ?",
@@ -189,15 +194,31 @@ class Ledger:
     ) -> None:
         if not redacted:
             raise LedgerConflict("unredacted_evidence_refused")
-        self._run(dispatch_id)
+        run = self._run(dispatch_id)
         self.connection.execute(
-            "INSERT INTO factory_evidence(evidence_id, dispatch_id, run_id, attempt, kind, digest, artifact_ref, redacted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
-            (evidence_id, dispatch_id, run_id, attempt, kind, digest, artifact_ref, now or utc_now()),
+            "INSERT INTO factory_evidence(evidence_id, dispatch_id, run_id, attempt, kind, factory_id, registry_version, registry_digest, registry_entry_version, digest, artifact_ref, redacted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (evidence_id, dispatch_id, run_id, attempt, kind, run["factory_id"], run["registry_version"], run["registry_digest"], run["registry_entry_version"], digest, artifact_ref, now or utc_now()),
         )
         self.connection.commit()
 
     def run(self, dispatch_id: str) -> Mapping[str, Any]:
         return dict(self._run(dispatch_id))
+
+    def record_pr_receipt(self, *, receipt_id: str, dispatch_id: str, pr_number: int, pr_url: str, head_sha: str, now: str | None = None) -> None:
+        run = self._run(dispatch_id)
+        self.connection.execute(
+            "INSERT INTO factory_pr_receipts(receipt_id, dispatch_id, run_id, pr_number, pr_url, head_sha, factory_id, registry_version, registry_digest, registry_entry_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (receipt_id, dispatch_id, run["run_id"], pr_number, pr_url, head_sha, run["factory_id"], run["registry_version"], run["registry_digest"], run["registry_entry_version"], now or utc_now()),
+        )
+        self.connection.commit()
+
+    def record_linear_reconciliation(self, *, reconciliation_id: str, dispatch_id: str, state: str, reason: str, now: str | None = None) -> None:
+        run = self._run(dispatch_id)
+        self.connection.execute(
+            "INSERT INTO factory_linear_reconciliations(reconciliation_id, dispatch_id, run_id, state, reason, factory_id, registry_version, registry_digest, registry_entry_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (reconciliation_id, dispatch_id, run["run_id"], state, reason, run["factory_id"], run["registry_version"], run["registry_digest"], run["registry_entry_version"], now or utc_now()),
+        )
+        self.connection.commit()
 
     def events(self, dispatch_id: str) -> list[Mapping[str, Any]]:
         self._run(dispatch_id)
@@ -233,6 +254,18 @@ class Ledger:
         updated = self.connection.execute(
             "UPDATE factory_ingress_events SET handoff_state = 'enqueued', enqueued_at = ? WHERE event_id = ? AND handoff_state = 'pending'",
             (now or utc_now(), event_id),
+        ).rowcount
+        self.connection.commit()
+        if updated != 1:
+            raise LedgerConflict("ingress_handoff_not_pending")
+
+    def bind_ingress(self, event_id: str, contract: DispatchContract) -> None:
+        registry = contract.to_dict().get("registry")
+        if not isinstance(registry, Mapping):
+            raise LedgerConflict("registry_identity_missing")
+        updated = self.connection.execute(
+            "UPDATE factory_ingress_events SET factory_id=?, registry_version=?, registry_digest=?, registry_entry_version=? WHERE event_id=? AND handoff_state='pending'",
+            (registry["factory_id"], registry["registry_version"], registry["registry_digest"], registry["entry_version"], event_id),
         ).rowcount
         self.connection.commit()
         if updated != 1:

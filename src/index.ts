@@ -4,6 +4,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
+import registryArtifact from "../factory/factory_registry.json";
 
 export { Sandbox } from "@cloudflare/sandbox";
 
@@ -24,14 +25,11 @@ const GITHUB_API_VERSION = "2022-11-28";
 const MAX_PROVIDER_BODY_BYTES = 64 * 1024;
 const PROVIDER_TIMEOUT_MS = 30_000;
 const GITHUB_EVENT_TYPES = new Set(["pull_request", "workflow_run"]);
-const PROFILE_DIGEST = "sha256:e56a438c8feb33cd39b03aca75a3b8596d63de5c90662f87a16729b9d467acfb";
-const SUPPORTED_TARGETS = {
-  "mhoo-os/dark-factory": {
-    executionProfile: "python-tests-v1",
-    validationProfile: "python-tests-v1",
-    collisionGroups: ["dark-factory-governance", "dark-factory-runtime", "dark-factory-reference"],
-  },
-} as const;
+const FACTORY_REGISTRY = registryArtifact as unknown as ObjectValue;
+const ACTIVE_FACTORY_STATES = new Set(["pilot", "limited", "enabled"]);
+const RISK_ORDER: Readonly<Record<string, number>> = { low: 0, medium: 1, high: 2 };
+const AUTHORITY_ORDER: Readonly<Record<string, number>> = { "repository-local": 0, "cross-system": 1 };
+const MERGE_ORDER: Readonly<Record<string, number>> = { human: 0, "auto-eligible": 1 };
 
 type TransitionActor =
   | "admission"
@@ -129,6 +127,25 @@ type Contract = {
   allowed_scope: { paths: string[]; max_files: number; max_changed_lines: number };
   merge_policy: "human" | "auto-eligible";
   stale_conditions: string[];
+  factory_request: {
+    credential_profile: string;
+    concurrency: number;
+    model_policy_key: string;
+    escalation_class: string;
+    effect_classes: string[];
+  };
+  registry: {
+    factory_id: string;
+    registry_version: string;
+    registry_digest: string;
+    entry_version: string;
+  };
+};
+
+type RegistryBinding = {
+  identity: Contract["registry"];
+  factory: ObjectValue;
+  repository: ObjectValue;
 };
 
 type DispatchJob = { kind: "dispatch"; dispatchId: string; runId: string; contractDigest: string; contract: Contract };
@@ -148,6 +165,10 @@ type Run = {
   run_id: string;
   contract_digest: string;
   profile_digest: string;
+  factory_id: string;
+  registry_version: string;
+  registry_digest: string;
+  registry_entry_version: string;
   contract_json: string;
   linear_issue_id: string;
   repository: string;
@@ -226,6 +247,136 @@ async function textDigest(value: string): Promise<string> {
   return `sha256:${Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
+function records(value: unknown, reason: string): ObjectValue[] {
+  if (!Array.isArray(value) || value.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+    throw new AdmissionError(reason);
+  }
+  return value as ObjectValue[];
+}
+
+function strings(value: unknown, reason: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new AdmissionError(reason);
+  }
+  return value as string[];
+}
+
+function providerId(issue: ObjectValue, field: "project" | "team"): string {
+  const nested = issue[field];
+  const direct = issue[`${field}_id`] ?? issue[`${field}Id`];
+  const value = nested && typeof nested === "object" && !Array.isArray(nested) ? (nested as ObjectValue).id : direct;
+  return text(value, `registry_${field}_identity_missing`);
+}
+
+function uniqueBy(items: ObjectValue[], key: string, reason: string): void {
+  const values = items.map((item) => text(item[key], reason));
+  if (new Set(values).size !== values.length) throw new AdmissionError(reason);
+}
+
+async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "registry">): Promise<RegistryBinding> {
+  if (FACTORY_REGISTRY.schema_version !== "v1") throw new AdmissionError("registry_schema_invalid");
+  const registryVersion = text(FACTORY_REGISTRY.registry_version, "registry_version_invalid");
+  const factories = records(FACTORY_REGISTRY.factories, "registry_factories_invalid");
+  if (factories.length === 0) throw new AdmissionError("registry_factories_invalid");
+  uniqueBy(factories, "factory_id", "registry_factory_id_ambiguous");
+  const projectId = providerId(issue, "project");
+  const teamId = providerId(issue, "team");
+  const matches = factories.filter((factory) => {
+    const linear = factory.linear;
+    return linear && typeof linear === "object" && !Array.isArray(linear)
+      && strings((linear as ObjectValue).project_ids, "registry_project_ids_invalid").includes(projectId);
+  });
+  if (matches.length === 0) throw new AdmissionError("registry_unknown_project");
+  if (matches.length !== 1) throw new AdmissionError("registry_ambiguous_project");
+  const factory = matches[0];
+  if (!ACTIVE_FACTORY_STATES.has(String(factory.state))) throw new AdmissionError("registry_factory_disabled");
+  const linear = factory.linear as ObjectValue;
+  if (!strings(linear.team_ids, "registry_team_ids_invalid").includes(teamId)) throw new AdmissionError("registry_team_not_allowed");
+  const state = issue.state;
+  const stateType = state && typeof state === "object" && !Array.isArray(state) ? (state as ObjectValue).type : undefined;
+  if (!strings(linear.eligible_state_types, "registry_state_types_invalid").includes(String(stateType))) throw new AdmissionError("registry_issue_state_not_allowed");
+  if (!strings(linear.required_contract_versions, "registry_contract_versions_invalid").includes(contract.contract_version)) throw new AdmissionError("registry_contract_version_not_allowed");
+  const requiredLabels = strings(linear.required_labels, "registry_required_labels_invalid");
+  if (requiredLabels.some((label) => !labels(issue).includes(label))) throw new AdmissionError("registry_required_label_missing");
+
+  const repositories = records(factory.repositories, "registry_repositories_invalid");
+  uniqueBy(repositories, "repository", "registry_repository_ambiguous");
+  const repositoryMatches = repositories.filter((item) => item.repository === contract.target.repository);
+  if (repositoryMatches.length === 0) throw new AdmissionError("registry_repository_not_allowed");
+  if (repositoryMatches.length !== 1) throw new AdmissionError("registry_repository_ambiguous");
+  const repository = repositoryMatches[0];
+  for (const [requested, allowed, reason] of [
+    [contract.target.work_type, repository.work_types, "registry_work_type_not_allowed"],
+    [contract.target.execution_profile, repository.execution_profiles, "registry_execution_profile_not_allowed"],
+    [contract.validation_profile, repository.validation_profiles, "registry_validation_profile_not_allowed"],
+    [contract.target.collision_group, repository.collision_groups, "registry_collision_group_not_allowed"],
+  ] as const) {
+    if (!strings(allowed, reason).includes(requested)) throw new AdmissionError(reason);
+  }
+  const scope = repository.scope as ObjectValue;
+  const capacity = factory.capacity as ObjectValue;
+  if (!scope || typeof scope !== "object" || !capacity || typeof capacity !== "object") throw new AdmissionError("registry_capacity_invalid");
+  if (contract.allowed_scope.max_files > Number(scope.max_files) || contract.allowed_scope.max_files > Number(capacity.max_files)) throw new AdmissionError("registry_scope_max_files_exceeded");
+  if (contract.allowed_scope.max_changed_lines > Number(scope.max_changed_lines) || contract.allowed_scope.max_changed_lines > Number(capacity.max_changed_lines)) throw new AdmissionError("registry_scope_max_changed_lines_exceeded");
+  const allowedPaths = strings(scope.paths, "registry_scope_paths_invalid");
+  if (contract.allowed_scope.paths.some((path) => !pathMatchesScope(path, allowedPaths))) throw new AdmissionError("registry_scope_path_not_allowed");
+  const risk = factory.risk as ObjectValue;
+  if ((RISK_ORDER[contract.risk.risk_class] ?? 99) > (RISK_ORDER[String(risk.maximum_risk_class)] ?? -1)) throw new AdmissionError("registry_risk_ceiling_exceeded");
+  if ((AUTHORITY_ORDER[contract.risk.authority_class] ?? 99) > (AUTHORITY_ORDER[String(risk.maximum_authority_class)] ?? -1)) throw new AdmissionError("registry_authority_ceiling_exceeded");
+  if ((MERGE_ORDER[contract.merge_policy] ?? 99) > (MERGE_ORDER[String(risk.merge_ceiling)] ?? -1)) throw new AdmissionError("registry_merge_ceiling_exceeded");
+  const credentials = factory.credentials as ObjectValue;
+  if (!strings(credentials.sandbox_secret_profiles, "registry_credential_profiles_invalid").includes(contract.factory_request.credential_profile)) throw new AdmissionError("registry_credential_profile_not_allowed");
+  const concurrencyCeiling = Math.min(Number(capacity.per_factory_concurrency), Number(capacity.global_concurrency), Number(capacity.per_repository_concurrency), Number(capacity.collision_group_concurrency));
+  if (!Number.isSafeInteger(concurrencyCeiling) || contract.factory_request.concurrency > concurrencyCeiling) throw new AdmissionError("registry_concurrency_ceiling_exceeded");
+  if (!strings(factory.model_policy_keys, "registry_model_policy_keys_invalid").includes(contract.factory_request.model_policy_key)) throw new AdmissionError("registry_model_policy_not_allowed");
+  if (contract.factory_request.escalation_class !== factory.escalation_ceiling) throw new AdmissionError("registry_escalation_ceiling_exceeded");
+  const forbidden = strings(risk.forbidden_work_effect_classes, "registry_forbidden_effects_invalid");
+  if ((forbidden.includes("all") && contract.factory_request.effect_classes.length > 0) || contract.factory_request.effect_classes.some((item) => forbidden.includes(item))) throw new AdmissionError("registry_effect_class_forbidden");
+  const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
+  const execution = executions.find((item) => item.id === contract.target.execution_profile);
+  const limits = execution?.limits as ObjectValue | undefined;
+  if (!limits || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field]))) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
+  return {
+    identity: {
+      factory_id: text(factory.factory_id, "registry_factory_id_invalid"),
+      registry_version: registryVersion,
+      registry_digest: await digest(FACTORY_REGISTRY),
+      entry_version: text(factory.entry_version, "registry_entry_version_invalid"),
+    },
+    factory,
+    repository,
+  };
+}
+
+async function assertCurrentRegistry(contract: Contract): Promise<RegistryBinding> {
+  const factories = records(FACTORY_REGISTRY.factories, "registry_factories_invalid");
+  const matches = factories.filter((item) => item.factory_id === contract.registry.factory_id);
+  if (matches.length !== 1) throw new Error("registry_factory_identity_missing");
+  if (!ACTIVE_FACTORY_STATES.has(String(matches[0].state))) throw new Error("registry_factory_disabled");
+  const binding = await resolveFactory(
+    {
+      project: { id: contract.linear.project_id },
+      team: { id: strings((matches[0].linear as ObjectValue).team_ids, "registry_team_ids_invalid")[0] },
+      state: { type: strings((matches[0].linear as ObjectValue).eligible_state_types, "registry_state_types_invalid")[0] },
+      labels: strings((matches[0].linear as ObjectValue).required_labels, "registry_required_labels_invalid"),
+    },
+    contract,
+  );
+  if (stable(binding.identity) !== stable(contract.registry)) throw new Error("registry_stale_re_admission_required");
+  return binding;
+}
+
+async function profileDigest(contract: Contract): Promise<string> {
+  const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
+  const validations = records(FACTORY_REGISTRY.validation_profiles, "registry_validation_profiles_invalid");
+  const groups = records(FACTORY_REGISTRY.collision_groups, "registry_collision_groups_invalid");
+  const execution = executions.find((item) => item.id === contract.target.execution_profile);
+  const validation = validations.find((item) => item.id === contract.validation_profile);
+  const collision = groups.find((item) => item.id === contract.target.collision_group);
+  if (!execution || !validation || !collision) throw new Error("registry_profile_missing");
+  return await digest({ registry: contract.registry, execution, validation, collision });
+}
+
 function repositoryPath(repository: string): string {
   return repository.split("/").map((part) => encodeURIComponent(part)).join("/");
 }
@@ -274,7 +425,7 @@ function integer(value: unknown, label: string, max: number): number {
   return value;
 }
 
-function contractFromDescription(description: unknown, issue: ObjectValue, env: Env): Contract {
+async function contractFromDescription(description: unknown, issue: ObjectValue): Promise<Contract> {
   const source = descriptionValue(description, "description", 100_000);
   if (source.split(CONTRACT_OPEN).length - 1 !== 1 || source.split(CONTRACT_CLOSE).length - 1 !== 1) {
     throw new AdmissionError("contract_block_missing_or_ambiguous");
@@ -284,10 +435,12 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (end <= start) throw new AdmissionError("contract_block_order_invalid");
   let parsed: unknown;
   try { parsed = JSON.parse(source.slice(start, end).trim()); } catch { throw new AdmissionError("contract_json_invalid"); }
-  const root = object(parsed, ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions"], "contract");
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && ("factory_id" in parsed || "registry" in parsed)) throw new AdmissionError("issue_factory_identity_forbidden");
+  const parsedRoot = parsed as ObjectValue;
+  const rootKeys = ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions", ...(parsedRoot?.factory_request === undefined ? [] : ["factory_request"])];
+  const root = object(parsed, rootKeys, "contract");
   if (root.contract_version !== "v1") throw new AdmissionError("contract_version_unsupported");
-  if (env.ALLOWED_REPOSITORY_PREFIX !== "mhoo-os/") throw new AdmissionError("repository_prefix_invalid");
-  const projectId = text(env.LINEAR_PROJECT_ID, "linear_project_id");
+  const projectId = providerId(issue, "project");
   const linear = object(root.linear, ["project_id", "issue_id", "identifier", "planning_revision", "planning_fingerprint"], "linear");
   const issueId = text(issue.id, "issue_id");
   const identifier = text(issue.identifier, "identifier", 32);
@@ -298,15 +451,12 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (!/^sha256:[0-9a-f]{64}$/.test(text(linear.planning_fingerprint, "planning_fingerprint", 71))) throw new AdmissionError("planning_fingerprint_invalid");
   const target = object(root.target, ["repository", "work_type", "execution_profile", "collision_group", "base_sha"], "target");
   const repository = text(target.repository, "repository");
-  if (!REPOSITORY.test(repository) || !repository.startsWith(env.ALLOWED_REPOSITORY_PREFIX)) throw new AdmissionError("repository_not_allowed");
+  if (!REPOSITORY.test(repository)) throw new AdmissionError("repository_not_allowed");
   text(target.work_type, "work_type");
   const executionProfile = text(target.execution_profile, "execution_profile");
   const validationProfile = text(root.validation_profile, "validation_profile");
   if (executionProfile !== validationProfile) throw new AdmissionError("profile_mismatch");
-  const profile = SUPPORTED_TARGETS[repository as keyof typeof SUPPORTED_TARGETS];
-  if (!profile || profile.executionProfile !== executionProfile || profile.validationProfile !== validationProfile) throw new AdmissionError("unsupported_repository_or_profile");
   const collisionGroup = text(target.collision_group, "collision_group");
-  if (!(profile.collisionGroups as readonly string[]).includes(collisionGroup)) throw new AdmissionError("unsupported_collision_group");
   if (!SHA40.test(text(target.base_sha, "base_sha", 40))) throw new AdmissionError("base_sha_invalid");
   if (!Array.isArray(root.dependencies) || root.dependencies.length > 50) throw new AdmissionError("dependencies_invalid");
   const dependencyIds = new Set<string>();
@@ -326,7 +476,15 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   integer(scope.max_changed_lines, "max_changed_lines", 500);
   if (!["human", "auto-eligible"].includes(String(root.merge_policy))) throw new AdmissionError("merge_policy_invalid");
   if (!Array.isArray(root.stale_conditions) || root.stale_conditions.length === 0 || root.stale_conditions.length > STALE_CONDITIONS.size || root.stale_conditions.some((item) => typeof item !== "string" || !STALE_CONDITIONS.has(item)) || new Set(root.stale_conditions).size !== root.stale_conditions.length) throw new AdmissionError("stale_conditions_invalid");
-  const contract: Contract = {
+  const execution = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid").find((item) => item.id === executionProfile);
+  if (!execution) throw new AdmissionError("registry_execution_profile_not_allowed");
+  const rawRequest = root.factory_request === undefined ? {} : root.factory_request;
+  if (!rawRequest || typeof rawRequest !== "object" || Array.isArray(rawRequest)) throw new AdmissionError("factory_request_invalid");
+  const requestObject = rawRequest as ObjectValue;
+  const requestKeys = Object.keys(requestObject);
+  if (requestKeys.some((key) => !["credential_profile", "concurrency", "model_policy_key", "escalation_class", "effect_classes"].includes(key))) throw new AdmissionError("factory_request_fields_invalid");
+  const concurrency = requestObject.concurrency === undefined ? 1 : integer(requestObject.concurrency, "factory_request_concurrency", 32);
+  const contract: Omit<Contract, "registry"> = {
     contract_version: "v1",
     dispatch_id: text(root.dispatch_id, "dispatch_id", 192),
     linear: {
@@ -360,8 +518,16 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
     },
     merge_policy: root.merge_policy as Contract["merge_policy"],
     stale_conditions: root.stale_conditions as string[],
+    factory_request: {
+      credential_profile: requestObject.credential_profile === undefined ? "none" : text(requestObject.credential_profile, "factory_request_credential_profile", 128),
+      concurrency,
+      model_policy_key: requestObject.model_policy_key === undefined ? text(execution.model_policy, "registry_model_policy_invalid", 128) : text(requestObject.model_policy_key, "factory_request_model_policy", 128),
+      escalation_class: requestObject.escalation_class === undefined ? "human" : text(requestObject.escalation_class, "factory_request_escalation", 64),
+      effect_classes: requestObject.effect_classes === undefined ? [] : strings(requestObject.effect_classes, "factory_request_effect_classes_invalid"),
+    },
   };
-  return contract;
+  const binding = await resolveFactory(issue, contract);
+  return { ...contract, registry: binding.identity };
 }
 
 function issueFromPayload(payload: unknown): ObjectValue {
@@ -388,9 +554,7 @@ async function admit(raw: string, env: Env): Promise<Job> {
   const state = issue.state && typeof issue.state === "object" ? (issue.state as ObjectValue).type : undefined;
   if (typeof state !== "string" || !ISSUE_STATES.has(state)) throw new AdmissionError("issue_not_eligible");
   if (!labels(issue).includes("factory:accepted")) throw new AdmissionError("factory_acceptance_label_missing");
-  const contract = contractFromDescription(issue.description, issue, env);
-  const risk = contract.risk;
-  if (risk.risk_class === "high" || risk.authority_class === "cross-system") throw new AdmissionError("human_approval_required");
+  const contract = await contractFromDescription(issue.description, issue);
   const contractDigest = await digest(contract);
   const dispatchId = contract.dispatch_id;
   const runId = `run-v1-${(await digest({ dispatchId, contractDigest, baseSha: contract.target.base_sha })).slice(7, 39)}`;
@@ -421,11 +585,11 @@ async function ingress(db: D1Database, id: string, provider: string, type: strin
 }
 
 async function runById(db: D1Database, runId: string): Promise<Run | null> {
-  return await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE run_id=?").bind(runId).first<Run>();
+  return await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE run_id=?").bind(runId).first<Run>();
 }
 
 async function runByBranch(db: D1Database, repository: string, branch: string): Promise<Run | null> {
-  const rows = await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE repository=? AND branch=? ORDER BY updated_at DESC LIMIT 2").bind(repository, branch).all<Run>();
+  const rows = await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE repository=? AND branch=? ORDER BY updated_at DESC LIMIT 2").bind(repository, branch).all<Run>();
   if ((rows.results ?? []).length > 1) throw new Error("reconciliation_branch_ambiguous");
   return rows.results?.[0] ?? null;
 }
@@ -439,15 +603,16 @@ async function insertRun(db: D1Database, job: Job): Promise<"inserted" | "duplic
   if (existing) return existing.contract_digest === job.contractDigest && existing.linear_issue_id === c.linear.issue_id ? "duplicate" : "conflict";
   const timestamp = new Date().toISOString();
   const admissionEventId = `admission:${job.dispatchId}`;
+  const resolvedProfileDigest = await profileDigest(c);
   let results: D1Result<unknown>[];
   try {
     results = await db.batch([
-      db.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-        .bind(job.dispatchId, job.runId, job.contractDigest, PROFILE_DIGEST, stable(c), c.linear.project_id, c.linear.issue_id, c.linear.identifier, c.target.repository, c.target.collision_group, c.target.base_sha, "admitted", timestamp, timestamp),
-      db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,? FROM factory_runs WHERE dispatch_id=? AND current_state='admitted'")
-        .bind(admissionEventId, job.dispatchId, 1, "state:admitted", job.contractDigest, 1, "accepted", timestamp, job.dispatchId),
-      db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
-        .bind(job.dispatchId, 1, admissionEventId, "proposed", "admitted", "admission", timestamp, admissionEventId),
+      db.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(job.dispatchId, job.runId, job.contractDigest, resolvedProfileDigest, c.registry.factory_id, c.registry.registry_version, c.registry.registry_digest, c.registry.entry_version, stable(c), c.linear.project_id, c.linear.issue_id, c.linear.identifier, c.target.repository, c.target.collision_group, c.target.base_sha, "admitted", timestamp, timestamp),
+      db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,factory_id,registry_version,registry_digest,registry_entry_version,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? FROM factory_runs WHERE dispatch_id=? AND current_state='admitted'")
+        .bind(admissionEventId, job.dispatchId, 1, "state:admitted", c.registry.factory_id, c.registry.registry_version, c.registry.registry_digest, c.registry.entry_version, job.contractDigest, 1, "accepted", timestamp, job.dispatchId),
+      db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
+        .bind(job.dispatchId, 1, admissionEventId, "proposed", "admitted", "admission", c.registry.factory_id, c.registry.registry_version, c.registry.registry_digest, c.registry.entry_version, timestamp, admissionEventId),
     ]);
   } catch (error) {
     const raced = await db.prepare("SELECT contract_digest,linear_issue_id FROM factory_runs WHERE dispatch_id=?")
@@ -466,8 +631,19 @@ async function insertRun(db: D1Database, job: Job): Promise<"inserted" | "duplic
 }
 
 async function recordStep(db: D1Database, runId: string, stepKey: string, status: string, result: ObjectValue = {}): Promise<void> {
-  await db.prepare("INSERT INTO factory_steps(run_id,step_key,status,result_json,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(run_id,step_key) DO UPDATE SET status=excluded.status,result_json=excluded.result_json,updated_at=excluded.updated_at")
-    .bind(runId, stepKey, status, stable(result), new Date().toISOString()).run();
+  await db.prepare("INSERT INTO factory_steps(run_id,step_key,status,result_json,factory_id,registry_version,registry_digest,registry_entry_version,updated_at) SELECT ?,?,?,?,factory_id,registry_version,registry_digest,registry_entry_version,? FROM factory_runs WHERE run_id=? ON CONFLICT(run_id,step_key) DO UPDATE SET status=excluded.status,result_json=excluded.result_json,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,updated_at=excluded.updated_at")
+    .bind(runId, stepKey, status, stable(result), new Date().toISOString(), runId).run();
+}
+
+async function recordPrReceipt(db: D1Database, runId: string, pull: PullRequest): Promise<void> {
+  const receiptId = `pr:${runId}:${pull.number}`;
+  await db.prepare("INSERT OR REPLACE INTO factory_pr_receipts(receipt_id,dispatch_id,run_id,pr_number,pr_url,head_sha,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,dispatch_id,run_id,?,?,?,factory_id,registry_version,registry_digest,registry_entry_version,? FROM factory_runs WHERE run_id=?")
+    .bind(receiptId, pull.number, pull.html_url, pull.head.sha, new Date().toISOString(), runId).run();
+}
+
+async function recordLinearReconciliation(db: D1Database, runId: string, reconciliationId: string, state: string, reason: string): Promise<void> {
+  await db.prepare("INSERT OR REPLACE INTO factory_linear_reconciliations(reconciliation_id,dispatch_id,run_id,state,reason,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,dispatch_id,run_id,?,?,factory_id,registry_version,registry_digest,registry_entry_version,? FROM factory_runs WHERE run_id=?")
+    .bind(reconciliationId, state, reason, new Date().toISOString(), runId).run();
 }
 
 type RunFields = {
@@ -565,10 +741,10 @@ async function transitionRun(
   const payloadDigest = patch.result ? await digest(patch.result) : null;
   const results = await db.batch([
     db.prepare(`UPDATE factory_runs SET ${set.join(",")} WHERE ${where.join(" AND ")}`).bind(...updateValues),
-    db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,? FROM factory_runs WHERE run_id=? AND current_state=? AND updated_at=?")
-      .bind(eventId, run.dispatch_id, sequence, `state:${toState}`, payloadDigest, 1, "accepted", now, runId, toState, now),
-    db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
-      .bind(run.dispatch_id, sequence, eventId, run.current_state, toState, actor, now, eventId),
+    db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,factory_id,registry_version,registry_digest,registry_entry_version,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? FROM factory_runs WHERE run_id=? AND current_state=? AND updated_at=?")
+      .bind(eventId, run.dispatch_id, sequence, `state:${toState}`, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, payloadDigest, 1, "accepted", now, runId, toState, now),
+    db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
+      .bind(run.dispatch_id, sequence, eventId, run.current_state, toState, actor, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, now, eventId),
   ]);
   if (results[0].meta.changes !== 1 || results[1].meta.changes !== 1 || results[2].meta.changes !== 1) {
     throw new Error(patch.leaseFence === undefined ? "state_transition_raced" : "lease_fenced");
@@ -603,8 +779,8 @@ async function acquireLease(db: D1Database, run: Run): Promise<number | null> {
   if (current?.dispatch_id === run.run_id && new Date(current.expires_at) > now) return current.fence;
   if (current && new Date(current.expires_at) > now) return null;
   const expiry = new Date(now.getTime() + 30 * 60_000).toISOString();
-  const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,fence,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=?")
-    .bind(key, "workflow", run.run_id, current?.fence ?? 0, expiry, now.toISOString()).run();
+  const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=?")
+    .bind(key, "workflow", run.run_id, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, current?.fence ?? 0, expiry, now.toISOString()).run();
   if (result.meta.changes !== 1) return null;
   const lease = await db.prepare("SELECT fence FROM factory_leases WHERE lease_key=? AND dispatch_id=?").bind(key, run.run_id).first<{ fence: number }>();
   return lease?.fence ?? null;
@@ -634,6 +810,13 @@ async function renewLease(db: D1Database, run: Run): Promise<void> {
 
 async function markIngress(db: D1Database, id: string, state: string): Promise<void> {
   await db.prepare("UPDATE factory_ingress_events SET handoff_state=?,updated_at=? WHERE event_id=?").bind(state, new Date().toISOString(), id).run();
+}
+
+async function bindIngressRegistry(db: D1Database, id: string, job: Job): Promise<void> {
+  const identity = job.contract.registry;
+  const result = await db.prepare("UPDATE factory_ingress_events SET factory_id=?,registry_version=?,registry_digest=?,registry_entry_version=?,updated_at=? WHERE event_id=? AND handoff_state='processing'")
+    .bind(identity.factory_id, identity.registry_version, identity.registry_digest, identity.entry_version, new Date().toISOString(), id).run();
+  if (result.meta.changes !== 1) throw new Error("ingress_registry_binding_failed");
 }
 
 async function claimIngress(db: D1Database, id: string): Promise<boolean> {
@@ -675,7 +858,11 @@ function linearSelectors(payload: ObjectValue): ObjectValue {
 function githubSelectors(payload: ObjectValue, eventType: string): ObjectValue | null {
   const repository = payload.repository;
   const fullName = repository && typeof repository === "object" && !Array.isArray(repository) ? (repository as ObjectValue).full_name : undefined;
-  if (typeof fullName !== "string" || !REPOSITORY.test(fullName) || !fullName.startsWith(envRepositoryPrefix())) throw new AdmissionError("github_repository_invalid");
+  const registered = records(FACTORY_REGISTRY.factories, "registry_factories_invalid")
+    .filter((item) => ACTIVE_FACTORY_STATES.has(String(item.state)))
+    .flatMap((item) => records(item.repositories, "registry_repositories_invalid"))
+    .map((item) => item.repository);
+  if (typeof fullName !== "string" || !REPOSITORY.test(fullName) || !registered.includes(fullName)) throw new AdmissionError("github_repository_invalid");
   const action = payload.action;
   if (typeof action !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(action)) throw new AdmissionError("github_action_invalid");
   if (eventType === "pull_request") {
@@ -702,10 +889,6 @@ function githubSelectors(payload: ObjectValue, eventType: string): ObjectValue |
     ...(typeof number === "number" && Number.isSafeInteger(number) && number > 0 ? { pr_number: number } : {}),
     action,
   };
-}
-
-function envRepositoryPrefix(): string {
-  return "mhoo-os/";
 }
 
 function dispatchJob(value: unknown): DispatchJob | null {
@@ -741,14 +924,18 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
   let job = parsedJob;
   let run = await runById(env.DB, job.runId);
   if (!run) return "missing";
+  let registryBinding: RegistryBinding | null = null;
   try {
     const contract = storedContract(run);
-    if (run.profile_digest !== PROFILE_DIGEST || run.dispatch_id !== job.dispatchId || run.contract_digest !== job.contractDigest || await digest(contract) !== run.contract_digest) throw new Error("dispatch_identity_conflict");
+    registryBinding = await assertCurrentRegistry(contract);
+    if (run.factory_id !== contract.registry.factory_id || run.registry_version !== contract.registry.registry_version || run.registry_digest !== contract.registry.registry_digest || run.registry_entry_version !== contract.registry.entry_version || run.profile_digest !== await profileDigest(contract) || run.dispatch_id !== job.dispatchId || run.contract_digest !== job.contractDigest || await digest(contract) !== run.contract_digest) throw new Error("dispatch_identity_conflict");
     job = { ...job, dispatchId: run.dispatch_id, runId: run.run_id, contractDigest: run.contract_digest, contract };
   } catch (error) {
     try {
-      await transitionRun(env.DB, job.runId, "needs-human", "reconciler", `schedule:identity-conflict:${job.runId}`, { result: { reason: error instanceof Error ? error.message : "dispatch_identity_conflict" } });
-      return "needs-human";
+      const reason = error instanceof Error ? error.message : "dispatch_identity_conflict";
+      const stale = reason === "registry_stale_re_admission_required" || reason === "registry_factory_disabled";
+      await transitionRun(env.DB, job.runId, stale ? "needs-replan" : "needs-human", "reconciler", `schedule:identity-conflict:${job.runId}`, { result: { reason } });
+      return stale ? "needs-replan" : "needs-human";
     } catch {
       return "retryable";
     }
@@ -775,7 +962,9 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     if (!run) return "missing";
   }
   const maxConcurrency = configInteger(env, "MAX_GLOBAL_CONCURRENCY", 1, 32);
-  if (maxConcurrency === null) {
+  const capacity = registryBinding?.factory.capacity as ObjectValue | undefined;
+  const registryGlobal = Number(capacity?.global_concurrency);
+  if (maxConcurrency === null || !Number.isSafeInteger(registryGlobal) || maxConcurrency > registryGlobal || maxConcurrency > job.contract.factory_request.concurrency) {
     try {
       await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:invalid-concurrency:${job.runId}`, { result: { reason: "global_concurrency_config_invalid" } });
       return "needs-human";
@@ -848,6 +1037,7 @@ async function acceptLinear(request: Request, env: Env): Promise<Response> {
       await markIngress(env.DB, id, "rejected:conflicting_dispatch");
       return response({ accepted: false, reason: "conflicting_dispatch" }, 202);
     }
+    await bindIngressRegistry(env.DB, id, job);
     await env.EXECUTION_QUEUE.send(job);
     await env.DB.prepare("UPDATE factory_ingress_events SET handoff_state='enqueued',enqueued_at=?,updated_at=? WHERE event_id=?").bind(new Date().toISOString(), new Date().toISOString(), id).run();
     return response({ accepted: true, executionId: job.runId, duplicate: runResult === "duplicate" }, 202);
@@ -1123,7 +1313,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
     title: `[Factory] ${job.contract.linear.identifier} bounded execution`,
     head: agent.branch,
     base: defaultBranch,
-    body: `${marker}\n\nFactory execution for ${job.contract.linear.identifier}.\n\n- Run: \`${job.runId}\`\n- Contract digest: \`${job.contractDigest}\`\n- Base: \`${job.contract.target.base_sha}\`\n- Head: \`${agent.head_sha}\`\n\nAutomatic merge is disabled; human review is required.`,
+    body: `${marker}\n\nFactory execution for ${job.contract.linear.identifier}.\n\n- Factory: \`${job.contract.registry.factory_id}\`\n- Registry: \`${job.contract.registry.registry_version}\` / \`${job.contract.registry.registry_digest}\`\n- Run: \`${job.runId}\`\n- Contract digest: \`${job.contractDigest}\`\n- Base: \`${job.contract.target.base_sha}\`\n- Head: \`${agent.head_sha}\`\n\nAutomatic merge is disabled; human review is required.`,
   });
   const pull = pullRequest(created, job.contract.target.repository);
   if (pull.head.sha !== agent.head_sha) throw new Error("created_pull_request_head_mismatch");
@@ -1157,7 +1347,7 @@ async function ensureLinearReceipt(env: Env, job: Job, pull: PullRequest, state 
     after = pageInfo.endCursor;
     if (page === 9) throw new Error("linear_receipts_pagination_limit");
   }
-  const body = `${marker}\n\nFactory execution for ${job.contract.linear.identifier}: ${state}.\n\n- Run: \`${job.runId}\`\n- Reason: \`${reason}\`\n- Contract digest: \`${job.contractDigest}\`\n- Repository: \`${job.contract.target.repository}\`\n- PR: ${pull.html_url}\n- PR head: \`${pull.head.sha}\`\n\nAutomatic merge is disabled; human review is required.`;
+  const body = `${marker}\n\nFactory execution for ${job.contract.linear.identifier}: ${state}.\n\n- Factory: \`${job.contract.registry.factory_id}\`\n- Registry: \`${job.contract.registry.registry_version}\` / \`${job.contract.registry.registry_digest}\`\n- Run: \`${job.runId}\`\n- Reason: \`${reason}\`\n- Contract digest: \`${job.contractDigest}\`\n- Repository: \`${job.contract.target.repository}\`\n- PR: ${pull.html_url}\n- PR head: \`${pull.head.sha}\`\n\nAutomatic merge is disabled; human review is required.`;
   const matches = nodes.filter((item) => {
     if (!item || typeof item !== "object") return false;
     const value = item as ObjectValue;
@@ -1192,15 +1382,14 @@ function storedContract(run: Run): Contract {
 }
 
 async function linearPlanningSnapshot(env: Env, run: Run): Promise<Contract> {
-  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description project{id} state{type}}}";
+  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description project{id} team{id} state{type} labels{nodes{name}}}}";
   const data = await linearGraphql(env, query, { issueId: run.linear_issue_id });
   const issue = data.issue;
   if (!issue || typeof issue !== "object" || Array.isArray(issue)) throw new Error("linear_issue_missing");
   const item = issue as ObjectValue;
   const project = item.project;
   if (!project || typeof project !== "object" || Array.isArray(project) || typeof (project as ObjectValue).id !== "string") throw new Error("linear_project_missing");
-  if ((project as ObjectValue).id !== secret(env, "LINEAR_PROJECT_ID")) throw new Error("linear_project_mismatch");
-  return contractFromDescription(item.description, item, env);
+  return await contractFromDescription(item.description, item);
 }
 
 async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Promise<"processed" | "ignored"> {
@@ -1208,7 +1397,9 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
   const run = job.runId ? await runById(env.DB, job.runId) : await runByBranch(env.DB, job.repository, job.branch as string);
   if (!run) return "ignored";
   if (run.repository !== job.repository || (run.branch !== null && job.branch !== undefined && run.branch !== job.branch) || (run.pr_number !== null && job.prNumber !== undefined && run.pr_number !== job.prNumber)) throw new Error("reconciliation_identity_conflict");
-  if (run.profile_digest !== PROFILE_DIGEST) throw new Error("reconciliation_profile_digest_conflict");
+  const stored = storedContract(run);
+  await assertCurrentRegistry(stored);
+  if (run.registry_digest !== stored.registry.registry_digest || run.profile_digest !== await profileDigest(stored)) throw new Error("reconciliation_registry_identity_conflict");
   const token = secret(env, "GITHUB_TOKEN");
   if (!token) throw new Error("github_credentials_missing");
   let prNumber = job.prNumber ?? run.pr_number ?? null;
@@ -1224,7 +1415,7 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
   const value = await githubRequest(token, "GET", `/repos/${repositoryPath(job.repository)}/pulls/${prNumber}`);
   const pull = pullRequest(value, job.repository);
   if (pull.number !== prNumber || pull.html_url !== `https://github.com/${job.repository}/pull/${prNumber}`) throw new Error("reconciliation_pr_identity_conflict");
-  const contract = storedContract(run);
+  const contract = stored;
   if (await digest(contract) !== run.contract_digest) throw new Error("reconciliation_contract_digest_conflict");
   const currentContract = await linearPlanningSnapshot(env, run);
   const expectedBranch = run.branch ?? `factory/${contract.linear.identifier.toLowerCase()}-${run.run_id.slice(-12)}`;
@@ -1264,6 +1455,7 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
   await recordStep(env.DB, run.run_id, "reconciliation", state, { reason, action: job.action, pr_number: pull.number, base_sha: pull.base.sha, head_sha: pull.head.sha });
   const dispatchJob: Job = { kind: "dispatch", dispatchId: run.dispatch_id, runId: run.run_id, contractDigest: run.contract_digest, contract };
   await ensureLinearReceipt(env, dispatchJob, pull, state, reason);
+  await recordLinearReconciliation(env.DB, run.run_id, `github:${job.eventId}`, state, reason);
   return "processed";
 }
 
@@ -1298,7 +1490,7 @@ function workflowActor(fromState: string, toState: string): TransitionActor {
 
 async function rehydrateLinearJob(env: Env, selector: ObjectValue): Promise<Job> {
   if (selector.kind !== "linear-issue" || typeof selector.issue_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(selector.issue_id)) throw new Error("linear_selector_invalid");
-  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description state{type} labels{nodes{name}}}}";
+  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description project{id} team{id} state{type} labels{nodes{name}}}}";
   const data = await linearGraphql(env, query, { issueId: selector.issue_id });
   const issue = data.issue;
   if (!issue || typeof issue !== "object" || Array.isArray(issue) || (issue as ObjectValue).id !== selector.issue_id) throw new Error("linear_issue_missing");
@@ -1327,6 +1519,7 @@ async function recoverIngress(env: Env): Promise<void> {
         const job = await rehydrateLinearJob(env, selector);
         const runResult = await insertRun(env.DB, job);
         if (runResult === "conflict") throw new Error("conflicting_dispatch");
+        await bindIngressRegistry(env.DB, row.event_id, job);
         await env.EXECUTION_QUEUE.send(job);
       } else {
         await markIngress(env.DB, row.event_id, "rejected:unsupported_provider");
@@ -1436,11 +1629,13 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       published = await step.do<PullRequest>("publish-pr", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<PullRequest> => {
         const pull = await publishPullRequest(this.env, job, execution);
         await recordStep(this.env.DB, job.runId, "publish-pr", "passed", { number: pull.number, url: pull.html_url, head_sha: pull.head.sha, base: pull.base.ref, base_sha: pull.base.sha });
+        await recordPrReceipt(this.env.DB, job.runId, pull);
         return pull;
       });
       const receipt = await step.do<"created" | "existing">("linear-receipt", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<"created" | "existing"> => {
         const result = await ensureLinearReceipt(this.env, job, published as PullRequest);
         await recordStep(this.env.DB, job.runId, "linear-receipt", "passed", { outcome: result, pr_number: (published as PullRequest).number });
+        await recordLinearReconciliation(this.env.DB, job.runId, `linear:${job.runId}:${(published as PullRequest).number}`, "pr-open", "pr_published");
         return result;
       });
       await step.do("finalize-pr", async () => {
@@ -1473,7 +1668,19 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
-      if (url.pathname === "/health") return response({ ok: true, stopped: await stopped(env.DB), automaticMerge: false, source: "github-reviewable" });
+      if (url.pathname === "/health") return response({ ok: true });
+      if (url.pathname === "/ops/status") {
+        const admin = secret(env, "FACTORY_ADMIN_SECRET");
+        if (request.method !== "GET" || !admin || request.headers.get("Authorization") !== `Bearer ${admin}`) return response({ error: "forbidden" }, 403);
+        return response({
+          ok: true,
+          stopped: await stopped(env.DB),
+          automaticMerge: false,
+          registryVersion: text(FACTORY_REGISTRY.registry_version, "registry_version_invalid"),
+          registryDigest: await digest(FACTORY_REGISTRY),
+          enabledFactories: records(FACTORY_REGISTRY.factories, "registry_factories_invalid").filter((item) => ACTIVE_FACTORY_STATES.has(String(item.state))).map((item) => item.factory_id),
+        });
+      }
       if (url.pathname === "/webhooks/linear" && request.method === "POST") return await acceptLinear(request, env);
       if (url.pathname === "/webhooks/github" && request.method === "POST") return await acceptGithub(request, env);
       if (url.pathname === "/controls/stop" || url.pathname === "/controls/resume") {
