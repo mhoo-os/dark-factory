@@ -17,7 +17,7 @@ export default defineConfig({
       // Keep the authority-heavy Worker paths above the prior smoke-test floor.
       // The D1 suite exercises migrations, contention, fencing, renewal, and
       // exact release rather than counting lease-key strings.
-      thresholds: { statements: 22, branches: 20, functions: 38, lines: 25 },
+      thresholds: { statements: 23, branches: 21, functions: 41, lines: 26 },
     },
   },
 });

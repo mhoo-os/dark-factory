@@ -16,7 +16,6 @@ async function testAgent() {
   process.env.OPENROUTER_API_KEY = "receipt-test-key";
   process.env.OPENROUTER_MODEL = "test-model";
   process.env.FACTORY_MODEL_PROVIDER = "openrouter";
-  process.env.FACTORY_MODEL_VERSION = "test-version";
   process.env.FACTORY_REPOSITORY = "mhoo-os/dark-factory";
   process.env.FACTORY_ISSUE = "MHO-224";
   process.env.FACTORY_MAX_COST_USD = "1.00";
@@ -61,6 +60,9 @@ test("agent sends a pricing-derived provider max_tokens and returns the provider
   globalThis.fetch = async (_url, options) => {
     request = JSON.parse(options.body);
     return new Response(JSON.stringify({
+      id: "gen-provider-issued-123",
+      created: 1_725_000_000,
+      model: "provider-returned-model",
       choices: [{ message: { content: JSON.stringify({ files: [{ path: "src/bounded.ts", content: "export const bounded = true;\n" }] }) } }],
       usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost: 0.40 },
     }), { status: 200 });
@@ -68,7 +70,7 @@ test("agent sends a pricing-derived provider max_tokens and returns the provider
   try {
     const result = await modelFiles(modelContract);
     assert.equal(request.max_tokens, 80);
-    assert.deepEqual(result.providerUsage, { provider: "openrouter", model: "test-model", version: "test-version", prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.40 });
+    assert.deepEqual(result.providerUsage, { provider: "openrouter", model: "provider-returned-model", generation_id: "gen-provider-issued-123", provider_created_at: 1_725_000_000, prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.40 });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -78,8 +80,25 @@ test("agent refuses an over-budget provider receipt before files can be applied"
   const { modelFiles } = await testAgent();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({
+    id: "gen-over-budget-123",
+    created: 1_725_000_001,
+    model: "provider-returned-model",
     choices: [{ message: { content: JSON.stringify({ files: [{ path: "src/never.ts", content: "no" }] }) } }],
     usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 1.01 },
+  }), { status: 200 });
+  try {
+    await assert.rejects(() => modelFiles(modelContract), /provider_usage_or_cost_invalid/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("agent refuses a provider response without provider-issued identity evidence", async () => {
+  const { modelFiles } = await testAgent();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ files: [{ path: "src/never.ts", content: "no" }] }) } }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0.01 },
   }), { status: 200 });
   try {
     await assert.rejects(() => modelFiles(modelContract), /provider_usage_or_cost_invalid/);

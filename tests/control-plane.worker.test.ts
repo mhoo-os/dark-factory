@@ -108,11 +108,13 @@ describe("local Worker control-plane behavior", () => {
   });
 
   it("binds execution to the canonical OpenRouter model receipt and configured spend ceiling", () => {
-    const receipt = { status: "passed", reason: "ok", branch: "factory/mho-224-run-v1-aaaaaaaaaaaa", head_sha: "a".repeat(40), cost_usd: 0.4, provider_usage: { provider: "openrouter", model: "z-ai/glm-5.3-flash", version: "2026-09-03", prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.4 } };
+    const receipt = { status: "passed", reason: "ok", branch: "factory/mho-224-run-v1-aaaaaaaaaaaa", head_sha: "a".repeat(40), cost_usd: 0.4, provider_usage: { provider: "openrouter", model: "z-ai/glm-5.3-flash", generation_id: "gen-provider-issued-123", provider_created_at: 1_725_000_000, prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.4 } };
     expect(__TEST_ONLY__.agentResult(receipt)).toMatchObject({ cost_usd: 0.4 });
     expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, cost_usd: 0.3 } })).toThrow("agent_provider_cost_mismatch");
     expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, provider: "other" } })).toThrow("agent_provider_usage_invalid");
     expect(__TEST_ONLY__.canonicalModel(contract as never)).toEqual({ policyKey: "static:execution-default-v1", provider: "openrouter", model: "z-ai/glm-5.3-flash", version: "2026-09-03", outputTokenUsd: 0.001, requestOverheadUsd: 0.5 });
+    expect(__TEST_ONLY__.providerReceiptMatchesCanonical(receipt.provider_usage, __TEST_ONLY__.canonicalModel(contract as never))).toBe(true);
+    expect(__TEST_ONLY__.providerReceiptMatchesCanonical({ ...receipt.provider_usage, model: "provider-drift" }, __TEST_ONLY__.canonicalModel(contract as never))).toBe(false);
     expect(() => __TEST_ONLY__.canonicalModel({ ...contract, factory_request: { ...contract.factory_request, model_policy_key: "static:drift-v1" } } as never)).toThrow("registry_model_policy_not_canonical");
     expect(__TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "1" } as never, contract as never).costUsd).toBe(1);
     expect(() => __TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "9" } as never, contract as never)).toThrow("cost_cap_config_invalid");
@@ -161,9 +163,10 @@ describe("local Worker control-plane behavior", () => {
     expect(originalFence).toBeTypeOf("number");
     const heldOriginal = { ...original, lease_fence: originalFence as number };
     await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(originalFence, original.run_id).run();
-    await __TEST_ONLY__.renewLease(env.DB, heldOriginal as never);
+    await __TEST_ONLY__.renewLeaseWithinRunDeadline(env.DB, heldOriginal as never, { timeoutSeconds: 60 });
     const liveExpiry = await env.DB.prepare("SELECT lease_expires_at FROM factory_runs WHERE run_id=?").bind(original.run_id).first<{ lease_expires_at: string }>();
     expect(Date.parse(liveExpiry?.lease_expires_at ?? "")).toBeGreaterThan(Date.now());
+    expect(Date.parse(liveExpiry?.lease_expires_at ?? "")).toBeLessThanOrEqual(Date.parse(original.created_at) + 60_000);
     await env.DB.prepare("UPDATE factory_leases SET expires_at=? WHERE dispatch_id=?").bind(new Date(0).toISOString(), original.run_id).run();
     const successorFence = await __TEST_ONLY__.acquireLease(env.DB, successor as never, limits);
     expect(successorFence).toBeTypeOf("number");
@@ -184,5 +187,28 @@ describe("local Worker control-plane behavior", () => {
     expect(__TEST_ONLY__.terminalCleanupSeconds(cleanup as never, { timeoutSeconds: 1_000 })).toBeLessThanOrEqual(30);
     const exhaustedCleanup = { created_at: new Date(Date.now() - 1_031_000).toISOString() };
     expect(() => __TEST_ONLY__.terminalCleanupSeconds(exhaustedCleanup as never, { timeoutSeconds: 1_000 })).toThrow("terminal_cleanup_deadline_exceeded");
+  });
+
+  it("does not enter an expired callback or renew its lease", async () => {
+    let callbackRan = false;
+    const observedSteps: Array<{ name: string; options: { retries: { limit: number }; timeout: string } }> = [];
+    const fakeStep = { do: async (name: string, options: { retries: { limit: number }; timeout: string }, callback: () => Promise<string>) => { observedSteps.push({ name, options }); return await callback(); } };
+    const live = { created_at: new Date().toISOString() };
+    await expect(__TEST_ONLY__.activeWorkflowStep(fakeStep as never, "live-callback", live as never, { timeoutSeconds: 30 } as never, async () => "ran")).resolves.toBe("ran");
+    expect(observedSteps).toMatchObject([{ name: "live-callback", options: { retries: { limit: 0 } } }]);
+    const expired = { created_at: new Date(Date.now() - 2_000).toISOString() };
+    await expect(__TEST_ONLY__.activeWorkflowStep(fakeStep as never, "expired-callback", expired as never, { timeoutSeconds: 1 } as never, async () => {
+      callbackRan = true;
+      return "should-not-run";
+    })).rejects.toThrow("workflow_deadline_exceeded");
+    expect(callbackRan).toBe(false);
+
+    const run = { run_id: `run-v1-${"l".repeat(32)}`, factory_id: "deadline-factory", repository: "deadline-repository", collision_group: "deadline-collision", registry_version: registry.registry_version, registry_digest: registry.registry_digest, registry_entry_version: registry.entry_version, lease_fence: null, created_at: new Date().toISOString() };
+    await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(run.run_id, run.run_id, "digest", "profile", run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, JSON.stringify(contract), "project", `${run.run_id}-issue`, run.run_id, run.repository, run.collision_group, contract.target.base_sha, "queued", run.created_at, run.created_at).run();
+    const fence = await __TEST_ONLY__.acquireLease(env.DB, run as never, { global: 1, factory: 1, repository: 1, collision: 1 });
+    const held = { ...run, lease_fence: fence as number };
+    const before = await env.DB.prepare("SELECT expires_at FROM factory_leases WHERE dispatch_id=? LIMIT 1").bind(run.run_id).first<{ expires_at: string }>();
+    await expect(__TEST_ONLY__.renewLeaseWithinRunDeadline(env.DB, { ...held, created_at: new Date(Date.now() - 2_000).toISOString() } as never, { timeoutSeconds: 1 })).rejects.toThrow("workflow_deadline_exceeded");
+    await expect(env.DB.prepare("SELECT expires_at FROM factory_leases WHERE dispatch_id=? LIMIT 1").bind(run.run_id).first<{ expires_at: string }>()).resolves.toEqual(before);
   });
 });

@@ -194,7 +194,7 @@ type AgentResult = {
   status: "passed" | "failed" | "needs-replan" | "needs-human";
   reason: string;
   cost_usd?: number;
-  provider_usage?: { provider: "openrouter"; model: string; version: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; cost_usd: number };
+  provider_usage?: { provider: "openrouter"; model: string; generation_id: string; provider_created_at: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cost_usd: number };
   branch?: string;
   head_sha?: string;
   diff_digest?: string;
@@ -936,10 +936,11 @@ async function releaseLease(db: D1Database, run: Run): Promise<void> {
   ]);
 }
 
-async function renewLease(db: D1Database, run: Run): Promise<void> {
+async function renewLease(db: D1Database, run: Run, expiresNoLaterThan?: number): Promise<void> {
   if (run.lease_fence === null) throw new Error("lease_missing");
   const now = new Date();
-  const expiry = new Date(now.getTime() + 30 * 60_000).toISOString();
+  if (expiresNoLaterThan !== undefined && (!Number.isFinite(expiresNoLaterThan) || expiresNoLaterThan <= now.getTime())) throw new Error("workflow_deadline_exceeded");
+  const expiry = new Date(Math.min(now.getTime() + 30 * 60_000, expiresNoLaterThan ?? Number.POSITIVE_INFINITY)).toISOString();
   const members = await db.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence).first<{ count: number }>();
   const expected = members?.count ?? 0;
   const result = await db.prepare("UPDATE factory_leases SET expires_at=? WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?) AND expires_at>?").bind(expiry, run.run_id, run.lease_fence, now.toISOString()).run();
@@ -1262,13 +1263,19 @@ function agentResult(value: unknown): AgentResult {
     for (const field of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
       if (!Number.isSafeInteger(usage[field]) || Number(usage[field]) < 0) throw new Error("agent_provider_usage_invalid");
     }
-    if (usage.provider !== "openrouter" || typeof usage.model !== "string" || typeof usage.version !== "string" || typeof usage.cost_usd !== "number" || !Number.isFinite(usage.cost_usd) || usage.cost_usd < 0 || usage.cost_usd > 1_000_000 || usage.total_tokens !== Number(usage.prompt_tokens) + Number(usage.completion_tokens)) throw new Error("agent_provider_usage_invalid");
+    if (usage.provider !== "openrouter" || typeof usage.model !== "string" || usage.model.length === 0 || usage.model.length > 256 || typeof usage.generation_id !== "string" || usage.generation_id.length === 0 || usage.generation_id.length > 256 || !Number.isSafeInteger(usage.provider_created_at) || Number(usage.provider_created_at) < 1 || typeof usage.cost_usd !== "number" || !Number.isFinite(usage.cost_usd) || usage.cost_usd < 0 || usage.cost_usd > 1_000_000 || usage.total_tokens !== Number(usage.prompt_tokens) + Number(usage.completion_tokens)) throw new Error("agent_provider_usage_invalid");
     if (item.cost_usd !== usage.cost_usd) throw new Error("agent_provider_cost_mismatch");
   }
   if (item.changed_files !== undefined && (!Array.isArray(item.changed_files) || item.changed_files.length > 12 || item.changed_files.some((path) => typeof path !== "string" || path.length === 0 || path.length > 512 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")))) throw new Error("agent_changed_files_invalid");
   Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "cost_usd", "provider_usage"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
   if (result.status === "passed" && (!result.branch || !result.head_sha || item.cost_usd === undefined || providerUsage === undefined)) throw new Error("agent_success_identity_or_provider_cost_missing");
   return result;
+}
+
+function providerReceiptMatchesCanonical(usage: NonNullable<AgentResult["provider_usage"]>, model: CanonicalModel): boolean {
+  // `model`, generation id, and timestamp are provider-response evidence.
+  // The registry only supplies the expected model identity for comparison.
+  return usage.provider === model.provider && usage.model === model.model && usage.generation_id.length > 0 && usage.provider_created_at > 0;
 }
 
 function parseAgentResult(result: SandboxExecResult): AgentResult {
@@ -1297,6 +1304,29 @@ function remainingRunSeconds(run: Run, limits: { timeoutSeconds: number }): numb
   const remaining = Math.floor((started + limits.timeoutSeconds * 1_000 - Date.now()) / 1_000);
   if (remaining < 1) throw new Error("workflow_deadline_exceeded");
   return remaining;
+}
+
+function runDeadlineAt(run: Run, limits: { timeoutSeconds: number }): number {
+  const started = Date.parse(run.created_at);
+  if (!Number.isFinite(started)) throw new Error("run_deadline_invalid");
+  return started + limits.timeoutSeconds * 1_000;
+}
+
+async function renewLeaseWithinRunDeadline(db: D1Database, run: Run, limits: { timeoutSeconds: number }): Promise<void> {
+  // Check immediately before the write; an overdue callback may only perform
+  // terminal cleanup, never extend authority by renewing a lease.
+  remainingRunSeconds(run, limits);
+  await renewLease(db, run, runDeadlineAt(run, limits));
+}
+
+async function activeWorkflowStep<T extends Rpc.Serializable<T>>(step: WorkflowStep, name: string, run: Run, limits: RuntimeLimits, callback: () => Promise<T>): Promise<T> {
+  const timeout = workflowTimeout(remainingRunSeconds(run, limits));
+  return await step.do<T>(name, { retries: { limit: 0, delay: "1 second" }, timeout }, async () => {
+    remainingRunSeconds(run, limits);
+    const value = await callback();
+    remainingRunSeconds(run, limits);
+    return value;
+  });
 }
 
 function terminalCleanupSeconds(run: Run, limits: { timeoutSeconds: number }): number {
@@ -1390,11 +1420,10 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
         OPENROUTER_API_KEY: credentials.openRouterKey,
         OPENROUTER_MODEL: model.model,
         FACTORY_MODEL_PROVIDER: model.provider,
-        FACTORY_MODEL_VERSION: model.version,
       },
     }) as SandboxExecResult;
     const agent = parseAgentResult(result);
-    if (agent.provider_usage && (agent.provider_usage.provider !== model.provider || agent.provider_usage.model !== model.model || agent.provider_usage.version !== model.version)) return { status: "needs-human", reason: "provider_receipt_model_mismatch" };
+    if (agent.provider_usage && !providerReceiptMatchesCanonical(agent.provider_usage, model)) return { status: "needs-human", reason: "provider_receipt_model_mismatch" };
     return agent;
   } catch {
     return { status: "needs-human", reason: "sandbox_execution_failed" };
@@ -1797,15 +1826,16 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       if (!run || run.lease_fence === null) return { status: "needs-human", runId: job.runId, reason: "lease_missing" };
       const resolvedRuntimeLimits = runtimeExecutionLimits(this.env, job.contract);
       runtimeLimits = resolvedRuntimeLimits;
-      const remainingTimeout = () => workflowTimeout(remainingRunSeconds(run as Run, resolvedRuntimeLimits));
+      const assertActive = () => remainingRunSeconds(run as Run, resolvedRuntimeLimits);
       leaseHeld = true;
       if (await stopped(this.env.DB)) {
         return await finish("stopped", "stop_requested_before_execution");
       }
-      await renewLease(this.env.DB, run);
+      await renewLeaseWithinRunDeadline(this.env.DB, run, resolvedRuntimeLimits);
 
-      const grounding = await step.do<GroundingResult>("ground", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<GroundingResult> => {
+      const grounding = await activeWorkflowStep<GroundingResult>(step, "ground", run, resolvedRuntimeLimits, async (): Promise<GroundingResult> => {
         const result = await groundInSandbox(this.env, job);
+        assertActive();
         await recordStep(this.env.DB, job.runId, "ground", result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes, file_count: result.file_count });
         return result;
       });
@@ -1823,12 +1853,13 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         const remainingCostUsd = runtimeLimits.costUsd - cumulativeCostUsd;
         if (!Number.isFinite(remainingCostUsd) || remainingCostUsd <= 0) return await finish("needs-human", "cost_cap_exhausted", { cost_usd: cumulativeCostUsd, cost_cap_usd: runtimeLimits.costUsd });
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_execution");
-        await renewLease(this.env.DB, run);
+        await renewLeaseWithinRunDeadline(this.env.DB, run, resolvedRuntimeLimits);
         const findings = validation?.status === "failed" ? [validation.reason] : [];
-        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<AgentResult> => {
+        execution = await activeWorkflowStep<AgentResult>(step, `sandbox-execution-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<AgentResult> => {
           // The provider request receives only the remaining authoritative budget;
           // it cannot start after previous attempts consumed the cap.
           const result = await executeInSandbox(this.env, job, remainingRunSeconds(run as Run, resolvedRuntimeLimits), remainingCostUsd, attempt, findings);
+          assertActive();
           await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes, provider_usage: result.provider_usage });
           return result;
         });
@@ -1839,16 +1870,20 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         cumulativeCostUsd += execution.cost_usd ?? Number.POSITIVE_INFINITY;
         if (!Number.isFinite(cumulativeCostUsd) || cumulativeCostUsd > runtimeLimits.costUsd) return await finish("needs-human", "cost_cap_exceeded", { cost_usd: cumulativeCostUsd, cost_cap_usd: runtimeLimits.costUsd });
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_validation", { head_sha: execution.head_sha, branch: execution.branch });
+        assertActive();
         await transitionRun(this.env.DB, job.runId, "validating", "workflow", `workflow:validating:${job.runId}:${attempt}`, { leaseFence: run.lease_fence ?? undefined });
 
-        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<ValidationResult> => {
+        validation = await activeWorkflowStep<ValidationResult>(step, `independent-validation-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<ValidationResult> => {
           const result = await validateInFreshSandbox(this.env, job, execution as AgentResult);
+          assertActive();
           await recordStep(this.env.DB, job.runId, `independent-validation-${attempt}`, result.status, { reason: result.reason, fixable: result.fixable, exit_code: result.exit_code, output_digest: result.output_digest, output_bytes: result.output_bytes });
           return result;
         });
         if (validation.status !== "passed") {
           if (validation.fixable && attempt < maxFixAttempts) {
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "fixable-failure", "validator", `workflow:validation-fixable:${job.runId}:${attempt}`, { result: { reason: validation.reason, validation_digest: validation.output_digest, validation_bytes: validation.output_bytes }, leaseFence: run.lease_fence ?? undefined });
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "running", "workflow", `workflow:validation-retry:${job.runId}:${attempt}`, { result: { reason: "bounded_fix_attempt", attempt: attempt + 1 }, leaseFence: run.lease_fence ?? undefined });
             continue;
           }
@@ -1856,15 +1891,18 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         }
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_review", { head_sha: execution.head_sha, branch: execution.branch });
 
-        review = await step.do<ReviewResult>(`independent-review-${attempt}`, { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<ReviewResult> => {
+        review = await activeWorkflowStep<ReviewResult>(step, `independent-review-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<ReviewResult> => {
           const result = await reviewInFreshSandbox(this.env, job, execution as AgentResult);
+          assertActive();
           await recordStep(this.env.DB, job.runId, `independent-review-${attempt}`, result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes });
           return result;
         });
         if (review.status !== "passed") {
           if (attempt < maxFixAttempts) {
             validation = { status: "failed", exit_code: 78, output_digest: review.digest, output_bytes: review.bytes, reason: review.reason, fixable: true };
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "fixable-failure", "validator", `workflow:review-fixable:${job.runId}:${attempt}`, { result: { reason: review.reason, review_digest: review.digest, review_bytes: review.bytes }, leaseFence: run.lease_fence ?? undefined });
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "running", "workflow", `workflow:review-retry:${job.runId}:${attempt}`, { result: { reason: "bounded_fix_attempt", attempt: attempt + 1 }, leaseFence: run.lease_fence ?? undefined });
             continue;
           }
@@ -1874,27 +1912,33 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       }
       if (!execution || !validation || validation.status !== "passed" || !review || review.status !== "passed") return await finish("needs-human", "workflow_evaluation_incomplete");
       if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_publication", { head_sha: execution.head_sha });
-      await renewLease(this.env.DB, run);
+      await renewLeaseWithinRunDeadline(this.env.DB, run, resolvedRuntimeLimits);
 
-      published = await step.do<PullRequest>("publish-pr", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<PullRequest> => {
+      published = await activeWorkflowStep<PullRequest>(step, "publish-pr", run, resolvedRuntimeLimits, async (): Promise<PullRequest> => {
         const pull = await publishPullRequest(this.env, job, execution);
+        assertActive();
         await recordStep(this.env.DB, job.runId, "publish-pr", "passed", { number: pull.number, url: pull.html_url, head_sha: pull.head.sha, base: pull.base.ref, base_sha: pull.base.sha });
+        assertActive();
         await recordPrReceipt(this.env.DB, job.runId, pull);
         return pull;
       });
-      const receipt = await step.do<"created" | "existing">("linear-receipt", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<"created" | "existing"> => {
+      const receipt = await activeWorkflowStep<"created" | "existing">(step, "linear-receipt", run, resolvedRuntimeLimits, async (): Promise<"created" | "existing"> => {
         const result = await ensureLinearReceipt(this.env, job, published as PullRequest);
+        assertActive();
         await recordStep(this.env.DB, job.runId, "linear-receipt", "passed", { outcome: result, pr_number: (published as PullRequest).number });
+        assertActive();
         await recordLinearReconciliation(this.env.DB, job.runId, `linear:${job.runId}:${(published as PullRequest).number}`, "pr-open", "pr_published");
         return result;
       });
-      await step.do("finalize-pr", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async () => {
+      await activeWorkflowStep(step, "finalize-pr", run, resolvedRuntimeLimits, async () => {
         const pull = published as PullRequest;
+        assertActive();
         await transitionRun(this.env.DB, job.runId, "pr-open", "workflow", `workflow:publish:${job.runId}`, {
           result: { reason: "pr_published", validation_digest: validation.output_digest, validation_bytes: validation.output_bytes, review_digest: review?.digest, review_bytes: review?.bytes, linear_receipt: receipt },
           leaseFence: run?.lease_fence ?? undefined,
           fields: { branch: execution?.branch ?? null, headSha: pull.head.sha, prNumber: pull.number, prUrl: pull.html_url },
         });
+        assertActive();
         await recordStep(this.env.DB, job.runId, "final", "pr-open", { pr_number: pull.number, pr_url: pull.html_url, head_sha: pull.head.sha });
         return { recorded: true };
       });
@@ -1923,11 +1967,15 @@ export const __TEST_ONLY__ = {
   runtimeConcurrencyLimits,
   acquireLease,
   renewLease,
+  renewLeaseWithinRunDeadline,
   releaseLease,
   remainingRunSeconds,
+  runDeadlineAt,
+  activeWorkflowStep,
   terminalCleanupSeconds,
   runtimeExecutionLimits,
   canonicalModel,
+  providerReceiptMatchesCanonical,
   agentResult,
   resolveFactory,
 };
