@@ -86,14 +86,40 @@ describe("local Worker control-plane behavior", () => {
     await expect(env.DB.prepare("SELECT from_state,to_state,actor FROM factory_transitions WHERE dispatch_id=?").bind(dispatchId).first()).resolves.toMatchObject({ from_state: "queued", to_state: "needs-replan", actor: "reconciler" });
   });
 
-  it("keeps the none credential profile empty and reserves every independent capacity domain", () => {
+  it("keeps the none credential profile empty", () => {
     expect(__TEST_ONLY__.sandboxCredentials({ GITHUB_TOKEN: "must-not-leak", OPENROUTER_API_KEY: "must-not-leak" } as never, contract)).toEqual({});
     expect(__TEST_ONLY__.inherentEffectClasses(contract)).toEqual(["repository-write"]);
-    expect(__TEST_ONLY__.capacityLeaseScopes({ repository: contract.target.repository, factory_id: registry.factory_id, collision_group: contract.target.collision_group } as never, { global: 1, factory: 2, repository: 3, collision: 4 })).toEqual([
-      ["global:1"],
-      ["factory:foundation-pilot:1", "factory:foundation-pilot:2"],
-      ["repository:mhoo-os/dark-factory:1", "repository:mhoo-os/dark-factory:2", "repository:mhoo-os/dark-factory:3"],
-      ["collision:dark-factory-runtime:1", "collision:dark-factory-runtime:2", "collision:dark-factory-runtime:3", "collision:dark-factory-runtime:4"],
-    ]);
+  });
+
+  it("uses local D1 to contend, roll back partial claims, renew, and release all four capacity domains", async () => {
+    const makeRun = (suffix: string) => ({
+      run_id: `run-v1-${suffix.repeat(32)}`, factory_id: registry.factory_id, repository: contract.target.repository,
+      collision_group: contract.target.collision_group, registry_version: registry.registry_version,
+      registry_digest: registry.registry_digest, registry_entry_version: registry.entry_version,
+      lease_fence: null, created_at: new Date().toISOString(),
+    });
+    const first = makeRun("b");
+    const second = makeRun("c");
+    for (const run of [first, second]) await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,current_state,created_at,updated_at) VALUES(?,?,?,?,?)").bind(run.run_id, run.run_id, "queued", run.created_at, run.created_at).run();
+    const oneEach = { global: 1, factory: 1, repository: 1, collision: 1 };
+    const firstReservation = await __TEST_ONLY__.acquireLease(env.DB, first as never, oneEach);
+    expect(firstReservation).toBeTypeOf("number");
+    expect(await __TEST_ONLY__.acquireLease(env.DB, second as never, oneEach)).toBeNull();
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 4 });
+
+    const rollback = makeRun("d");
+    await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,current_state,created_at,updated_at) VALUES(?,?,?,?,?)").bind(rollback.run_id, rollback.run_id, "queued", rollback.created_at, rollback.created_at).run();
+    expect(await __TEST_ONLY__.acquireLease(env.DB, rollback as never, { global: 2, factory: 1, repository: 2, collision: 2 })).toBeNull();
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(rollback.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+
+    const held = { ...first, lease_fence: firstReservation as number };
+    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(firstReservation, first.run_id).run();
+    const before = await env.DB.prepare("SELECT MIN(expires_at) AS expiry FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ expiry: string }>();
+    await __TEST_ONLY__.renewLease(env.DB, held as never);
+    const after = await env.DB.prepare("SELECT MIN(expires_at) AS expiry FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ expiry: string }>();
+    expect(Date.parse(after!.expiry)).toBeGreaterThanOrEqual(Date.parse(before!.expiry));
+    await __TEST_ONLY__.releaseLease(env.DB, held as never);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(firstReservation).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
   });
 });

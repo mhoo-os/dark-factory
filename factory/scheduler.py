@@ -61,8 +61,10 @@ def choose_eligible(
             reason = "stop_requested"
         elif run.risk_class == "high" or run.authority_class == "cross-system":
             reason = "human_authorization_required"
-        elif run.merge_policy == "auto-eligible" and autonomy_level < 3:
-            reason = "merge_policy_not_human_reviewed"
+        elif run.merge_policy != "human":
+            # Registry v1 is human-only. Retaining this check in the local
+            # scheduler prevents a legacy tick from treating level 3 as merge authority.
+            reason = "registry_human_merge_required"
         elif run.attempts >= run.max_attempts:
             reason = "attempt_cap_reached"
         elif any(state != "completed" for state in run.dependency_states.values()):

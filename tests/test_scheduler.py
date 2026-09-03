@@ -37,7 +37,7 @@ class SchedulerTests(unittest.TestCase):
         result = choose_eligible([risky, automatic], global_limit=3)
         self.assertEqual(result.eligible, ())
         self.assertEqual(result.blocked["run-risk"], "human_authorization_required")
-        self.assertEqual(result.blocked["run-auto"], "merge_policy_not_human_reviewed")
+        self.assertEqual(result.blocked["run-auto"], "registry_human_merge_required")
 
     def test_lease_acquisition_is_serialized_and_fenced_after_expiry(self):
         connection = sqlite3.connect(":memory:")

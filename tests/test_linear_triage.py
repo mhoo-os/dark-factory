@@ -68,6 +68,16 @@ class CandidateTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertEqual(selected[0].identifier, "MHO-2")
 
+    def test_live_intake_enumerates_each_active_registry_mapping(self):
+        calls = []
+        original = triage.eligible_issues_for
+        try:
+            triage.eligible_issues_for = lambda team_id, project_id: calls.append((team_id, project_id)) or []
+            self.assertEqual(triage.eligible_issues(), [])
+        finally:
+            triage.eligible_issues_for = original
+        self.assertEqual(calls, [(team_id, project_id) for _, project_id, team_id in triage.active_intake_mappings()])
+
 
 if __name__ == "__main__":
     unittest.main()

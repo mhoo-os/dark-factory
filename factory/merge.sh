@@ -27,6 +27,12 @@ PR_FILE="${1:?a PR target: gh:pr:<n> or .factory/prs/<id>.md}"
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+REPOSITORY="$(git config --get remote.origin.url 2>/dev/null | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')"
+[ -n "$REPOSITORY" ] || { echo "MERGE_REFUSED: repository identity is unavailable"; exit 78; }
+python3 -m factory.legacy_policy merge --repository "$REPOSITORY" || exit $?
+echo "MERGE_REFUSED: the registry requires a human to merge in GitHub. This legacy runner will not merge."
+exit 78
+
 case "$PR_FILE" in
   gh:*) GH=1; PR_NUM="${PR_FILE##*:}" ;;
   *)    GH=0; PR_NUM="" ;;

@@ -122,6 +122,15 @@ class WorkflowTests(unittest.TestCase):
         result = DurableWorkflow(MemoryStore(), Backend(cost=9.0)).run(make_request(max_cost_usd=8.0))
         self.assertEqual(result.reason, "cost_cap_exceeded")
 
+    def test_cost_cap_is_cumulative_across_a_fix_retry(self):
+        result = DurableWorkflow(MemoryStore(), Backend(CASES["red"]["validation"], cost=5.0)).run(make_request(max_fix_attempts=1, max_cost_usd=8.0))
+        self.assertEqual(result.reason, "cost_cap_exceeded")
+
+    def test_one_deadline_covers_every_step_and_retry(self):
+        ticks = iter((0.0, 0.0, 0.0, 2.0))
+        result = DurableWorkflow(MemoryStore(), Backend(), clock=lambda: next(ticks)).run(make_request(timeout_seconds=1))
+        self.assertEqual(result.reason, "workflow_deadline_exceeded")
+
     def test_stop_is_fail_closed_before_lease(self):
         backend = Backend()
         stopped = DurableWorkflow(MemoryStore(), backend).run(make_request(stop_requested=True))

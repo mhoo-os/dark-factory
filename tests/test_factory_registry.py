@@ -46,7 +46,7 @@ class FactoryRegistryTests(unittest.TestCase):
             "concurrency": 1,
             "model_policy_key": "static:execution-default-v1",
             "escalation_class": "human",
-            "effect_classes": [],
+            "effect_classes": ["repository-write"],
         })
 
     def test_unknown_disabled_and_ambiguous_projects_fail_closed(self) -> None:

@@ -5,7 +5,10 @@
   "scripts": {
     "typecheck": "wrangler types && tsc --noEmit",
     "build": "wrangler deploy --dry-run --containers-rollout=none",
-    "test": "node --test tests/sandbox-agent.test.mjs && vitest run",
+    "test:python": "python3 -m unittest discover -s tests -v",
+    "test:sandbox": "node --test tests/sandbox-agent.test.mjs",
+    "test:worker": "vitest run",
+    "test": "npm run test:python && npm run test:sandbox && npm run test:worker",
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {

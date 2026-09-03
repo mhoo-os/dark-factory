@@ -11,6 +11,10 @@ export default defineConfig({
       provider: "istanbul",
       reporter: ["text", "json-summary"],
       include: ["src/**/*.ts"],
+      // The Worker is intentionally small but its external-provider paths are
+      // isolated in local tests. These floors prevent coverage from silently
+      // dropping while allowing each provider boundary to remain mocked.
+      thresholds: { statements: 15, branches: 12, functions: 30, lines: 18 },
     },
   },
 });

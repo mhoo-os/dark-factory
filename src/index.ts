@@ -184,6 +184,7 @@ type Run = {
   head_sha: string | null;
   pr_number: number | null;
   pr_url: string | null;
+  created_at: string;
 };
 
 class AdmissionError extends Error {}
@@ -193,6 +194,7 @@ type AgentResult = {
   status: "passed" | "failed" | "needs-replan" | "needs-human";
   reason: string;
   cost_usd?: number;
+  provider_usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number; cost_usd: number };
   branch?: string;
   head_sha?: string;
   diff_digest?: string;
@@ -247,6 +249,11 @@ function sandboxRemote(repository: string, githubToken?: string): string {
 function configInteger(env: Env, name: string, minimum: number, maximum: number): number | null {
   const parsed = Number(Reflect.get(env, name));
   return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : null;
+}
+
+function configMoney(env: Env, name: string, minimum: number, maximum: number): number | null {
+  const parsed = Number(Reflect.get(env, name));
+  return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : null;
 }
 
 function stable(value: unknown): string {
@@ -324,6 +331,13 @@ function executionLimits(contract: Contract): { timeoutSeconds: number; costUsd:
   return { timeoutSeconds, costUsd };
 }
 
+function runtimeExecutionLimits(env: Env, contract: Contract): { timeoutSeconds: number; costUsd: number } {
+  const registryLimits = executionLimits(contract);
+  const configuredCost = configMoney(env, "MAX_COST_USD", 0.01, registryLimits.costUsd);
+  if (configuredCost === null) throw new Error("cost_cap_config_invalid");
+  return { ...registryLimits, costUsd: configuredCost };
+}
+
 async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "registry">): Promise<RegistryBinding> {
   if (FACTORY_REGISTRY.schema_version !== "v1") throw new AdmissionError("registry_schema_invalid");
   const registryVersion = text(FACTORY_REGISTRY.registry_version, "registry_version_invalid");
@@ -375,6 +389,8 @@ async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "regi
   if ((RISK_ORDER[contract.risk.risk_class] ?? 99) > (RISK_ORDER[String(risk.maximum_risk_class)] ?? -1)) throw new AdmissionError("registry_risk_ceiling_exceeded");
   if ((AUTHORITY_ORDER[contract.risk.authority_class] ?? 99) > (AUTHORITY_ORDER[String(risk.maximum_authority_class)] ?? -1)) throw new AdmissionError("registry_authority_ceiling_exceeded");
   if ((MERGE_ORDER[contract.merge_policy] ?? 99) > (MERGE_ORDER[String(risk.merge_ceiling)] ?? -1)) throw new AdmissionError("registry_merge_ceiling_exceeded");
+  if (contract.merge_policy !== "human" || risk.merge_ceiling !== "human") throw new AdmissionError("registry_human_merge_required");
+  if (!strings(risk.autonomous_merge_exclusions, "registry_autonomous_merge_exclusions_invalid").includes(contract.target.repository)) throw new AdmissionError("registry_autonomous_merge_exclusion_missing");
   const credentials = factory.credentials as ObjectValue;
   if (!strings(credentials.sandbox_secret_profiles, "registry_credential_profiles_invalid").includes(contract.factory_request.credential_profile)) throw new AdmissionError("registry_credential_profile_not_allowed");
   const capacityCeilings = ["per_factory_concurrency", "global_concurrency", "per_repository_concurrency", "collision_group_concurrency"].map((field) => Number(capacity[field]));
@@ -639,11 +655,11 @@ async function ingress(db: D1Database, id: string, provider: string, type: strin
 }
 
 async function runById(db: D1Database, runId: string): Promise<Run | null> {
-  return await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE run_id=?").bind(runId).first<Run>();
+  return await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url,created_at FROM factory_runs WHERE run_id=?").bind(runId).first<Run>();
 }
 
 async function runByBranch(db: D1Database, repository: string, branch: string): Promise<Run | null> {
-  const rows = await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE repository=? AND branch=? ORDER BY updated_at DESC LIMIT 2").bind(repository, branch).all<Run>();
+  const rows = await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url,created_at FROM factory_runs WHERE repository=? AND branch=? ORDER BY updated_at DESC LIMIT 2").bind(repository, branch).all<Run>();
   if ((rows.results ?? []).length > 1) throw new Error("reconciliation_branch_ambiguous");
   return rows.results?.[0] ?? null;
 }
@@ -1212,9 +1228,19 @@ function agentResult(value: unknown): AgentResult {
   if (item.validation_digest !== undefined && (typeof item.validation_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(item.validation_digest))) throw new Error("agent_validation_digest_invalid");
   if (item.validation_bytes !== undefined && (typeof item.validation_bytes !== "number" || !Number.isSafeInteger(item.validation_bytes) || item.validation_bytes < 0 || item.validation_bytes > MAX_PROVIDER_BODY_BYTES)) throw new Error("agent_validation_bytes_invalid");
   if (item.cost_usd !== undefined && (typeof item.cost_usd !== "number" || !Number.isFinite(item.cost_usd) || item.cost_usd < 0 || item.cost_usd > 1_000_000)) throw new Error("agent_cost_invalid");
+  const providerUsage = item.provider_usage;
+  if (providerUsage !== undefined) {
+    if (!providerUsage || typeof providerUsage !== "object" || Array.isArray(providerUsage)) throw new Error("agent_provider_usage_invalid");
+    const usage = providerUsage as ObjectValue;
+    for (const field of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
+      if (!Number.isSafeInteger(usage[field]) || Number(usage[field]) < 0) throw new Error("agent_provider_usage_invalid");
+    }
+    if (typeof usage.cost_usd !== "number" || !Number.isFinite(usage.cost_usd) || usage.cost_usd < 0 || usage.cost_usd > 1_000_000 || usage.total_tokens !== Number(usage.prompt_tokens) + Number(usage.completion_tokens)) throw new Error("agent_provider_usage_invalid");
+    if (item.cost_usd !== usage.cost_usd) throw new Error("agent_provider_cost_mismatch");
+  }
   if (item.changed_files !== undefined && (!Array.isArray(item.changed_files) || item.changed_files.length > 12 || item.changed_files.some((path) => typeof path !== "string" || path.length === 0 || path.length > 512 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")))) throw new Error("agent_changed_files_invalid");
-  if (result.status === "passed" && (!result.branch || !result.head_sha || item.cost_usd === undefined)) throw new Error("agent_success_identity_or_cost_missing");
-  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "cost_usd"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
+  if (result.status === "passed" && (!result.branch || !result.head_sha || item.cost_usd === undefined || providerUsage === undefined)) throw new Error("agent_success_identity_or_provider_cost_missing");
+  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "cost_usd", "provider_usage"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
   return result;
 }
 
@@ -1236,6 +1262,14 @@ function validationCommand(profile: string): string {
 
 function workflowTimeout(seconds: number): `${number} seconds` {
   return `${Math.max(1, Math.floor(seconds))} seconds`;
+}
+
+function remainingRunSeconds(run: Run, limits: { timeoutSeconds: number }): number {
+  const started = Date.parse(run.created_at);
+  if (!Number.isFinite(started)) throw new Error("run_deadline_invalid");
+  const remaining = Math.floor((started + limits.timeoutSeconds * 1_000 - Date.now()) / 1_000);
+  if (remaining < 1) throw new Error("workflow_deadline_exceeded");
+  return remaining;
 }
 
 function pathMatchesScope(path: string, scopes: string[]): boolean {
@@ -1276,7 +1310,7 @@ async function groundInSandbox(env: Env, job: Job): Promise<GroundingResult> {
   }
 }
 
-async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: string[] = []): Promise<AgentResult> {
+async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, remainingCostUsd: number, attempt = 0, findings: string[] = []): Promise<AgentResult> {
   let credentials: SandboxCredentials;
   try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
     return { status: "needs-human", reason: error instanceof Error ? error.message : "execution_credentials_missing" };
@@ -1294,7 +1328,7 @@ async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: strin
     if (!exactBase.success) return { status: "needs-replan", reason: "base_sha_unavailable" };
     const result = await sandbox.exec(env.SANDBOX_COMMAND, {
       cwd: "/workspace/project",
-      timeout: limits.timeoutSeconds * 1_000,
+      timeout: Math.min(limits.timeoutSeconds, remainingSeconds) * 1_000,
       env: {
         FACTORY_RUN_ID: job.runId,
         FACTORY_ISSUE: job.contract.linear.identifier,
@@ -1307,8 +1341,8 @@ async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: strin
         FACTORY_MAX_ITERATIONS: "8",
         FACTORY_MAX_COMMANDS: "24",
         FACTORY_MAX_OUTPUT_BYTES: String(Math.min(Number(env.MAX_PAYLOAD_BYTES), MAX_PROVIDER_BODY_BYTES)),
-        FACTORY_MAX_COST_USD: String(limits.costUsd),
-        FACTORY_TIMEOUT_SECONDS: String(limits.timeoutSeconds),
+        FACTORY_MAX_COST_USD: String(remainingCostUsd),
+        FACTORY_TIMEOUT_SECONDS: String(Math.min(limits.timeoutSeconds, remainingSeconds)),
         GITHUB_TOKEN: credentials.githubToken,
         OPENROUTER_API_KEY: credentials.openRouterKey,
         OPENROUTER_MODEL: secret(env, "OPENROUTER_MODEL"),
@@ -1410,6 +1444,9 @@ function pullRequest(value: unknown, expectedRepository: string): PullRequest {
 }
 
 async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promise<PullRequest> {
+  const current = await assertCurrentRegistry(job.contract);
+  const risk = current.factory.risk as ObjectValue;
+  if (job.contract.merge_policy !== "human" || risk.merge_ceiling !== "human" || !strings(risk.autonomous_merge_exclusions, "registry_autonomous_merge_exclusions_invalid").includes(job.contract.target.repository)) throw new Error("registry_human_merge_required");
   const token = secret(env, "GITHUB_TOKEN");
   if (!token || !agent.branch || !agent.head_sha) throw new Error("publication_identity_missing");
   const repo = repositoryPath(job.contract.target.repository);
@@ -1709,14 +1746,15 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
     try {
       run = await runById(this.env.DB, job.runId);
       if (!run || run.lease_fence === null) return { status: "needs-human", runId: job.runId, reason: "lease_missing" };
-      const runtimeLimits = executionLimits(job.contract);
+      const runtimeLimits = runtimeExecutionLimits(this.env, job.contract);
+      const remainingTimeout = () => workflowTimeout(remainingRunSeconds(run as Run, runtimeLimits));
       leaseHeld = true;
       if (await stopped(this.env.DB)) {
         return await finish("stopped", "stop_requested_before_execution");
       }
       await renewLease(this.env.DB, run);
 
-      const grounding = await step.do<GroundingResult>("ground", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<GroundingResult> => {
+      const grounding = await step.do<GroundingResult>("ground", { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<GroundingResult> => {
         const result = await groundInSandbox(this.env, job);
         await recordStep(this.env.DB, job.runId, "ground", result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes, file_count: result.file_count });
         return result;
@@ -1732,12 +1770,16 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       let review: ReviewResult | null = null;
       let cumulativeCostUsd = 0;
       for (let attempt = 0; attempt <= maxFixAttempts; attempt += 1) {
+        const remainingCostUsd = runtimeLimits.costUsd - cumulativeCostUsd;
+        if (!Number.isFinite(remainingCostUsd) || remainingCostUsd <= 0) return await finish("needs-human", "cost_cap_exhausted", { cost_usd: cumulativeCostUsd, cost_cap_usd: runtimeLimits.costUsd });
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_execution");
         await renewLease(this.env.DB, run);
         const findings = validation?.status === "failed" ? [validation.reason] : [];
-        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: workflowTimeout(runtimeLimits.timeoutSeconds) }, async (): Promise<AgentResult> => {
-          const result = await executeInSandbox(this.env, job, attempt, findings);
-          await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes });
+        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<AgentResult> => {
+          // The provider request receives only the remaining authoritative budget;
+          // it cannot start after previous attempts consumed the cap.
+          const result = await executeInSandbox(this.env, job, remainingRunSeconds(run as Run, runtimeLimits), remainingCostUsd, attempt, findings);
+          await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes, provider_usage: result.provider_usage });
           return result;
         });
         if (execution.status === "needs-replan" || execution.status === "needs-human" || !execution.branch || !execution.head_sha || (execution.status === "failed" && execution.reason !== "validation_failed")) {
@@ -1749,7 +1791,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_validation", { head_sha: execution.head_sha, branch: execution.branch });
         await transitionRun(this.env.DB, job.runId, "validating", "workflow", `workflow:validating:${job.runId}:${attempt}`, { leaseFence: run.lease_fence ?? undefined });
 
-        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: workflowTimeout(runtimeLimits.timeoutSeconds) }, async (): Promise<ValidationResult> => {
+        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<ValidationResult> => {
           const result = await validateInFreshSandbox(this.env, job, execution as AgentResult);
           await recordStep(this.env.DB, job.runId, `independent-validation-${attempt}`, result.status, { reason: result.reason, fixable: result.fixable, exit_code: result.exit_code, output_digest: result.output_digest, output_bytes: result.output_bytes });
           return result;
@@ -1764,7 +1806,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         }
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_review", { head_sha: execution.head_sha, branch: execution.branch });
 
-        review = await step.do<ReviewResult>(`independent-review-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<ReviewResult> => {
+        review = await step.do<ReviewResult>(`independent-review-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<ReviewResult> => {
           const result = await reviewInFreshSandbox(this.env, job, execution as AgentResult);
           await recordStep(this.env.DB, job.runId, `independent-review-${attempt}`, result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes });
           return result;
@@ -1784,13 +1826,13 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_publication", { head_sha: execution.head_sha });
       await renewLease(this.env.DB, run);
 
-      published = await step.do<PullRequest>("publish-pr", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<PullRequest> => {
+      published = await step.do<PullRequest>("publish-pr", { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<PullRequest> => {
         const pull = await publishPullRequest(this.env, job, execution);
         await recordStep(this.env.DB, job.runId, "publish-pr", "passed", { number: pull.number, url: pull.html_url, head_sha: pull.head.sha, base: pull.base.ref, base_sha: pull.base.sha });
         await recordPrReceipt(this.env.DB, job.runId, pull);
         return pull;
       });
-      const receipt = await step.do<"created" | "existing">("linear-receipt", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<"created" | "existing"> => {
+      const receipt = await step.do<"created" | "existing">("linear-receipt", { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<"created" | "existing"> => {
         const result = await ensureLinearReceipt(this.env, job, published as PullRequest);
         await recordStep(this.env.DB, job.runId, "linear-receipt", "passed", { outcome: result, pr_number: (published as PullRequest).number });
         await recordLinearReconciliation(this.env.DB, job.runId, `linear:${job.runId}:${(published as PullRequest).number}`, "pr-open", "pr_published");
@@ -1808,7 +1850,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       });
       return { status: "pr-open", runId: job.runId, prUrl: (published as PullRequest).html_url };
     } catch (error) {
-      const reason = error instanceof Error && ["publication_base_changed", "grounding_base_unavailable", "base_sha_unavailable", "fix_branch_base_changed"].includes(error.message) ? error.message : "workflow_step_failed";
+      const reason = error instanceof Error && ["publication_base_changed", "grounding_base_unavailable", "base_sha_unavailable", "fix_branch_base_changed", "workflow_deadline_exceeded"].includes(error.message) ? error.message : "workflow_step_failed";
       const state = reason === "publication_base_changed" || reason === "grounding_base_unavailable" || reason === "base_sha_unavailable" || reason === "fix_branch_base_changed" ? "needs-replan" : "needs-human";
       return await finish(state, reason, { pr_url: published?.html_url ?? null, pr_number: published?.number ?? null });
     } finally {
@@ -1829,6 +1871,10 @@ export const __TEST_ONLY__ = {
   inherentEffectClasses,
   capacityLeaseScopes,
   runtimeConcurrencyLimits,
+  acquireLease,
+  renewLease,
+  releaseLease,
+  remainingRunSeconds,
 };
 
 export default {

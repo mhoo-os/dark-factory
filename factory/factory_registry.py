@@ -59,6 +59,55 @@ def _duplicates(values: Iterable[str]) -> bool:
     return len(items) != len(set(items))
 
 
+def inherent_effect_classes(contract: Mapping[str, Any]) -> frozenset[str]:
+    """Effects that follow from execution even if the request omits them."""
+    request = contract.get("factory_request") or {}
+    if not isinstance(request, Mapping):
+        raise RegistryError("registry_request_invalid")
+    effects = {"repository-write"}
+    if request.get("credential_profile", "none") != "none":
+        effects.add("provider-read")
+    if contract.get("merge_policy") == "auto-eligible":
+        effects.add("merge")
+    return frozenset(effects)
+
+
+def effective_effect_classes(contract: Mapping[str, Any]) -> frozenset[str]:
+    request = contract.get("factory_request") or {}
+    if not isinstance(request, Mapping):
+        raise RegistryError("registry_request_invalid")
+    requested = request.get("effect_classes", [])
+    if not isinstance(requested, list) or any(not isinstance(item, str) or not item for item in requested):
+        raise RegistryError("registry_effect_classes_invalid")
+    return frozenset(requested) | inherent_effect_classes(contract)
+
+
+def active_intake_mappings(*, registry: Mapping[str, Any] = REGISTRY) -> tuple[tuple[str, str, str], ...]:
+    """Return every active factory/project/team mapping; never select a named pilot."""
+    validate_registry(registry)
+    mappings = [
+        (str(factory["factory_id"]), project_id, team_id)
+        for factory in registry["factories"] if factory["state"] in ACTIVE_STATES
+        for project_id in factory["linear"]["project_ids"]
+        for team_id in factory["linear"]["team_ids"]
+    ]
+    projects = [project_id for _, project_id, _ in mappings]
+    if _duplicates(projects):
+        raise RegistryError("registry_active_project_ambiguous")
+    return tuple(sorted(mappings))
+
+
+def assert_human_only_legacy_operation(repository: str, *, registry: Mapping[str, Any] = REGISTRY) -> None:
+    """Legacy scripts may only hand work to a human; they never merge or deploy."""
+    validate_registry(registry)
+    matches = [factory for factory in registry["factories"] if any(item.get("repository") == repository for item in factory["repositories"])]
+    if len(matches) != 1:
+        raise RegistryError("registry_repository_ambiguous")
+    risk = matches[0]["risk"]
+    if risk.get("merge_ceiling") != "human" or repository not in risk.get("autonomous_merge_exclusions", []):
+        raise RegistryError("registry_human_only_operation_required")
+
+
 def validate_registry(registry: Mapping[str, Any] = REGISTRY) -> None:
     if not isinstance(registry, Mapping) or registry.get("schema_version") != "v1":
         raise RegistryError("registry_schema_invalid")
@@ -87,6 +136,14 @@ def validate_registry(registry: Mapping[str, Any] = REGISTRY) -> None:
         names = [item.get("repository") for item in repositories if isinstance(item, Mapping)]
         if len(names) != len(repositories) or any(not isinstance(item, str) for item in names) or _duplicates(names):
             raise RegistryError("registry_repository_ambiguous")
+        risk = factory.get("risk")
+        if not isinstance(risk, Mapping) or risk.get("merge_ceiling") != "human":
+            raise RegistryError("registry_human_merge_required")
+        exclusions = risk.get("autonomous_merge_exclusions")
+        if not isinstance(exclusions, list) or any(not isinstance(item, str) or not item for item in exclusions):
+            raise RegistryError("registry_autonomous_merge_exclusions_invalid")
+        if factory.get("state") in ACTIVE_STATES and not set(names).issubset(exclusions):
+            raise RegistryError("registry_autonomous_merge_exclusions_incomplete")
     profiles = registry.get("execution_profiles")
     validations = registry.get("validation_profiles")
     groups = registry.get("collision_groups")
@@ -179,6 +236,10 @@ def resolve_factory(
         raise RegistryError("registry_authority_ceiling_exceeded")
     if MERGE_ORDER.get(contract.get("merge_policy"), 99) > MERGE_ORDER[entry["risk"]["merge_ceiling"]]:
         raise RegistryError("registry_merge_ceiling_exceeded")
+    if contract.get("merge_policy") != "human" or entry["risk"].get("merge_ceiling") != "human":
+        raise RegistryError("registry_human_merge_required")
+    if target.get("repository") not in entry["risk"].get("autonomous_merge_exclusions", []):
+        raise RegistryError("registry_autonomous_merge_exclusion_missing")
     request = contract.get("factory_request") or {}
     if not isinstance(request, Mapping):
         raise RegistryError("registry_request_invalid")
@@ -194,12 +255,13 @@ def resolve_factory(
         raise RegistryError("registry_model_policy_not_allowed")
     if request.get("escalation_class", "human") != entry["escalation_ceiling"]:
         raise RegistryError("registry_escalation_ceiling_exceeded")
-    effect_classes = request.get("effect_classes", [])
-    if not isinstance(effect_classes, list) or any(not isinstance(item, str) or not item for item in effect_classes):
-        raise RegistryError("registry_effect_classes_invalid")
+    effect_classes = effective_effect_classes(contract)
     forbidden = set(entry["risk"]["forbidden_work_effect_classes"])
     if "all" in forbidden and effect_classes or forbidden.intersection(effect_classes):
         raise RegistryError("registry_effect_class_forbidden")
+    permitted = set(entry["risk"].get("permitted_work_effect_classes", []))
+    if not effect_classes.issubset(permitted):
+        raise RegistryError("registry_effect_class_not_permitted")
     limits = execution.get("limits")
     if not isinstance(limits, Mapping):
         raise RegistryError("registry_profile_limits_invalid")
@@ -211,7 +273,7 @@ def resolve_factory(
         "concurrency": concurrency,
         "model_policy_key": model_policy,
         "escalation_class": request.get("escalation_class", "human"),
-        "effect_classes": effect_classes,
+        "effect_classes": sorted(effect_classes),
     }
     return RegistryBinding(
         entry["factory_id"], registry["registry_version"], registry_digest(registry),
