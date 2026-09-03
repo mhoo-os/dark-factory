@@ -32,7 +32,7 @@
           "repositories": {"type": "array", "items": {"type": "object", "required": ["repository", "work_types", "execution_profiles", "validation_profiles", "collision_groups", "scope"]}},
           "model_policy_keys": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
           "escalation_ceiling": {"enum": ["none", "human"]},
-          "risk": {"type": "object", "required": ["maximum_risk_class", "maximum_authority_class", "merge_ceiling", "forbidden_work_effect_classes", "autonomous_merge_exclusions"]},
+          "risk": {"type": "object", "required": ["maximum_risk_class", "maximum_authority_class", "merge_ceiling", "permitted_work_effect_classes", "forbidden_work_effect_classes", "autonomous_merge_exclusions"]},
           "credentials": {"type": "object", "required": ["boundary_id", "sandbox_secret_profiles", "tenant_boundary", "default_denials"]},
           "capacity": {"type": "object", "required": ["per_factory_concurrency", "global_concurrency", "per_repository_concurrency", "collision_group_concurrency", "cost_usd", "timeout_seconds", "max_changed_lines", "max_files"]},
           "evidence": {"type": "object", "required": ["evaluator_ids", "policy_id", "rollout_status", "minimum_promotion_evidence"]}

@@ -71,6 +71,7 @@
         "maximum_risk_class": "medium",
         "maximum_authority_class": "repository-local",
         "merge_ceiling": "human",
+        "permitted_work_effect_classes": ["repository-write", "provider-read"],
         "forbidden_work_effect_classes": ["deployment", "secrets", "production-data", "provider-write", "customer-write", "cross-vertical-access"],
         "autonomous_merge_exclusions": ["mhoo-os/dark-factory"]
       },
@@ -110,7 +111,7 @@
       "repositories": [],
       "model_policy_keys": [],
       "escalation_ceiling": "none",
-      "risk": {"maximum_risk_class": "low", "maximum_authority_class": "repository-local", "merge_ceiling": "human", "forbidden_work_effect_classes": ["all"], "autonomous_merge_exclusions": []},
+      "risk": {"maximum_risk_class": "low", "maximum_authority_class": "repository-local", "merge_ceiling": "human", "permitted_work_effect_classes": [], "forbidden_work_effect_classes": ["all"], "autonomous_merge_exclusions": []},
       "credentials": {"boundary_id": "disabled", "sandbox_secret_profiles": ["none"], "tenant_boundary": "none", "default_denials": ["provider", "customer", "production", "cross-vertical"]},
       "capacity": {"per_factory_concurrency": 0, "global_concurrency": 1, "per_repository_concurrency": 0, "collision_group_concurrency": 0, "cost_usd": 0, "timeout_seconds": 0, "max_changed_lines": 0, "max_files": 0},
       "evidence": {"evaluator_ids": [], "policy_id": "factory-evidence-v1", "rollout_status": "disabled", "minimum_promotion_evidence": ["foundation-pilot-complete"]}
@@ -128,7 +129,7 @@
       "repositories": [],
       "model_policy_keys": [],
       "escalation_ceiling": "none",
-      "risk": {"maximum_risk_class": "low", "maximum_authority_class": "repository-local", "merge_ceiling": "human", "forbidden_work_effect_classes": ["all"], "autonomous_merge_exclusions": []},
+      "risk": {"maximum_risk_class": "low", "maximum_authority_class": "repository-local", "merge_ceiling": "human", "permitted_work_effect_classes": [], "forbidden_work_effect_classes": ["all"], "autonomous_merge_exclusions": []},
       "credentials": {"boundary_id": "disabled", "sandbox_secret_profiles": ["none"], "tenant_boundary": "none", "default_denials": ["provider", "customer", "production", "cross-vertical"]},
       "capacity": {"per_factory_concurrency": 0, "global_concurrency": 1, "per_repository_concurrency": 0, "collision_group_concurrency": 0, "cost_usd": 0, "timeout_seconds": 0, "max_changed_lines": 0, "max_files": 0},
       "evidence": {"evaluator_ids": [], "policy_id": "factory-evidence-v1", "rollout_status": "disabled", "minimum_promotion_evidence": ["separate-human-approval"]}

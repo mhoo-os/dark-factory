@@ -58,6 +58,7 @@ const TRANSITION_ACTORS: Readonly<Record<string, readonly TransitionActor[]>> = 
   "blocked-by-dependency->needs-human": ["reconciler", "human-override"],
   "queued->blocked-by-dependency": ["scheduler", "reconciler"],
   "queued->leased": ["scheduler"],
+  "queued->needs-replan": ["reconciler"],
   "queued->needs-human": ["scheduler", "reconciler", "human-override"],
   "queued->stopped": ["human-override"],
   "leased->running": ["workflow"],
@@ -191,6 +192,7 @@ type IngressReceipt = { outcome: "inserted" | "duplicate" | "conflict"; handoffS
 type AgentResult = {
   status: "passed" | "failed" | "needs-replan" | "needs-human";
   reason: string;
+  cost_usd?: number;
   branch?: string;
   head_sha?: string;
   diff_digest?: string;
@@ -221,6 +223,25 @@ const response = (body: ObjectValue, status = 200) =>
 function secret(env: Env, name: string): string | undefined {
   const value = Reflect.get(env, name);
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+type SandboxCredentials = { githubToken?: string; openRouterKey?: string };
+
+function sandboxCredentials(env: Env, contract: Contract): SandboxCredentials {
+  // The credential profile is an authorization boundary, not a label. In
+  // particular, the `none` profile is deliberately an empty environment.
+  if (contract.factory_request.credential_profile === "none") return {};
+  if (contract.factory_request.credential_profile !== "github-linear-openrouter-v1") throw new Error("credential_profile_runtime_unsupported");
+  const githubToken = secret(env, "GITHUB_TOKEN");
+  const openRouterKey = secret(env, "OPENROUTER_API_KEY");
+  if (!githubToken || !openRouterKey) throw new Error("execution_credentials_missing");
+  return { githubToken, openRouterKey };
+}
+
+function sandboxRemote(repository: string, githubToken?: string): string {
+  return githubToken
+    ? `https://x-access-token:${encodeURIComponent(githubToken)}@github.com/${repository}.git`
+    : `https://github.com/${repository}.git`;
 }
 
 function configInteger(env: Env, name: string, minimum: number, maximum: number): number | null {
@@ -271,6 +292,36 @@ function providerId(issue: ObjectValue, field: "project" | "team"): string {
 function uniqueBy(items: ObjectValue[], key: string, reason: string): void {
   const values = items.map((item) => text(item[key], reason));
   if (new Set(values).size !== values.length) throw new AdmissionError(reason);
+}
+
+function nonNegativeNumber(value: unknown, reason: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new AdmissionError(reason);
+  return value;
+}
+
+function inherentEffectClasses(contract: Omit<Contract, "registry"> | Contract): string[] {
+  // A contract cannot omit the effects intrinsic to executing it. Repository
+  // mutation is inherent, a non-empty sandbox profile can read providers, and
+  // automatic merge would be an additional effect even if a caller hid it.
+  return [
+    "repository-write",
+    ...(contract.factory_request.credential_profile === "none" ? [] : ["provider-read"]),
+    ...(contract.merge_policy === "auto-eligible" ? ["merge"] : []),
+  ];
+}
+
+function executionLimits(contract: Contract): { timeoutSeconds: number; costUsd: number } {
+  const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
+  const execution = executions.find((item) => item.id === contract.target.execution_profile);
+  const factories = records(FACTORY_REGISTRY.factories, "registry_factories_invalid");
+  const factory = factories.find((item) => item.factory_id === contract.registry.factory_id);
+  const limits = execution?.limits as ObjectValue | undefined;
+  const capacity = factory?.capacity as ObjectValue | undefined;
+  if (!limits || !capacity || typeof limits !== "object" || typeof capacity !== "object") throw new Error("registry_runtime_limits_invalid");
+  const timeoutSeconds = Math.min(nonNegativeNumber(limits.timeout_seconds, "registry_timeout_invalid"), nonNegativeNumber(capacity.timeout_seconds, "registry_timeout_invalid"));
+  const costUsd = Math.min(nonNegativeNumber(limits.cost_usd, "registry_cost_invalid"), nonNegativeNumber(capacity.cost_usd, "registry_cost_invalid"));
+  if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 1 || costUsd < 0) throw new Error("registry_runtime_limits_invalid");
+  return { timeoutSeconds, costUsd };
 }
 
 async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "registry">): Promise<RegistryBinding> {
@@ -326,16 +377,19 @@ async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "regi
   if ((MERGE_ORDER[contract.merge_policy] ?? 99) > (MERGE_ORDER[String(risk.merge_ceiling)] ?? -1)) throw new AdmissionError("registry_merge_ceiling_exceeded");
   const credentials = factory.credentials as ObjectValue;
   if (!strings(credentials.sandbox_secret_profiles, "registry_credential_profiles_invalid").includes(contract.factory_request.credential_profile)) throw new AdmissionError("registry_credential_profile_not_allowed");
-  const concurrencyCeiling = Math.min(Number(capacity.per_factory_concurrency), Number(capacity.global_concurrency), Number(capacity.per_repository_concurrency), Number(capacity.collision_group_concurrency));
-  if (!Number.isSafeInteger(concurrencyCeiling) || contract.factory_request.concurrency > concurrencyCeiling) throw new AdmissionError("registry_concurrency_ceiling_exceeded");
+  const capacityCeilings = ["per_factory_concurrency", "global_concurrency", "per_repository_concurrency", "collision_group_concurrency"].map((field) => Number(capacity[field]));
+  if (capacityCeilings.some((value) => !Number.isSafeInteger(value) || value < 1) || capacityCeilings.some((value) => contract.factory_request.concurrency > value)) throw new AdmissionError("registry_concurrency_ceiling_exceeded");
   if (!strings(factory.model_policy_keys, "registry_model_policy_keys_invalid").includes(contract.factory_request.model_policy_key)) throw new AdmissionError("registry_model_policy_not_allowed");
   if (contract.factory_request.escalation_class !== factory.escalation_ceiling) throw new AdmissionError("registry_escalation_ceiling_exceeded");
+  const permitted = strings(risk.permitted_work_effect_classes, "registry_permitted_effects_invalid");
   const forbidden = strings(risk.forbidden_work_effect_classes, "registry_forbidden_effects_invalid");
-  if ((forbidden.includes("all") && contract.factory_request.effect_classes.length > 0) || contract.factory_request.effect_classes.some((item) => forbidden.includes(item))) throw new AdmissionError("registry_effect_class_forbidden");
+  const requestedAndInherentEffects = [...new Set([...contract.factory_request.effect_classes, ...inherentEffectClasses(contract)])];
+  if (requestedAndInherentEffects.some((item) => !permitted.includes(item))) throw new AdmissionError("registry_effect_class_not_permitted");
+  if ((forbidden.includes("all") && requestedAndInherentEffects.length > 0) || requestedAndInherentEffects.some((item) => forbidden.includes(item))) throw new AdmissionError("registry_effect_class_forbidden");
   const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
   const execution = executions.find((item) => item.id === contract.target.execution_profile);
   const limits = execution?.limits as ObjectValue | undefined;
-  if (!limits || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field]))) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
+  if (!limits || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field])) || ["cost_usd", "timeout_seconds"].some((field) => !Number.isFinite(Number(limits[field])) || Number(limits[field]) < 0)) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
   return {
     identity: {
       factory_id: text(factory.factory_id, "registry_factory_id_invalid"),
@@ -358,7 +412,7 @@ async function assertCurrentRegistry(contract: Contract): Promise<RegistryBindin
       project: { id: contract.linear.project_id },
       team: { id: strings((matches[0].linear as ObjectValue).team_ids, "registry_team_ids_invalid")[0] },
       state: { type: strings((matches[0].linear as ObjectValue).eligible_state_types, "registry_state_types_invalid")[0] },
-      labels: strings((matches[0].linear as ObjectValue).required_labels, "registry_required_labels_invalid"),
+      labels: { nodes: strings((matches[0].linear as ObjectValue).required_labels, "registry_required_labels_invalid").map((name) => ({ name })) },
     },
     contract,
   );
@@ -772,38 +826,81 @@ async function dependenciesReady(job: Job, env: Env): Promise<"ready" | "blocked
   }
 }
 
-async function acquireLease(db: D1Database, run: Run): Promise<number | null> {
-  const key = `${run.repository}#${run.collision_group}`;
+type ConcurrencyLimits = { global: number; factory: number; repository: number; collision: number };
+
+function runtimeConcurrencyLimits(env: Env, factory: ObjectValue): ConcurrencyLimits {
+  const capacity = factory.capacity as ObjectValue | undefined;
+  if (!capacity || typeof capacity !== "object") throw new Error("registry_capacity_invalid");
+  const values = {
+    global: Number(capacity.global_concurrency),
+    factory: Number(capacity.per_factory_concurrency),
+    repository: Number(capacity.per_repository_concurrency),
+    collision: Number(capacity.collision_group_concurrency),
+  };
+  if (Object.values(values).some((value) => !Number.isSafeInteger(value) || value < 1 || value > 32)) throw new Error("registry_concurrency_ceiling_invalid");
+  const configuredGlobal = configInteger(env, "MAX_GLOBAL_CONCURRENCY", 1, 32);
+  if (configuredGlobal === null || configuredGlobal > values.global) throw new Error("global_concurrency_config_invalid");
+  return { ...values, global: configuredGlobal };
+}
+
+function capacityLeaseScopes(run: Run, limits: ConcurrencyLimits): string[][] {
+  return [
+    Array.from({ length: limits.global }, (_, index) => `global:${index + 1}`),
+    Array.from({ length: limits.factory }, (_, index) => `factory:${run.factory_id}:${index + 1}`),
+    Array.from({ length: limits.repository }, (_, index) => `repository:${run.repository}:${index + 1}`),
+    Array.from({ length: limits.collision }, (_, index) => `collision:${run.collision_group}:${index + 1}`),
+  ];
+}
+
+async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits): Promise<number | null> {
   const now = new Date();
-  const current = await db.prepare("SELECT owner,dispatch_id,fence,expires_at FROM factory_leases WHERE lease_key=?").bind(key).first<{ owner: string; dispatch_id: string; fence: number; expires_at: string }>();
-  if (current?.dispatch_id === run.run_id && new Date(current.expires_at) > now) return current.fence;
-  if (current && new Date(current.expires_at) > now) return null;
   const expiry = new Date(now.getTime() + 30 * 60_000).toISOString();
-  const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=?")
-    .bind(key, "workflow", run.run_id, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, current?.fence ?? 0, expiry, now.toISOString()).run();
-  if (result.meta.changes !== 1) return null;
-  const lease = await db.prepare("SELECT fence FROM factory_leases WHERE lease_key=? AND dispatch_id=?").bind(key, run.run_id).first<{ fence: number }>();
-  return lease?.fence ?? null;
+  const reservation = await db.prepare("INSERT INTO factory_lease_reservations(run_id,created_at) VALUES(?,?)").bind(run.run_id, now.toISOString()).run();
+  const reservationId = Number(reservation.meta.last_row_id);
+  if (!Number.isSafeInteger(reservationId) || reservationId < 1) throw new Error("lease_reservation_failed");
+  const acquired: string[] = [];
+  let committed = false;
+  try {
+    for (const scope of capacityLeaseScopes(run, limits)) {
+      let selected: string | null = null;
+      for (const key of scope) {
+        const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=?")
+          .bind(key, "workflow", run.run_id, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, 0, expiry, now.toISOString()).run();
+        if (result.meta.changes === 1) { selected = key; break; }
+      }
+      if (!selected) return null;
+      acquired.push(selected);
+    }
+    await db.batch(acquired.map((key) => db.prepare("INSERT INTO factory_lease_members(reservation_id,lease_key) VALUES(?,?)").bind(reservationId, key)));
+    committed = true;
+    return reservationId;
+  } finally {
+    if (!committed) {
+      if (acquired.length > 0) await db.prepare(`DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (${acquired.map(() => "?").join(",")})`).bind(run.run_id, ...acquired).run();
+      await db.prepare("DELETE FROM factory_lease_reservations WHERE reservation_id=?").bind(reservationId).run();
+    }
+  }
 }
 
 async function releaseLease(db: D1Database, run: Run): Promise<void> {
-  const key = `${run.repository}#${run.collision_group}`;
-  const result = await db.prepare("DELETE FROM factory_leases WHERE lease_key=? AND dispatch_id=? AND fence=?").bind(key, run.run_id, run.lease_fence).run();
-  if (result.meta.changes !== 1) {
-    const current = await db.prepare("SELECT dispatch_id,fence FROM factory_leases WHERE lease_key=?").bind(key).first<{ dispatch_id: string; fence: number }>();
-    if (current && (current.dispatch_id !== run.run_id || current.fence !== run.lease_fence)) throw new Error("lease_fenced");
-  }
-  const cleared = await db.prepare("UPDATE factory_runs SET lease_owner=NULL,lease_fence=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=? AND lease_fence=?").bind(new Date().toISOString(), run.run_id, run.lease_fence).run();
-  if (cleared.meta.changes !== 1 && result.meta.changes !== 0) throw new Error("lease_release_state_failed");
+  if (run.lease_fence === null) throw new Error("lease_missing");
+  const members = await db.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence).first<{ count: number }>();
+  const result = await db.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?)").bind(run.run_id, run.lease_fence).run();
+  if ((members?.count ?? 0) !== result.meta.changes) throw new Error("lease_fenced");
+  await db.batch([
+    db.prepare("DELETE FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence),
+    db.prepare("UPDATE factory_runs SET lease_owner=NULL,lease_fence=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=? AND lease_fence=?").bind(new Date().toISOString(), run.run_id, run.lease_fence),
+  ]);
 }
 
 async function renewLease(db: D1Database, run: Run): Promise<void> {
   if (run.lease_fence === null) throw new Error("lease_missing");
   const now = new Date();
   const expiry = new Date(now.getTime() + 30 * 60_000).toISOString();
-  const key = `${run.repository}#${run.collision_group}`;
-  const result = await db.prepare("UPDATE factory_leases SET expires_at=? WHERE lease_key=? AND dispatch_id=? AND fence=? AND expires_at>?").bind(expiry, key, run.run_id, run.lease_fence, now.toISOString()).run();
-  if (result.meta.changes !== 1) throw new Error("lease_fenced");
+  const members = await db.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence).first<{ count: number }>();
+  const expected = members?.count ?? 0;
+  const result = await db.prepare("UPDATE factory_leases SET expires_at=? WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?) AND expires_at>?").bind(expiry, run.run_id, run.lease_fence, now.toISOString()).run();
+  if (expected !== 4 || result.meta.changes !== expected) throw new Error("lease_fenced");
   const recorded = await db.prepare("UPDATE factory_runs SET lease_expires_at=?,updated_at=? WHERE run_id=? AND lease_fence=?").bind(expiry, now.toISOString(), run.run_id, run.lease_fence).run();
   if (recorded.meta.changes !== 1) throw new Error("lease_fenced");
 }
@@ -912,8 +1009,10 @@ async function recoverStaleLeases(env: Env): Promise<void> {
       leaseExpiredAt: now,
       lease: null,
     });
-    const leaseKey = `${row.repository}#${row.collision_group}`;
-    await env.DB.prepare("DELETE FROM factory_leases WHERE lease_key=? AND dispatch_id=? AND fence=?").bind(leaseKey, row.run_id, row.lease_fence).run();
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?)").bind(row.run_id, row.lease_fence),
+      env.DB.prepare("DELETE FROM factory_lease_members WHERE reservation_id=?").bind(row.lease_fence),
+    ]);
     await recordStep(env.DB, row.run_id, "recovery-stale-lease", targetState, { reason, previous_state: row.current_state, previous_fence: row.lease_fence });
   }
 }
@@ -961,20 +1060,21 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     run = await runById(env.DB, job.runId);
     if (!run) return "missing";
   }
-  const maxConcurrency = configInteger(env, "MAX_GLOBAL_CONCURRENCY", 1, 32);
-  const capacity = registryBinding?.factory.capacity as ObjectValue | undefined;
-  const registryGlobal = Number(capacity?.global_concurrency);
-  if (maxConcurrency === null || !Number.isSafeInteger(registryGlobal) || maxConcurrency > registryGlobal || maxConcurrency > job.contract.factory_request.concurrency) {
+  let concurrencyLimits: ConcurrencyLimits;
+  try {
+    if (!registryBinding) throw new Error("registry_capacity_invalid");
+    concurrencyLimits = runtimeConcurrencyLimits(env, registryBinding.factory);
+    if (job.contract.factory_request.concurrency > concurrencyLimits.global || job.contract.factory_request.concurrency > concurrencyLimits.factory || job.contract.factory_request.concurrency > concurrencyLimits.repository || job.contract.factory_request.concurrency > concurrencyLimits.collision) throw new Error("registry_concurrency_ceiling_exceeded");
+  } catch (error) {
     try {
-      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:invalid-concurrency:${job.runId}`, { result: { reason: "global_concurrency_config_invalid" } });
+      const reason = error instanceof Error ? error.message : "global_concurrency_config_invalid";
+      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:invalid-concurrency:${job.runId}`, { result: { reason } });
       return "needs-human";
     } catch {
       return "retryable";
     }
   }
-  const active = await env.DB.prepare("SELECT COUNT(*) AS count FROM factory_runs WHERE current_state IN ('leased','running','validating')").first<{ count: number }>();
-  if ((active?.count ?? 0) >= maxConcurrency) return "global-busy";
-  const leaseFence = await acquireLease(env.DB, run);
+  const leaseFence = await acquireLease(env.DB, run, concurrencyLimits);
   if (leaseFence === null) return "repo-busy";
   const leaseExpiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
   try {
@@ -1111,9 +1211,10 @@ function agentResult(value: unknown): AgentResult {
   if (item.diff_digest !== undefined && (typeof item.diff_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(item.diff_digest))) throw new Error("agent_diff_digest_invalid");
   if (item.validation_digest !== undefined && (typeof item.validation_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(item.validation_digest))) throw new Error("agent_validation_digest_invalid");
   if (item.validation_bytes !== undefined && (typeof item.validation_bytes !== "number" || !Number.isSafeInteger(item.validation_bytes) || item.validation_bytes < 0 || item.validation_bytes > MAX_PROVIDER_BODY_BYTES)) throw new Error("agent_validation_bytes_invalid");
+  if (item.cost_usd !== undefined && (typeof item.cost_usd !== "number" || !Number.isFinite(item.cost_usd) || item.cost_usd < 0 || item.cost_usd > 1_000_000)) throw new Error("agent_cost_invalid");
   if (item.changed_files !== undefined && (!Array.isArray(item.changed_files) || item.changed_files.length > 12 || item.changed_files.some((path) => typeof path !== "string" || path.length === 0 || path.length > 512 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")))) throw new Error("agent_changed_files_invalid");
-  if (result.status === "passed" && (!result.branch || !result.head_sha)) throw new Error("agent_success_identity_missing");
-  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
+  if (result.status === "passed" && (!result.branch || !result.head_sha || item.cost_usd === undefined)) throw new Error("agent_success_identity_or_cost_missing");
+  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "cost_usd"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
   return result;
 }
 
@@ -1133,6 +1234,10 @@ function validationCommand(profile: string): string {
   throw new Error("unsupported_validation_profile");
 }
 
+function workflowTimeout(seconds: number): `${number} seconds` {
+  return `${Math.max(1, Math.floor(seconds))} seconds`;
+}
+
 function pathMatchesScope(path: string, scopes: string[]): boolean {
   return scopes.some((scope) => scope === path || (scope.endsWith("/**") && path.startsWith(`${scope.slice(0, -3)}/`)) || (scope.endsWith("/*") && path.startsWith(`${scope.slice(0, -2)}/`) && !path.slice(scope.length - 1).includes("/")));
 }
@@ -1145,13 +1250,16 @@ type GroundingResult = { status: "passed" | "failed"; reason: string; digest: st
 type ReviewResult = { status: "passed" | "failed"; reason: string; digest: string; bytes: number };
 
 async function groundInSandbox(env: Env, job: Job): Promise<GroundingResult> {
-  const token = secret(env, "GITHUB_TOKEN");
-  if (!token) return { status: "failed", reason: "grounding_credentials_missing", digest: await textDigest("grounding_credentials_missing"), bytes: 0, file_count: 0 };
+  let credentials: SandboxCredentials;
+  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+    const reason = error instanceof Error ? error.message : "grounding_credentials_missing";
+    return { status: "failed", reason, digest: await textDigest(reason), bytes: 0, file_count: 0 };
+  }
   const repository = job.contract.target.repository;
   const baseSha = job.contract.target.base_sha;
   const sandbox = getSandbox(env.Sandbox, `ground-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(`https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`, { depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(sandboxRemote(repository, credentials.githubToken), { depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", reason: "grounding_checkout_failed", digest: await textDigest("grounding_checkout_failed"), bytes: 0, file_count: 0 };
     const exactBase = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${baseSha} && git -C /workspace/project checkout --detach ${baseSha}`, { timeout: 60_000 });
     if (!exactBase.success) return { status: "failed", reason: "grounding_base_unavailable", digest: await textDigest("grounding_base_unavailable"), bytes: 0, file_count: 0 };
@@ -1169,12 +1277,15 @@ async function groundInSandbox(env: Env, job: Job): Promise<GroundingResult> {
 }
 
 async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: string[] = []): Promise<AgentResult> {
-  const token = secret(env, "GITHUB_TOKEN");
-  const modelKey = secret(env, "OPENROUTER_API_KEY");
-  if (!token || !modelKey) return { status: "needs-human", reason: "execution_credentials_missing" };
+  let credentials: SandboxCredentials;
+  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+    return { status: "needs-human", reason: error instanceof Error ? error.message : "execution_credentials_missing" };
+  }
+  if (!credentials.githubToken || !credentials.openRouterKey) return { status: "needs-human", reason: "execution_credentials_missing" };
+  const limits = executionLimits(job.contract);
   const repository = job.contract.target.repository;
   const baseSha = job.contract.target.base_sha;
-  const remote = `https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`;
+  const remote = sandboxRemote(repository, credentials.githubToken);
   const sandbox = getSandbox(env.Sandbox, `execution-${job.runId}`);
   try {
     const checkout = await sandbox.gitCheckout(remote, { depth: 1, targetDir: "/workspace/project" });
@@ -1183,7 +1294,7 @@ async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: strin
     if (!exactBase.success) return { status: "needs-replan", reason: "base_sha_unavailable" };
     const result = await sandbox.exec(env.SANDBOX_COMMAND, {
       cwd: "/workspace/project",
-      timeout: 15 * 60_000,
+      timeout: limits.timeoutSeconds * 1_000,
       env: {
         FACTORY_RUN_ID: job.runId,
         FACTORY_ISSUE: job.contract.linear.identifier,
@@ -1196,8 +1307,10 @@ async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: strin
         FACTORY_MAX_ITERATIONS: "8",
         FACTORY_MAX_COMMANDS: "24",
         FACTORY_MAX_OUTPUT_BYTES: String(Math.min(Number(env.MAX_PAYLOAD_BYTES), MAX_PROVIDER_BODY_BYTES)),
-        GITHUB_TOKEN: token,
-        OPENROUTER_API_KEY: modelKey,
+        FACTORY_MAX_COST_USD: String(limits.costUsd),
+        FACTORY_TIMEOUT_SECONDS: String(limits.timeoutSeconds),
+        GITHUB_TOKEN: credentials.githubToken,
+        OPENROUTER_API_KEY: credentials.openRouterKey,
         OPENROUTER_MODEL: secret(env, "OPENROUTER_MODEL"),
       },
     }) as SandboxExecResult;
@@ -1211,17 +1324,22 @@ async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: strin
 
 async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ValidationResult> {
   if (!agent.branch || !agent.head_sha) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_identity_missing"), output_bytes: 0, reason: "validation_identity_missing", fixable: false };
-  const token = secret(env, "GITHUB_TOKEN");
-  if (!token) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_credentials_missing"), output_bytes: 0, reason: "validation_credentials_missing", fixable: false };
+  let credentials: SandboxCredentials;
+  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+    const reason = error instanceof Error ? error.message : "validation_credentials_missing";
+    return { status: "failed", exit_code: 78, output_digest: await textDigest(reason), output_bytes: 0, reason, fixable: false };
+  }
+  if (!credentials.githubToken) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_credentials_missing"), output_bytes: 0, reason: "validation_credentials_missing", fixable: false };
+  const limits = executionLimits(job.contract);
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `validation-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(`https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`, { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(sandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_checkout_failed"), output_bytes: 0, reason: "validation_checkout_failed", fixable: false };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
     if (!head.success || head.stdout.trim() !== agent.head_sha) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_head_mismatch"), output_bytes: Math.min(MAX_PROVIDER_BODY_BYTES, head.stdout.length + head.stderr.length), reason: "validation_head_mismatch", fixable: false };
     const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project diff --check ${job.contract.target.base_sha} HEAD`, { timeout: 60_000 });
-    const checks = await sandbox.exec(`sh -lc ${JSON.stringify(validationCommand(job.contract.validation_profile))}`, { cwd: "/workspace/project", timeout: 15 * 60_000 }) as SandboxExecResult;
+    const checks = await sandbox.exec(`sh -lc ${JSON.stringify(validationCommand(job.contract.validation_profile))}`, { cwd: "/workspace/project", timeout: limits.timeoutSeconds * 1_000 }) as SandboxExecResult;
     const output = `${base.stdout}\n${base.stderr}\n${checks.stdout}\n${checks.stderr}`;
     const passed = base.success && checks.success;
     const boundedOutput = boundedTextValue(output);
@@ -1235,12 +1353,16 @@ async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): P
 
 async function reviewInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ReviewResult> {
   if (!agent.branch || !agent.head_sha) return { status: "failed", reason: "review_identity_missing", digest: await textDigest("review_identity_missing"), bytes: 0 };
-  const token = secret(env, "GITHUB_TOKEN");
-  if (!token) return { status: "failed", reason: "review_credentials_missing", digest: await textDigest("review_credentials_missing"), bytes: 0 };
+  let credentials: SandboxCredentials;
+  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+    const reason = error instanceof Error ? error.message : "review_credentials_missing";
+    return { status: "failed", reason, digest: await textDigest(reason), bytes: 0 };
+  }
+  if (!credentials.githubToken) return { status: "failed", reason: "review_credentials_missing", digest: await textDigest("review_credentials_missing"), bytes: 0 };
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `review-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(`https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`, { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(sandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", reason: "review_checkout_failed", digest: await textDigest("review_checkout_failed"), bytes: 0 };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
     const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha}`, { timeout: 60_000 });
@@ -1535,6 +1657,38 @@ async function recoverIngress(env: Env): Promise<void> {
   }
 }
 
+function scheduledRegistryProjectIds(): string[] {
+  const ids = records(FACTORY_REGISTRY.factories, "registry_factories_invalid")
+    .filter((factory) => ACTIVE_FACTORY_STATES.has(String(factory.state)))
+    .flatMap((factory) => strings((factory.linear as ObjectValue).project_ids, "registry_project_ids_invalid"));
+  if (new Set(ids).size !== ids.length) throw new Error("registry_project_ids_ambiguous");
+  return ids;
+}
+
+async function intakeScheduledRegistryProjects(env: Env): Promise<void> {
+  // Project authority is resolved from the signed-in issue and the canonical
+  // registry. This only discovers candidates; `admit` still verifies every
+  // project/team/label/contract boundary before a run is durable.
+  const query = "query($projectId:ID!){issues(first:50,filter:{project:{id:{eq:$projectId}}}){nodes{id identifier description project{id} team{id} state{type} labels{nodes{name}}}}}";
+  for (const projectId of scheduledRegistryProjectIds()) {
+    const data = await linearGraphql(env, query, { projectId });
+    const issues = (data.issues as ObjectValue | undefined)?.nodes;
+    if (!Array.isArray(issues)) throw new Error("linear_scheduled_intake_invalid");
+    for (const issue of issues.slice(0, 50)) {
+      try {
+        const job = await admit(JSON.stringify({ type: "Issue", data: issue }), env);
+        const outcome = await insertRun(env.DB, job);
+        if (outcome === "inserted") await env.EXECUTION_QUEUE.send(job);
+      } catch (error) {
+        // Most project issues are not opted in. Malformed or over-authority
+        // candidates fail closed without preventing other registered factories
+        // from being inspected on this scheduled pass.
+        if (!(error instanceof AdmissionError)) throw error;
+      }
+    }
+  }
+}
+
 export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
   async run(event: Readonly<WorkflowEvent<Job>>, step: WorkflowStep): Promise<ObjectValue> {
     const job = event.payload;
@@ -1555,6 +1709,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
     try {
       run = await runById(this.env.DB, job.runId);
       if (!run || run.lease_fence === null) return { status: "needs-human", runId: job.runId, reason: "lease_missing" };
+      const runtimeLimits = executionLimits(job.contract);
       leaseHeld = true;
       if (await stopped(this.env.DB)) {
         return await finish("stopped", "stop_requested_before_execution");
@@ -1575,11 +1730,12 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       let execution: AgentResult | null = null;
       let validation: ValidationResult | null = null;
       let review: ReviewResult | null = null;
+      let cumulativeCostUsd = 0;
       for (let attempt = 0; attempt <= maxFixAttempts; attempt += 1) {
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_execution");
         await renewLease(this.env.DB, run);
         const findings = validation?.status === "failed" ? [validation.reason] : [];
-        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: "16 minutes" }, async (): Promise<AgentResult> => {
+        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: workflowTimeout(runtimeLimits.timeoutSeconds) }, async (): Promise<AgentResult> => {
           const result = await executeInSandbox(this.env, job, attempt, findings);
           await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes });
           return result;
@@ -1588,10 +1744,12 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
           const state = execution.status === "needs-replan" ? "needs-replan" : execution.status === "failed" ? "failed" : "needs-human";
           return await finish(state, execution.reason, { head_sha: execution.head_sha ?? null, branch: execution.branch ?? null });
         }
+        cumulativeCostUsd += execution.cost_usd ?? Number.POSITIVE_INFINITY;
+        if (!Number.isFinite(cumulativeCostUsd) || cumulativeCostUsd > runtimeLimits.costUsd) return await finish("needs-human", "cost_cap_exceeded", { cost_usd: cumulativeCostUsd, cost_cap_usd: runtimeLimits.costUsd });
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_validation", { head_sha: execution.head_sha, branch: execution.branch });
         await transitionRun(this.env.DB, job.runId, "validating", "workflow", `workflow:validating:${job.runId}:${attempt}`, { leaseFence: run.lease_fence ?? undefined });
 
-        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: "16 minutes" }, async (): Promise<ValidationResult> => {
+        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: workflowTimeout(runtimeLimits.timeoutSeconds) }, async (): Promise<ValidationResult> => {
           const result = await validateInFreshSandbox(this.env, job, execution as AgentResult);
           await recordStep(this.env.DB, job.runId, `independent-validation-${attempt}`, result.status, { reason: result.reason, fixable: result.fixable, exit_code: result.exit_code, output_digest: result.output_digest, output_bytes: result.output_bytes });
           return result;
@@ -1664,6 +1822,15 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
   }
 }
 
+// These pure boundaries are exported only for local Worker-runtime tests. They
+// are not attached to the public fetch surface.
+export const __TEST_ONLY__ = {
+  sandboxCredentials,
+  inherentEffectClasses,
+  capacityLeaseScopes,
+  runtimeConcurrencyLimits,
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -1708,7 +1875,7 @@ export default {
         continue;
       }
       const result = await schedule(env, message.body as Job);
-      if (["dispatched", "stopped", "blocked-by-dependency", "already-handled", "needs-human"].includes(result)) message.ack();
+      if (["dispatched", "stopped", "blocked-by-dependency", "needs-replan", "already-handled", "needs-human"].includes(result)) message.ack();
       else message.retry();
     }
   },
@@ -1717,6 +1884,7 @@ export default {
     if (await stopped(env.DB)) return;
     await recoverIngress(env);
     if (String(env.FACTORY_ENABLED) !== "true") return;
+    if (String(env.FACTORY_AUTONOMY) === "1") await intakeScheduledRegistryProjects(env);
     const row = await env.DB.prepare("SELECT run_id,contract_json FROM factory_runs WHERE current_state IN ('admitted','queued','blocked-by-dependency') ORDER BY created_at LIMIT 1").first<{ run_id: string; contract_json: string }>();
     if (row) { const contract = JSON.parse(row.contract_json) as Contract; await schedule(env, { kind: "dispatch", dispatchId: contract.dispatch_id, runId: row.run_id, contractDigest: await digest(contract), contract }); }
   },
