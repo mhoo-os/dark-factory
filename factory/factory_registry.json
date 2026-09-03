@@ -15,6 +15,7 @@
       "allowed_tools": ["bash", "git", "python3"],
       "model_policy": "static:execution-default-v1",
       "limits": {"timeout_seconds": 900, "max_changed_lines": 500, "max_files": 12, "cost_usd": 8},
+      "provider_budget": {"max_output_tokens": 4096, "cost_usd_per_output_token": 0.001, "request_overhead_usd": 0.50},
       "artifacts": ["diff", "test-log", "run-receipt"]
     }
   ],

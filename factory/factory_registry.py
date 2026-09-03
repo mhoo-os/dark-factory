@@ -91,8 +91,12 @@ def active_intake_mappings(*, registry: Mapping[str, Any] = REGISTRY) -> tuple[t
         for project_id in factory["linear"]["project_ids"]
         for team_id in factory["linear"]["team_ids"]
     ]
-    projects = [project_id for _, project_id, _ in mappings]
-    if _duplicates(projects):
+    # A project can deliberately admit multiple approved teams in one factory.
+    # Ambiguity exists only when different factories claim the same project.
+    ownership: dict[str, set[str]] = {}
+    for factory_id, project_id, _team_id in mappings:
+        ownership.setdefault(project_id, set()).add(factory_id)
+    if any(len(factory_ids) > 1 for factory_ids in ownership.values()):
         raise RegistryError("registry_active_project_ambiguous")
     return tuple(sorted(mappings))
 
@@ -150,6 +154,10 @@ def validate_registry(registry: Mapping[str, Any] = REGISTRY) -> None:
     for values, reason in ((profiles, "registry_execution_profiles_invalid"), (validations, "registry_validation_profiles_invalid"), (groups, "registry_collision_groups_invalid")):
         if not isinstance(values, list) or not values or _duplicates(item.get("id") for item in values if isinstance(item, Mapping)):
             raise RegistryError(reason)
+    for profile in profiles:
+        budget = profile.get("provider_budget") if isinstance(profile, Mapping) else None
+        if not isinstance(budget, Mapping) or not isinstance(budget.get("max_output_tokens"), int) or isinstance(budget.get("max_output_tokens"), bool) or budget["max_output_tokens"] < 1 or any(not isinstance(budget.get(field), (int, float)) or isinstance(budget.get(field), bool) or budget[field] < 0 for field in ("cost_usd_per_output_token", "request_overhead_usd")) or budget["cost_usd_per_output_token"] == 0:
+            raise RegistryError("registry_provider_budget_invalid")
 
 
 def _provider_id(issue: Mapping[str, Any], field: str) -> str | None:

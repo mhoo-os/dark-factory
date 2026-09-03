@@ -14,7 +14,7 @@ export default defineConfig({
       // The Worker is intentionally small but its external-provider paths are
       // isolated in local tests. These floors prevent coverage from silently
       // dropping while allowing each provider boundary to remain mocked.
-      thresholds: { statements: 15, branches: 12, functions: 30, lines: 18 },
+      thresholds: { statements: 20, branches: 18, functions: 35, lines: 23 },
     },
   },
 });

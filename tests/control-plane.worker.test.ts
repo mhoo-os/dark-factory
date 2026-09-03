@@ -1,6 +1,11 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
+import migration001 from "../migrations/0001_factory.sql?raw";
+import migration002 from "../migrations/0002_ingress-retry-state.sql?raw";
+import migration003 from "../migrations/0003-state-history-and-active-issue.sql?raw";
+import migration004 from "../migrations/0004-trusted-factory-registry.sql?raw";
+import migration005 from "../migrations/0005-runtime-capacity-leases.sql?raw";
 import worker, { __TEST_ONLY__ } from "../src/index";
 
 const registry = {
@@ -46,14 +51,9 @@ const contract = {
 };
 
 beforeAll(async () => {
-  for (const statement of [
-    `CREATE TABLE factory_runs (dispatch_id TEXT PRIMARY KEY, run_id TEXT UNIQUE, contract_digest TEXT, profile_digest TEXT, factory_id TEXT, registry_version TEXT, registry_digest TEXT, registry_entry_version TEXT, contract_json TEXT, linear_project_id TEXT, linear_issue_id TEXT, linear_identifier TEXT, repository TEXT, collision_group TEXT, base_sha TEXT, current_state TEXT, workflow_id TEXT, lease_owner TEXT, lease_fence INTEGER, lease_expires_at TEXT, branch TEXT, head_sha TEXT, pr_number INTEGER, pr_url TEXT, result_json TEXT, created_at TEXT, updated_at TEXT)`,
-    `CREATE TABLE factory_events (event_id TEXT PRIMARY KEY, dispatch_id TEXT, event_sequence INTEGER, event_type TEXT, factory_id TEXT, registry_version TEXT, registry_digest TEXT, registry_entry_version TEXT, payload_digest TEXT, accepted INTEGER, reason TEXT, received_at TEXT)`,
-    `CREATE TABLE factory_transitions (dispatch_id TEXT, event_sequence INTEGER, event_id TEXT, from_state TEXT, to_state TEXT, actor TEXT, factory_id TEXT, registry_version TEXT, registry_digest TEXT, registry_entry_version TEXT, created_at TEXT)`,
-    `CREATE TABLE factory_leases (lease_key TEXT PRIMARY KEY, owner TEXT, dispatch_id TEXT, factory_id TEXT, registry_version TEXT, registry_digest TEXT, registry_entry_version TEXT, fence INTEGER, expires_at TEXT)`,
-    `CREATE TABLE factory_lease_reservations (reservation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, created_at TEXT)`,
-    `CREATE TABLE factory_lease_members (reservation_id INTEGER, lease_key TEXT, PRIMARY KEY (reservation_id, lease_key))`,
-  ]) await env.DB.prepare(statement).run();
+  for (const migration of [migration001, migration002, migration003, migration004, migration005]) {
+    for (const statement of migration.split(/;\s*(?:\r?\n|$)/).map((item) => item.trim()).filter(Boolean)) await env.DB.prepare(statement).run();
+  }
   await env.DB.prepare(`INSERT INTO factory_runs(
     dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,
     contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,
@@ -91,35 +91,58 @@ describe("local Worker control-plane behavior", () => {
     expect(__TEST_ONLY__.inherentEffectClasses(contract)).toEqual(["repository-write"]);
   });
 
-  it("uses local D1 to contend, roll back partial claims, renew, and release all four capacity domains", async () => {
-    const makeRun = (suffix: string) => ({
-      run_id: `run-v1-${suffix.repeat(32)}`, factory_id: registry.factory_id, repository: contract.target.repository,
-      collision_group: contract.target.collision_group, registry_version: registry.registry_version,
+  it("admits only registry-owned human, allowlisted authority and rejects broadened authority", async () => {
+    const issue = {
+      project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" },
+      state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] },
+    };
+    const binding = await __TEST_ONLY__.resolveFactory(issue as never, contract as never);
+    expect(binding.identity.factory_id).toBe("foundation-pilot");
+    await expect(__TEST_ONLY__.resolveFactory({ ...issue, labels: { nodes: [] } } as never, contract as never)).rejects.toThrow("registry_required_label_missing");
+    const deployment = { ...contract, factory_request: { ...contract.factory_request, effect_classes: ["deployment"] } };
+    await expect(__TEST_ONLY__.resolveFactory(issue as never, deployment as never)).rejects.toThrow("registry_effect_class_not_permitted");
+    const automatic = { ...contract, merge_policy: "auto-eligible" };
+    await expect(__TEST_ONLY__.resolveFactory(issue as never, automatic as never)).rejects.toThrow("registry_merge_ceiling_exceeded");
+  });
+
+  it("requires a complete matching provider receipt and applies the configured spend ceiling", () => {
+    const receipt = { status: "passed", reason: "ok", branch: "factory/mho-224-run-v1-aaaaaaaaaaaa", head_sha: "a".repeat(40), cost_usd: 0.4, provider_usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.4 } };
+    expect(__TEST_ONLY__.agentResult(receipt)).toMatchObject({ cost_usd: 0.4 });
+    expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, cost_usd: 0.3 } })).toThrow("agent_provider_cost_mismatch");
+    expect(__TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "1" } as never, contract as never).costUsd).toBe(1);
+    expect(() => __TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "9" } as never, contract as never)).toThrow("cost_cap_config_invalid");
+  });
+
+  it("isolates global, factory, repository, and collision D1 capacity ceilings through migrations 0004/0005", async () => {
+    const makeRun = (suffix: string, factory = registry.factory_id, repository = contract.target.repository, collision = contract.target.collision_group) => ({
+      run_id: `run-v1-${suffix.repeat(32)}`, factory_id: factory, repository, collision_group: collision, registry_version: registry.registry_version,
       registry_digest: registry.registry_digest, registry_entry_version: registry.entry_version,
       lease_fence: null, created_at: new Date().toISOString(),
     });
-    const first = makeRun("b");
-    const second = makeRun("c");
-    for (const run of [first, second]) await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,current_state,created_at,updated_at) VALUES(?,?,?,?,?)").bind(run.run_id, run.run_id, "queued", run.created_at, run.created_at).run();
-    const oneEach = { global: 1, factory: 1, repository: 1, collision: 1 };
-    const firstReservation = await __TEST_ONLY__.acquireLease(env.DB, first as never, oneEach);
-    expect(firstReservation).toBeTypeOf("number");
-    expect(await __TEST_ONLY__.acquireLease(env.DB, second as never, oneEach)).toBeNull();
-    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 4 });
+    const add = async (run: ReturnType<typeof makeRun>) => env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(run.run_id, run.run_id, "digest", "profile", run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, JSON.stringify(contract), "project", `${run.run_id}-issue`, run.run_id, run.repository, run.collision_group, contract.target.base_sha, "queued", run.created_at, run.created_at).run();
+    const release = async (run: ReturnType<typeof makeRun>, reservation: number) => {
+      const held = { ...run, lease_fence: reservation };
+      await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(reservation, run.run_id).run();
+      await __TEST_ONLY__.releaseLease(env.DB, held as never);
+    };
+    const cases = [
+      { name: "global", first: makeRun("b", "factory-a", "repo-a", "collision-a"), blocked: makeRun("c", "factory-b", "repo-b", "collision-b"), limits: { global: 1, factory: 2, repository: 2, collision: 2 } },
+      { name: "factory", first: makeRun("d", "factory-c", "repo-c", "collision-c"), blocked: makeRun("e", "factory-c", "repo-d", "collision-d"), limits: { global: 2, factory: 1, repository: 2, collision: 2 } },
+      { name: "repository", first: makeRun("f", "factory-d", "repo-e", "collision-e"), blocked: makeRun("g", "factory-e", "repo-e", "collision-f"), limits: { global: 2, factory: 2, repository: 1, collision: 2 } },
+      { name: "collision", first: makeRun("h", "factory-f", "repo-f", "collision-g"), blocked: makeRun("i", "factory-g", "repo-g", "collision-g"), limits: { global: 2, factory: 2, repository: 2, collision: 1 } },
+    ];
+    for (const item of cases) {
+      await add(item.first); await add(item.blocked);
+      const reservation = await __TEST_ONLY__.acquireLease(env.DB, item.first as never, item.limits);
+      expect(reservation, item.name).toBeTypeOf("number");
+      expect(await __TEST_ONLY__.acquireLease(env.DB, item.blocked as never, item.limits), item.name).toBeNull();
+      await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(item.blocked.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+      await release(item.first, reservation as number);
+    }
+  });
 
-    const rollback = makeRun("d");
-    await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,current_state,created_at,updated_at) VALUES(?,?,?,?,?)").bind(rollback.run_id, rollback.run_id, "queued", rollback.created_at, rollback.created_at).run();
-    expect(await __TEST_ONLY__.acquireLease(env.DB, rollback as never, { global: 2, factory: 1, repository: 2, collision: 2 })).toBeNull();
-    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(rollback.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
-
-    const held = { ...first, lease_fence: firstReservation as number };
-    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(firstReservation, first.run_id).run();
-    const before = await env.DB.prepare("SELECT MIN(expires_at) AS expiry FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ expiry: string }>();
-    await __TEST_ONLY__.renewLease(env.DB, held as never);
-    const after = await env.DB.prepare("SELECT MIN(expires_at) AS expiry FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ expiry: string }>();
-    expect(Date.parse(after!.expiry)).toBeGreaterThanOrEqual(Date.parse(before!.expiry));
-    await __TEST_ONLY__.releaseLease(env.DB, held as never);
-    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(first.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
-    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(firstReservation).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+  it("rejects expired workflow callbacks before a retry can restart their deadline", () => {
+    const expired = { created_at: new Date(Date.now() - 2_000).toISOString() };
+    expect(() => __TEST_ONLY__.remainingRunSeconds(expired as never, { timeoutSeconds: 1 })).toThrow("workflow_deadline_exceeded");
   });
 });

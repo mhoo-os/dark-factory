@@ -317,21 +317,27 @@ function inherentEffectClasses(contract: Omit<Contract, "registry"> | Contract):
   ];
 }
 
-function executionLimits(contract: Contract): { timeoutSeconds: number; costUsd: number } {
+type RuntimeLimits = { timeoutSeconds: number; costUsd: number; maxOutputTokens: number; outputTokenUsd: number; requestOverheadUsd: number };
+
+function executionLimits(contract: Contract): RuntimeLimits {
   const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
   const execution = executions.find((item) => item.id === contract.target.execution_profile);
   const factories = records(FACTORY_REGISTRY.factories, "registry_factories_invalid");
   const factory = factories.find((item) => item.factory_id === contract.registry.factory_id);
   const limits = execution?.limits as ObjectValue | undefined;
+  const providerBudget = execution?.provider_budget as ObjectValue | undefined;
   const capacity = factory?.capacity as ObjectValue | undefined;
-  if (!limits || !capacity || typeof limits !== "object" || typeof capacity !== "object") throw new Error("registry_runtime_limits_invalid");
+  if (!limits || !providerBudget || !capacity || typeof limits !== "object" || typeof providerBudget !== "object" || typeof capacity !== "object") throw new Error("registry_runtime_limits_invalid");
   const timeoutSeconds = Math.min(nonNegativeNumber(limits.timeout_seconds, "registry_timeout_invalid"), nonNegativeNumber(capacity.timeout_seconds, "registry_timeout_invalid"));
   const costUsd = Math.min(nonNegativeNumber(limits.cost_usd, "registry_cost_invalid"), nonNegativeNumber(capacity.cost_usd, "registry_cost_invalid"));
-  if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 1 || costUsd < 0) throw new Error("registry_runtime_limits_invalid");
-  return { timeoutSeconds, costUsd };
+  const maxOutputTokens = Number(providerBudget.max_output_tokens);
+  const outputTokenUsd = Number(providerBudget.cost_usd_per_output_token);
+  const requestOverheadUsd = Number(providerBudget.request_overhead_usd);
+  if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 1 || costUsd < 0 || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1 || !Number.isFinite(outputTokenUsd) || outputTokenUsd <= 0 || !Number.isFinite(requestOverheadUsd) || requestOverheadUsd < 0 || requestOverheadUsd + outputTokenUsd > costUsd) throw new Error("registry_runtime_limits_invalid");
+  return { timeoutSeconds, costUsd, maxOutputTokens, outputTokenUsd, requestOverheadUsd };
 }
 
-function runtimeExecutionLimits(env: Env, contract: Contract): { timeoutSeconds: number; costUsd: number } {
+function runtimeExecutionLimits(env: Env, contract: Contract): RuntimeLimits {
   const registryLimits = executionLimits(contract);
   const configuredCost = configMoney(env, "MAX_COST_USD", 0.01, registryLimits.costUsd);
   if (configuredCost === null) throw new Error("cost_cap_config_invalid");
@@ -405,7 +411,8 @@ async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "regi
   const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
   const execution = executions.find((item) => item.id === contract.target.execution_profile);
   const limits = execution?.limits as ObjectValue | undefined;
-  if (!limits || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field])) || ["cost_usd", "timeout_seconds"].some((field) => !Number.isFinite(Number(limits[field])) || Number(limits[field]) < 0)) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
+  const providerBudget = execution?.provider_budget as ObjectValue | undefined;
+  if (!limits || !providerBudget || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field])) || ["cost_usd", "timeout_seconds"].some((field) => !Number.isFinite(Number(limits[field])) || Number(limits[field]) < 0) || !Number.isSafeInteger(Number(providerBudget.max_output_tokens)) || Number(providerBudget.max_output_tokens) < 1 || ["cost_usd_per_output_token", "request_overhead_usd"].some((field) => !Number.isFinite(Number(providerBudget[field])) || Number(providerBudget[field]) < 0) || Number(providerBudget.cost_usd_per_output_token) === 0) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
   return {
     identity: {
       factory_id: text(factory.factory_id, "registry_factory_id_invalid"),
@@ -1239,8 +1246,8 @@ function agentResult(value: unknown): AgentResult {
     if (item.cost_usd !== usage.cost_usd) throw new Error("agent_provider_cost_mismatch");
   }
   if (item.changed_files !== undefined && (!Array.isArray(item.changed_files) || item.changed_files.length > 12 || item.changed_files.some((path) => typeof path !== "string" || path.length === 0 || path.length > 512 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")))) throw new Error("agent_changed_files_invalid");
-  if (result.status === "passed" && (!result.branch || !result.head_sha || item.cost_usd === undefined || providerUsage === undefined)) throw new Error("agent_success_identity_or_provider_cost_missing");
   Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "cost_usd", "provider_usage"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
+  if (result.status === "passed" && (!result.branch || !result.head_sha || item.cost_usd === undefined || providerUsage === undefined)) throw new Error("agent_success_identity_or_provider_cost_missing");
   return result;
 }
 
@@ -1342,6 +1349,9 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
         FACTORY_MAX_COMMANDS: "24",
         FACTORY_MAX_OUTPUT_BYTES: String(Math.min(Number(env.MAX_PAYLOAD_BYTES), MAX_PROVIDER_BODY_BYTES)),
         FACTORY_MAX_COST_USD: String(remainingCostUsd),
+        FACTORY_MAX_OUTPUT_TOKENS: String(limits.maxOutputTokens),
+        FACTORY_OUTPUT_TOKEN_USD: String(limits.outputTokenUsd),
+        FACTORY_REQUEST_OVERHEAD_USD: String(limits.requestOverheadUsd),
         FACTORY_TIMEOUT_SECONDS: String(Math.min(limits.timeoutSeconds, remainingSeconds)),
         GITHUB_TOKEN: credentials.githubToken,
         OPENROUTER_API_KEY: credentials.openRouterKey,
@@ -1754,7 +1764,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       }
       await renewLease(this.env.DB, run);
 
-      const grounding = await step.do<GroundingResult>("ground", { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<GroundingResult> => {
+      const grounding = await step.do<GroundingResult>("ground", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<GroundingResult> => {
         const result = await groundInSandbox(this.env, job);
         await recordStep(this.env.DB, job.runId, "ground", result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes, file_count: result.file_count });
         return result;
@@ -1775,7 +1785,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_execution");
         await renewLease(this.env.DB, run);
         const findings = validation?.status === "failed" ? [validation.reason] : [];
-        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<AgentResult> => {
+        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<AgentResult> => {
           // The provider request receives only the remaining authoritative budget;
           // it cannot start after previous attempts consumed the cap.
           const result = await executeInSandbox(this.env, job, remainingRunSeconds(run as Run, runtimeLimits), remainingCostUsd, attempt, findings);
@@ -1791,7 +1801,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_validation", { head_sha: execution.head_sha, branch: execution.branch });
         await transitionRun(this.env.DB, job.runId, "validating", "workflow", `workflow:validating:${job.runId}:${attempt}`, { leaseFence: run.lease_fence ?? undefined });
 
-        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<ValidationResult> => {
+        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<ValidationResult> => {
           const result = await validateInFreshSandbox(this.env, job, execution as AgentResult);
           await recordStep(this.env.DB, job.runId, `independent-validation-${attempt}`, result.status, { reason: result.reason, fixable: result.fixable, exit_code: result.exit_code, output_digest: result.output_digest, output_bytes: result.output_bytes });
           return result;
@@ -1806,7 +1816,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         }
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_review", { head_sha: execution.head_sha, branch: execution.branch });
 
-        review = await step.do<ReviewResult>(`independent-review-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<ReviewResult> => {
+        review = await step.do<ReviewResult>(`independent-review-${attempt}`, { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<ReviewResult> => {
           const result = await reviewInFreshSandbox(this.env, job, execution as AgentResult);
           await recordStep(this.env.DB, job.runId, `independent-review-${attempt}`, result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes });
           return result;
@@ -1826,13 +1836,13 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_publication", { head_sha: execution.head_sha });
       await renewLease(this.env.DB, run);
 
-      published = await step.do<PullRequest>("publish-pr", { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<PullRequest> => {
+      published = await step.do<PullRequest>("publish-pr", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<PullRequest> => {
         const pull = await publishPullRequest(this.env, job, execution);
         await recordStep(this.env.DB, job.runId, "publish-pr", "passed", { number: pull.number, url: pull.html_url, head_sha: pull.head.sha, base: pull.base.ref, base_sha: pull.base.sha });
         await recordPrReceipt(this.env.DB, job.runId, pull);
         return pull;
       });
-      const receipt = await step.do<"created" | "existing">("linear-receipt", { retries: { limit: 1, delay: "30 seconds" }, timeout: remainingTimeout() }, async (): Promise<"created" | "existing"> => {
+      const receipt = await step.do<"created" | "existing">("linear-receipt", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<"created" | "existing"> => {
         const result = await ensureLinearReceipt(this.env, job, published as PullRequest);
         await recordStep(this.env.DB, job.runId, "linear-receipt", "passed", { outcome: result, pr_number: (published as PullRequest).number });
         await recordLinearReconciliation(this.env.DB, job.runId, `linear:${job.runId}:${(published as PullRequest).number}`, "pr-open", "pr_published");
@@ -1875,6 +1885,9 @@ export const __TEST_ONLY__ = {
   renewLease,
   releaseLease,
   remainingRunSeconds,
+  runtimeExecutionLimits,
+  agentResult,
+  resolveFactory,
 };
 
 export default {
