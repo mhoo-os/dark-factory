@@ -15,6 +15,8 @@ async function testAgent() {
   process.env.FACTORY_PROJECT_ROOT = process.cwd();
   process.env.OPENROUTER_API_KEY = "receipt-test-key";
   process.env.OPENROUTER_MODEL = "test-model";
+  process.env.FACTORY_MODEL_PROVIDER = "openrouter";
+  process.env.FACTORY_MODEL_VERSION = "test-version";
   process.env.FACTORY_REPOSITORY = "mhoo-os/dark-factory";
   process.env.FACTORY_ISSUE = "MHO-224";
   process.env.FACTORY_MAX_COST_USD = "1.00";
@@ -66,7 +68,7 @@ test("agent sends a pricing-derived provider max_tokens and returns the provider
   try {
     const result = await modelFiles(modelContract);
     assert.equal(request.max_tokens, 80);
-    assert.deepEqual(result.providerUsage, { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.40 });
+    assert.deepEqual(result.providerUsage, { provider: "openrouter", model: "test-model", version: "test-version", prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.40 });
   } finally {
     globalThis.fetch = originalFetch;
   }

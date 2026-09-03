@@ -7,6 +7,15 @@
     "promotion_rule": "human-reviewed pull request",
     "rollback_rule": "disable the entry in a human-reviewed registry revision"
   },
+  "model_policies": [
+    {
+      "id": "static:execution-default-v1",
+      "provider": "openrouter",
+      "model": "z-ai/glm-5.3-flash",
+      "version": "2026-09-03",
+      "pricing": {"cost_usd_per_output_token": 0.001, "request_overhead_usd": 0.50}
+    }
+  ],
   "execution_profiles": [
     {
       "id": "python-tests-v1",
@@ -15,7 +24,7 @@
       "allowed_tools": ["bash", "git", "python3"],
       "model_policy": "static:execution-default-v1",
       "limits": {"timeout_seconds": 900, "max_changed_lines": 500, "max_files": 12, "cost_usd": 8},
-      "provider_budget": {"max_output_tokens": 4096, "cost_usd_per_output_token": 0.001, "request_overhead_usd": 0.50},
+      "provider_budget": {"max_output_tokens": 4096},
       "artifacts": ["diff", "test-log", "run-receipt"]
     }
   ],

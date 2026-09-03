@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import fnmatch
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -149,14 +150,21 @@ def validate_registry(registry: Mapping[str, Any] = REGISTRY) -> None:
         if factory.get("state") in ACTIVE_STATES and not set(names).issubset(exclusions):
             raise RegistryError("registry_autonomous_merge_exclusions_incomplete")
     profiles = registry.get("execution_profiles")
+    model_policies = registry.get("model_policies")
     validations = registry.get("validation_profiles")
     groups = registry.get("collision_groups")
     for values, reason in ((profiles, "registry_execution_profiles_invalid"), (validations, "registry_validation_profiles_invalid"), (groups, "registry_collision_groups_invalid")):
         if not isinstance(values, list) or not values or _duplicates(item.get("id") for item in values if isinstance(item, Mapping)):
             raise RegistryError(reason)
+    if not isinstance(model_policies, list) or not model_policies or _duplicates(item.get("id") for item in model_policies if isinstance(item, Mapping)):
+        raise RegistryError("registry_model_policies_invalid")
+    for policy in model_policies:
+        pricing = policy.get("pricing") if isinstance(policy, Mapping) else None
+        if not isinstance(policy, Mapping) or policy.get("provider") != "openrouter" or any(not isinstance(policy.get(field), str) or not policy[field] for field in ("id", "model", "version")) or not isinstance(pricing, Mapping) or any(not isinstance(pricing.get(field), (int, float)) or isinstance(pricing.get(field), bool) or not math.isfinite(pricing[field]) or pricing[field] < 0 for field in ("cost_usd_per_output_token", "request_overhead_usd")) or pricing["cost_usd_per_output_token"] == 0:
+            raise RegistryError("registry_model_policy_invalid")
     for profile in profiles:
         budget = profile.get("provider_budget") if isinstance(profile, Mapping) else None
-        if not isinstance(budget, Mapping) or not isinstance(budget.get("max_output_tokens"), int) or isinstance(budget.get("max_output_tokens"), bool) or budget["max_output_tokens"] < 1 or any(not isinstance(budget.get(field), (int, float)) or isinstance(budget.get(field), bool) or budget[field] < 0 for field in ("cost_usd_per_output_token", "request_overhead_usd")) or budget["cost_usd_per_output_token"] == 0:
+        if not isinstance(budget, Mapping) or not isinstance(budget.get("max_output_tokens"), int) or isinstance(budget.get("max_output_tokens"), bool) or budget["max_output_tokens"] < 1 or profile.get("model_policy") not in {item.get("id") for item in model_policies}:
             raise RegistryError("registry_provider_budget_invalid")
 
 
@@ -259,6 +267,8 @@ def resolve_factory(
         raise RegistryError("registry_concurrency_ceiling_exceeded")
     execution = next(item for item in registry["execution_profiles"] if item.get("id") == target.get("execution_profile"))
     model_policy = request.get("model_policy_key", execution.get("model_policy"))
+    if model_policy != execution.get("model_policy"):
+        raise RegistryError("registry_model_policy_not_canonical")
     if model_policy not in entry["model_policy_keys"]:
         raise RegistryError("registry_model_policy_not_allowed")
     if request.get("escalation_class", "human") != entry["escalation_ceiling"]:

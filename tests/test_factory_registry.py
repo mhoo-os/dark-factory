@@ -100,6 +100,26 @@ class FactoryRegistryTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assert_refused(reason, contract)
 
+    def test_execution_profile_binds_the_exact_canonical_model_policy_and_pricing(self) -> None:
+        drift_registry = copy.deepcopy(REGISTRY)
+        drift_registry["model_policies"].append({
+            "id": "static:other-v1", "provider": "openrouter", "model": "other/model",
+            "version": "2026-09-03", "pricing": {"cost_usd_per_output_token": 0.002, "request_overhead_usd": 0.5},
+        })
+        drift_registry["factories"][0]["model_policy_keys"].append("static:other-v1")
+        drift = copy.deepcopy(CASE["contract"])
+        drift["factory_request"] = {"credential_profile": "none", "concurrency": 1, "model_policy_key": "static:other-v1", "escalation_class": "human", "effect_classes": []}
+        self.assert_refused("registry_model_policy_not_canonical", drift, registry=drift_registry)
+
+        invalid_pricing = copy.deepcopy(REGISTRY)
+        invalid_pricing["model_policies"][0]["pricing"]["cost_usd_per_output_token"] = 0
+        with self.assertRaisesRegex(RegistryError, "registry_model_policy_invalid"):
+            resolve_factory(CASE["issue"], CASE["contract"], registry=invalid_pricing)
+        invalid_provider = copy.deepcopy(REGISTRY)
+        invalid_provider["model_policies"][0]["provider"] = "other"
+        with self.assertRaisesRegex(RegistryError, "registry_model_policy_invalid"):
+            resolve_factory(CASE["issue"], CASE["contract"], registry=invalid_provider)
+
     def test_stale_revision_disable_and_old_event_replay_require_new_admission(self) -> None:
         admitted = admit_linear_issue(issue())
         identity = admitted.contract.to_dict()["registry"]

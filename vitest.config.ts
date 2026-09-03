@@ -14,7 +14,10 @@ export default defineConfig({
       // The Worker is intentionally small but its external-provider paths are
       // isolated in local tests. These floors prevent coverage from silently
       // dropping while allowing each provider boundary to remain mocked.
-      thresholds: { statements: 20, branches: 18, functions: 35, lines: 23 },
+      // Keep the authority-heavy Worker paths above the prior smoke-test floor.
+      // The D1 suite exercises migrations, contention, fencing, renewal, and
+      // exact release rather than counting lease-key strings.
+      thresholds: { statements: 22, branches: 20, functions: 38, lines: 25 },
     },
   },
 });

@@ -194,7 +194,7 @@ type AgentResult = {
   status: "passed" | "failed" | "needs-replan" | "needs-human";
   reason: string;
   cost_usd?: number;
-  provider_usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number; cost_usd: number };
+  provider_usage?: { provider: "openrouter"; model: string; version: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; cost_usd: number };
   branch?: string;
   head_sha?: string;
   diff_digest?: string;
@@ -318,6 +318,22 @@ function inherentEffectClasses(contract: Omit<Contract, "registry"> | Contract):
 }
 
 type RuntimeLimits = { timeoutSeconds: number; costUsd: number; maxOutputTokens: number; outputTokenUsd: number; requestOverheadUsd: number };
+type CanonicalModel = { policyKey: string; provider: "openrouter"; model: string; version: string; outputTokenUsd: number; requestOverheadUsd: number };
+
+function canonicalModel(contract: Contract): CanonicalModel {
+  const execution = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid").find((item) => item.id === contract.target.execution_profile);
+  const policyKey = text(execution?.model_policy, "registry_model_policy_invalid");
+  if (contract.factory_request.model_policy_key !== policyKey) throw new Error("registry_model_policy_not_canonical");
+  const policy = records(FACTORY_REGISTRY.model_policies, "registry_model_policies_invalid").find((item) => item.id === policyKey);
+  const pricing = policy?.pricing as ObjectValue | undefined;
+  const provider = text(policy?.provider, "registry_model_provider_invalid");
+  const model = text(policy?.model, "registry_model_invalid");
+  const version = text(policy?.version, "registry_model_version_invalid");
+  const outputTokenUsd = Number(pricing?.cost_usd_per_output_token);
+  const requestOverheadUsd = Number(pricing?.request_overhead_usd);
+  if (provider !== "openrouter" || !pricing || !Number.isFinite(outputTokenUsd) || outputTokenUsd <= 0 || !Number.isFinite(requestOverheadUsd) || requestOverheadUsd < 0) throw new Error("registry_model_policy_invalid");
+  return { policyKey, provider, model, version, outputTokenUsd, requestOverheadUsd };
+}
 
 function executionLimits(contract: Contract): RuntimeLimits {
   const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
@@ -331,8 +347,9 @@ function executionLimits(contract: Contract): RuntimeLimits {
   const timeoutSeconds = Math.min(nonNegativeNumber(limits.timeout_seconds, "registry_timeout_invalid"), nonNegativeNumber(capacity.timeout_seconds, "registry_timeout_invalid"));
   const costUsd = Math.min(nonNegativeNumber(limits.cost_usd, "registry_cost_invalid"), nonNegativeNumber(capacity.cost_usd, "registry_cost_invalid"));
   const maxOutputTokens = Number(providerBudget.max_output_tokens);
-  const outputTokenUsd = Number(providerBudget.cost_usd_per_output_token);
-  const requestOverheadUsd = Number(providerBudget.request_overhead_usd);
+  const model = canonicalModel(contract);
+  const outputTokenUsd = model.outputTokenUsd;
+  const requestOverheadUsd = model.requestOverheadUsd;
   if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 1 || costUsd < 0 || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1 || !Number.isFinite(outputTokenUsd) || outputTokenUsd <= 0 || !Number.isFinite(requestOverheadUsd) || requestOverheadUsd < 0 || requestOverheadUsd + outputTokenUsd > costUsd) throw new Error("registry_runtime_limits_invalid");
   return { timeoutSeconds, costUsd, maxOutputTokens, outputTokenUsd, requestOverheadUsd };
 }
@@ -410,9 +427,12 @@ async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "regi
   if ((forbidden.includes("all") && requestedAndInherentEffects.length > 0) || requestedAndInherentEffects.some((item) => forbidden.includes(item))) throw new AdmissionError("registry_effect_class_forbidden");
   const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
   const execution = executions.find((item) => item.id === contract.target.execution_profile);
+  if (!execution || contract.factory_request.model_policy_key !== execution.model_policy) throw new AdmissionError("registry_model_policy_not_canonical");
   const limits = execution?.limits as ObjectValue | undefined;
   const providerBudget = execution?.provider_budget as ObjectValue | undefined;
-  if (!limits || !providerBudget || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field])) || ["cost_usd", "timeout_seconds"].some((field) => !Number.isFinite(Number(limits[field])) || Number(limits[field]) < 0) || !Number.isSafeInteger(Number(providerBudget.max_output_tokens)) || Number(providerBudget.max_output_tokens) < 1 || ["cost_usd_per_output_token", "request_overhead_usd"].some((field) => !Number.isFinite(Number(providerBudget[field])) || Number(providerBudget[field]) < 0) || Number(providerBudget.cost_usd_per_output_token) === 0) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
+  const canonical = records(FACTORY_REGISTRY.model_policies, "registry_model_policies_invalid").find((item) => item.id === execution?.model_policy);
+  const pricing = canonical?.pricing as ObjectValue | undefined;
+  if (!limits || !providerBudget || !pricing || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field])) || ["cost_usd", "timeout_seconds"].some((field) => !Number.isFinite(Number(limits[field])) || Number(limits[field]) < 0) || !Number.isSafeInteger(Number(providerBudget.max_output_tokens)) || Number(providerBudget.max_output_tokens) < 1 || ["cost_usd_per_output_token", "request_overhead_usd"].some((field) => !Number.isFinite(Number(pricing[field])) || Number(pricing[field]) < 0) || Number(pricing.cost_usd_per_output_token) === 0) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
   return {
     identity: {
       factory_id: text(factory.factory_id, "registry_factory_id_invalid"),
@@ -1242,7 +1262,7 @@ function agentResult(value: unknown): AgentResult {
     for (const field of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
       if (!Number.isSafeInteger(usage[field]) || Number(usage[field]) < 0) throw new Error("agent_provider_usage_invalid");
     }
-    if (typeof usage.cost_usd !== "number" || !Number.isFinite(usage.cost_usd) || usage.cost_usd < 0 || usage.cost_usd > 1_000_000 || usage.total_tokens !== Number(usage.prompt_tokens) + Number(usage.completion_tokens)) throw new Error("agent_provider_usage_invalid");
+    if (usage.provider !== "openrouter" || typeof usage.model !== "string" || typeof usage.version !== "string" || typeof usage.cost_usd !== "number" || !Number.isFinite(usage.cost_usd) || usage.cost_usd < 0 || usage.cost_usd > 1_000_000 || usage.total_tokens !== Number(usage.prompt_tokens) + Number(usage.completion_tokens)) throw new Error("agent_provider_usage_invalid");
     if (item.cost_usd !== usage.cost_usd) throw new Error("agent_provider_cost_mismatch");
   }
   if (item.changed_files !== undefined && (!Array.isArray(item.changed_files) || item.changed_files.length > 12 || item.changed_files.some((path) => typeof path !== "string" || path.length === 0 || path.length > 512 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")))) throw new Error("agent_changed_files_invalid");
@@ -1277,6 +1297,16 @@ function remainingRunSeconds(run: Run, limits: { timeoutSeconds: number }): numb
   const remaining = Math.floor((started + limits.timeoutSeconds * 1_000 - Date.now()) / 1_000);
   if (remaining < 1) throw new Error("workflow_deadline_exceeded");
   return remaining;
+}
+
+function terminalCleanupSeconds(run: Run, limits: { timeoutSeconds: number }): number {
+  const started = Date.parse(run.created_at);
+  if (!Number.isFinite(started)) throw new Error("run_deadline_invalid");
+  // Terminal persistence and lease cleanup are allowed one small, separately
+  // bounded window after the run deadline; they cannot invoke providers.
+  const remaining = Math.floor((started + (limits.timeoutSeconds + 30) * 1_000 - Date.now()) / 1_000);
+  if (remaining < 1) throw new Error("terminal_cleanup_deadline_exceeded");
+  return Math.min(30, remaining);
 }
 
 function pathMatchesScope(path: string, scopes: string[]): boolean {
@@ -1324,6 +1354,9 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
   }
   if (!credentials.githubToken || !credentials.openRouterKey) return { status: "needs-human", reason: "execution_credentials_missing" };
   const limits = executionLimits(job.contract);
+  const model = canonicalModel(job.contract);
+  const configuredModel = secret(env, "OPENROUTER_MODEL");
+  if (configuredModel !== model.model) return { status: "needs-human", reason: "openrouter_model_env_mismatch" };
   const repository = job.contract.target.repository;
   const baseSha = job.contract.target.base_sha;
   const remote = sandboxRemote(repository, credentials.githubToken);
@@ -1355,10 +1388,14 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
         FACTORY_TIMEOUT_SECONDS: String(Math.min(limits.timeoutSeconds, remainingSeconds)),
         GITHUB_TOKEN: credentials.githubToken,
         OPENROUTER_API_KEY: credentials.openRouterKey,
-        OPENROUTER_MODEL: secret(env, "OPENROUTER_MODEL"),
+        OPENROUTER_MODEL: model.model,
+        FACTORY_MODEL_PROVIDER: model.provider,
+        FACTORY_MODEL_VERSION: model.version,
       },
     }) as SandboxExecResult;
-    return parseAgentResult(result);
+    const agent = parseAgentResult(result);
+    if (agent.provider_usage && (agent.provider_usage.provider !== model.provider || agent.provider_usage.model !== model.model || agent.provider_usage.version !== model.version)) return { status: "needs-human", reason: "provider_receipt_model_mismatch" };
+    return agent;
   } catch {
     return { status: "needs-human", reason: "sandbox_execution_failed" };
   } finally {
@@ -1742,8 +1779,10 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
     let run: Run | null = null;
     let published: PullRequest | null = null;
     let leaseHeld = false;
+    let runtimeLimits: RuntimeLimits | null = null;
     const finish = async (state: string, reason: string, extra: ObjectValue = {}): Promise<ObjectValue> => {
-      await step.do("finalize", async () => {
+      const terminalTimeout = run && runtimeLimits ? workflowTimeout(terminalCleanupSeconds(run, runtimeLimits)) : "30 seconds";
+      await step.do("finalize", { retries: { limit: 0, delay: "1 second" }, timeout: terminalTimeout }, async () => {
         const latest = await runById(this.env.DB, job.runId);
         if (!latest) throw new Error("run_missing");
         const fence = latest.lease_fence === null ? undefined : latest.lease_fence;
@@ -1756,8 +1795,9 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
     try {
       run = await runById(this.env.DB, job.runId);
       if (!run || run.lease_fence === null) return { status: "needs-human", runId: job.runId, reason: "lease_missing" };
-      const runtimeLimits = runtimeExecutionLimits(this.env, job.contract);
-      const remainingTimeout = () => workflowTimeout(remainingRunSeconds(run as Run, runtimeLimits));
+      const resolvedRuntimeLimits = runtimeExecutionLimits(this.env, job.contract);
+      runtimeLimits = resolvedRuntimeLimits;
+      const remainingTimeout = () => workflowTimeout(remainingRunSeconds(run as Run, resolvedRuntimeLimits));
       leaseHeld = true;
       if (await stopped(this.env.DB)) {
         return await finish("stopped", "stop_requested_before_execution");
@@ -1788,7 +1828,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async (): Promise<AgentResult> => {
           // The provider request receives only the remaining authoritative budget;
           // it cannot start after previous attempts consumed the cap.
-          const result = await executeInSandbox(this.env, job, remainingRunSeconds(run as Run, runtimeLimits), remainingCostUsd, attempt, findings);
+          const result = await executeInSandbox(this.env, job, remainingRunSeconds(run as Run, resolvedRuntimeLimits), remainingCostUsd, attempt, findings);
           await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes, provider_usage: result.provider_usage });
           return result;
         });
@@ -1848,7 +1888,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         await recordLinearReconciliation(this.env.DB, job.runId, `linear:${job.runId}:${(published as PullRequest).number}`, "pr-open", "pr_published");
         return result;
       });
-      await step.do("finalize-pr", async () => {
+      await step.do("finalize-pr", { retries: { limit: 0, delay: "1 second" }, timeout: remainingTimeout() }, async () => {
         const pull = published as PullRequest;
         await transitionRun(this.env.DB, job.runId, "pr-open", "workflow", `workflow:publish:${job.runId}`, {
           result: { reason: "pr_published", validation_digest: validation.output_digest, validation_bytes: validation.output_bytes, review_digest: review?.digest, review_bytes: review?.bytes, linear_receipt: receipt },
@@ -1864,7 +1904,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       const state = reason === "publication_base_changed" || reason === "grounding_base_unavailable" || reason === "base_sha_unavailable" || reason === "fix_branch_base_changed" ? "needs-replan" : "needs-human";
       return await finish(state, reason, { pr_url: published?.html_url ?? null, pr_number: published?.number ?? null });
     } finally {
-      if (leaseHeld) await step.do("release-lease", async () => {
+      if (leaseHeld) await step.do("release-lease", { retries: { limit: 0, delay: "1 second" }, timeout: run && runtimeLimits ? workflowTimeout(terminalCleanupSeconds(run, runtimeLimits)) : "30 seconds" }, async () => {
         const latest = await runById(this.env.DB, job.runId);
         if (latest?.lease_fence !== null && latest?.lease_fence !== undefined) await releaseLease(this.env.DB, latest);
         await recordStep(this.env.DB, job.runId, "lease-release", "passed", { released: latest?.lease_fence !== null && latest?.lease_fence !== undefined });
@@ -1885,7 +1925,9 @@ export const __TEST_ONLY__ = {
   renewLease,
   releaseLease,
   remainingRunSeconds,
+  terminalCleanupSeconds,
   runtimeExecutionLimits,
+  canonicalModel,
   agentResult,
   resolveFactory,
 };

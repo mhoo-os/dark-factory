@@ -103,12 +103,17 @@ describe("local Worker control-plane behavior", () => {
     await expect(__TEST_ONLY__.resolveFactory(issue as never, deployment as never)).rejects.toThrow("registry_effect_class_not_permitted");
     const automatic = { ...contract, merge_policy: "auto-eligible" };
     await expect(__TEST_ONLY__.resolveFactory(issue as never, automatic as never)).rejects.toThrow("registry_merge_ceiling_exceeded");
+    const policyDrift = { ...contract, factory_request: { ...contract.factory_request, model_policy_key: "static:unapproved-v1" } };
+    await expect(__TEST_ONLY__.resolveFactory(issue as never, policyDrift as never)).rejects.toThrow("registry_model_policy_not_allowed");
   });
 
-  it("requires a complete matching provider receipt and applies the configured spend ceiling", () => {
-    const receipt = { status: "passed", reason: "ok", branch: "factory/mho-224-run-v1-aaaaaaaaaaaa", head_sha: "a".repeat(40), cost_usd: 0.4, provider_usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.4 } };
+  it("binds execution to the canonical OpenRouter model receipt and configured spend ceiling", () => {
+    const receipt = { status: "passed", reason: "ok", branch: "factory/mho-224-run-v1-aaaaaaaaaaaa", head_sha: "a".repeat(40), cost_usd: 0.4, provider_usage: { provider: "openrouter", model: "z-ai/glm-5.3-flash", version: "2026-09-03", prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost_usd: 0.4 } };
     expect(__TEST_ONLY__.agentResult(receipt)).toMatchObject({ cost_usd: 0.4 });
     expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, cost_usd: 0.3 } })).toThrow("agent_provider_cost_mismatch");
+    expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, provider: "other" } })).toThrow("agent_provider_usage_invalid");
+    expect(__TEST_ONLY__.canonicalModel(contract as never)).toEqual({ policyKey: "static:execution-default-v1", provider: "openrouter", model: "z-ai/glm-5.3-flash", version: "2026-09-03", outputTokenUsd: 0.001, requestOverheadUsd: 0.5 });
+    expect(() => __TEST_ONLY__.canonicalModel({ ...contract, factory_request: { ...contract.factory_request, model_policy_key: "static:drift-v1" } } as never)).toThrow("registry_model_policy_not_canonical");
     expect(__TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "1" } as never, contract as never).costUsd).toBe(1);
     expect(() => __TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "9" } as never, contract as never)).toThrow("cost_cap_config_invalid");
   });
@@ -141,8 +146,43 @@ describe("local Worker control-plane behavior", () => {
     }
   });
 
-  it("rejects expired workflow callbacks before a retry can restart their deadline", () => {
+  it("renews a live D1 reservation, fences expiry takeovers, and removes every exact lease member", async () => {
+    const makeRun = (suffix: string) => ({
+      run_id: `run-v1-${suffix.repeat(32)}`, factory_id: "lease-factory", repository: "lease-repository", collision_group: "lease-collision",
+      registry_version: registry.registry_version, registry_digest: registry.registry_digest, registry_entry_version: registry.entry_version,
+      lease_fence: null, created_at: new Date().toISOString(),
+    });
+    const add = async (run: ReturnType<typeof makeRun>) => env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(run.run_id, run.run_id, "digest", "profile", run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, JSON.stringify(contract), "project", `${run.run_id}-issue`, run.run_id, run.repository, run.collision_group, contract.target.base_sha, "queued", run.created_at, run.created_at).run();
+    const limits = { global: 1, factory: 1, repository: 1, collision: 1 };
+    const original = makeRun("j");
+    const successor = makeRun("k");
+    await add(original); await add(successor);
+    const originalFence = await __TEST_ONLY__.acquireLease(env.DB, original as never, limits);
+    expect(originalFence).toBeTypeOf("number");
+    const heldOriginal = { ...original, lease_fence: originalFence as number };
+    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(originalFence, original.run_id).run();
+    await __TEST_ONLY__.renewLease(env.DB, heldOriginal as never);
+    const liveExpiry = await env.DB.prepare("SELECT lease_expires_at FROM factory_runs WHERE run_id=?").bind(original.run_id).first<{ lease_expires_at: string }>();
+    expect(Date.parse(liveExpiry?.lease_expires_at ?? "")).toBeGreaterThan(Date.now());
+    await env.DB.prepare("UPDATE factory_leases SET expires_at=? WHERE dispatch_id=?").bind(new Date(0).toISOString(), original.run_id).run();
+    const successorFence = await __TEST_ONLY__.acquireLease(env.DB, successor as never, limits);
+    expect(successorFence).toBeTypeOf("number");
+    const heldSuccessor = { ...successor, lease_fence: successorFence as number };
+    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(successorFence, successor.run_id).run();
+    await expect(__TEST_ONLY__.renewLease(env.DB, heldOriginal as never)).rejects.toThrow("lease_fenced");
+    await __TEST_ONLY__.renewLease(env.DB, heldSuccessor as never);
+    await __TEST_ONLY__.releaseLease(env.DB, heldSuccessor as never);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(successor.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(successorFence).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+    await expect(env.DB.prepare("SELECT lease_owner,lease_fence,lease_expires_at FROM factory_runs WHERE run_id=?").bind(successor.run_id).first()).resolves.toMatchObject({ lease_owner: null, lease_fence: null, lease_expires_at: null });
+  });
+
+  it("rejects expired workflow callbacks and bounds terminal cleanup separately", () => {
     const expired = { created_at: new Date(Date.now() - 2_000).toISOString() };
     expect(() => __TEST_ONLY__.remainingRunSeconds(expired as never, { timeoutSeconds: 1 })).toThrow("workflow_deadline_exceeded");
+    const cleanup = { created_at: new Date(Date.now() - 1_005_000).toISOString() };
+    expect(__TEST_ONLY__.terminalCleanupSeconds(cleanup as never, { timeoutSeconds: 1_000 })).toBeLessThanOrEqual(30);
+    const exhaustedCleanup = { created_at: new Date(Date.now() - 1_031_000).toISOString() };
+    expect(() => __TEST_ONLY__.terminalCleanupSeconds(exhaustedCleanup as never, { timeoutSeconds: 1_000 })).toThrow("terminal_cleanup_deadline_exceeded");
   });
 });

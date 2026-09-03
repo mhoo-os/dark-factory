@@ -4,11 +4,12 @@
   "title": "Mhoo Trusted Factory Registry v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "registry_version", "governance", "execution_profiles", "validation_profiles", "collision_groups", "factories"],
+  "required": ["schema_version", "registry_version", "governance", "model_policies", "execution_profiles", "validation_profiles", "collision_groups", "factories"],
   "properties": {
     "schema_version": {"const": "v1"},
     "registry_version": {"type": "string", "minLength": 1},
     "governance": {"type": "object", "additionalProperties": false, "required": ["owner", "approval_record", "promotion_rule", "rollback_rule"], "properties": {"owner": {"type": "string"}, "approval_record": {"type": "string"}, "promotion_rule": {"type": "string"}, "rollback_rule": {"type": "string"}}},
+    "model_policies": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "provider", "model", "version", "pricing"]}},
     "execution_profiles": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "model_policy", "limits", "provider_budget"]}},
     "validation_profiles": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "merge_eligibility"]}},
     "collision_groups": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "paths"]}},
