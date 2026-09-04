@@ -141,10 +141,10 @@ describe("local Worker control-plane behavior", () => {
     for (const item of cases) {
       await add(item.first); await add(item.blocked);
       const reservation = await __TEST_ONLY__.acquireLease(env.DB, item.first as never, item.limits);
-      expect(reservation, item.name).toBeTypeOf("number");
+      expect(reservation?.fence, item.name).toBeTypeOf("number");
       expect(await __TEST_ONLY__.acquireLease(env.DB, item.blocked as never, item.limits), item.name).toBeNull();
       await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(item.blocked.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
-      await release(item.first, reservation as number);
+      await release(item.first, reservation?.fence as number);
     }
   });
 
@@ -160,23 +160,23 @@ describe("local Worker control-plane behavior", () => {
     const successor = makeRun("k");
     await add(original); await add(successor);
     const originalFence = await __TEST_ONLY__.acquireLease(env.DB, original as never, limits);
-    expect(originalFence).toBeTypeOf("number");
-    const heldOriginal = { ...original, lease_fence: originalFence as number };
-    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(originalFence, original.run_id).run();
+    expect(originalFence?.fence).toBeTypeOf("number");
+    const heldOriginal = { ...original, lease_fence: originalFence?.fence as number };
+    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(originalFence?.fence, original.run_id).run();
     await __TEST_ONLY__.renewLeaseWithinRunDeadline(env.DB, heldOriginal as never, { timeoutSeconds: 60 });
     const liveExpiry = await env.DB.prepare("SELECT lease_expires_at FROM factory_runs WHERE run_id=?").bind(original.run_id).first<{ lease_expires_at: string }>();
     expect(Date.parse(liveExpiry?.lease_expires_at ?? "")).toBeGreaterThan(Date.now());
     expect(Date.parse(liveExpiry?.lease_expires_at ?? "")).toBeLessThanOrEqual(Date.parse(original.created_at) + 60_000);
     await env.DB.prepare("UPDATE factory_leases SET expires_at=? WHERE dispatch_id=?").bind(new Date(0).toISOString(), original.run_id).run();
     const successorFence = await __TEST_ONLY__.acquireLease(env.DB, successor as never, limits);
-    expect(successorFence).toBeTypeOf("number");
-    const heldSuccessor = { ...successor, lease_fence: successorFence as number };
-    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(successorFence, successor.run_id).run();
+    expect(successorFence?.fence).toBeTypeOf("number");
+    const heldSuccessor = { ...successor, lease_fence: successorFence?.fence as number };
+    await env.DB.prepare("UPDATE factory_runs SET lease_fence=? WHERE run_id=?").bind(successorFence?.fence, successor.run_id).run();
     await expect(__TEST_ONLY__.renewLease(env.DB, heldOriginal as never)).rejects.toThrow("lease_fenced");
     await __TEST_ONLY__.renewLease(env.DB, heldSuccessor as never);
     await __TEST_ONLY__.releaseLease(env.DB, heldSuccessor as never);
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(successor.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
-    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(successorFence).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(successorFence?.fence).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
     await expect(env.DB.prepare("SELECT lease_owner,lease_fence,lease_expires_at FROM factory_runs WHERE run_id=?").bind(successor.run_id).first()).resolves.toMatchObject({ lease_owner: null, lease_fence: null, lease_expires_at: null });
   });
 
@@ -206,9 +206,45 @@ describe("local Worker control-plane behavior", () => {
     const run = { run_id: `run-v1-${"l".repeat(32)}`, factory_id: "deadline-factory", repository: "deadline-repository", collision_group: "deadline-collision", registry_version: registry.registry_version, registry_digest: registry.registry_digest, registry_entry_version: registry.entry_version, lease_fence: null, created_at: new Date().toISOString() };
     await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(run.run_id, run.run_id, "digest", "profile", run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, JSON.stringify(contract), "project", `${run.run_id}-issue`, run.run_id, run.repository, run.collision_group, contract.target.base_sha, "queued", run.created_at, run.created_at).run();
     const fence = await __TEST_ONLY__.acquireLease(env.DB, run as never, { global: 1, factory: 1, repository: 1, collision: 1 });
-    const held = { ...run, lease_fence: fence as number };
+    const held = { ...run, lease_fence: fence?.fence as number };
     const before = await env.DB.prepare("SELECT expires_at FROM factory_leases WHERE dispatch_id=? LIMIT 1").bind(run.run_id).first<{ expires_at: string }>();
     await expect(__TEST_ONLY__.renewLeaseWithinRunDeadline(env.DB, { ...held, created_at: new Date(Date.now() - 2_000).toISOString() } as never, { timeoutSeconds: 1 })).rejects.toThrow("workflow_deadline_exceeded");
     await expect(env.DB.prepare("SELECT expires_at FROM factory_leases WHERE dispatch_id=? LIMIT 1").bind(run.run_id).first<{ expires_at: string }>()).resolves.toEqual(before);
+    await __TEST_ONLY__.releaseLease(env.DB, held as never);
+  });
+
+  it("schedules only a live queued job, persists its capped initial expiry, and leaves an expired job lease-free", async () => {
+    const issue = {
+      project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" },
+      state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] },
+    };
+    const binding = await __TEST_ONLY__.resolveFactory(issue as never, contract as never);
+    const schedulerEnv = Object.assign(Object.create(env), {
+      FACTORY_ENABLED: "true", FACTORY_AUTONOMY: "1", MAX_COST_USD: "8", MAX_GLOBAL_CONCURRENCY: "1",
+      EXECUTION_WORKFLOW: { create: async () => ({ id: "local-workflow" }) },
+    });
+    const add = async (suffix: string, createdAt: string) => {
+      const dispatch = `MHO-224@scheduler-${suffix}`;
+      const runId = `run-v1-${suffix.repeat(32)}`;
+      const liveContract = { ...contract, dispatch_id: dispatch, linear: { ...contract.linear, issue_id: `issue-scheduler-${suffix}`, identifier: `MHO-${suffix === "0" ? "225" : "226"}` }, registry: binding.identity };
+      const contractDigest = await __TEST_ONLY__.digest(liveContract);
+      const profileDigest = await __TEST_ONLY__.profileDigest(liveContract);
+      await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(dispatch, runId, contractDigest, profileDigest, binding.identity.factory_id, binding.identity.registry_version, binding.identity.registry_digest, binding.identity.entry_version, JSON.stringify(liveContract), liveContract.linear.project_id, liveContract.linear.issue_id, liveContract.linear.identifier, liveContract.target.repository, liveContract.target.collision_group, liveContract.target.base_sha, "queued", createdAt, createdAt).run();
+      return { dispatch, runId, contract: liveContract, contractDigest, createdAt };
+    };
+    const live = await add("0", new Date().toISOString());
+    await expect(__TEST_ONLY__.schedule(schedulerEnv as never, { kind: "dispatch", dispatchId: live.dispatch, runId: live.runId, contractDigest: live.contractDigest, contract: live.contract })).resolves.toBe("dispatched");
+    const leased = await env.DB.prepare("SELECT lease_fence,lease_expires_at FROM factory_runs WHERE run_id=?").bind(live.runId).first<{ lease_fence: number; lease_expires_at: string }>();
+    const lease = await env.DB.prepare("SELECT expires_at FROM factory_leases WHERE dispatch_id=? LIMIT 1").bind(live.runId).first<{ expires_at: string }>();
+    expect(leased?.lease_expires_at).toBe(lease?.expires_at);
+    expect(Date.parse(leased?.lease_expires_at ?? "")).toBeLessThanOrEqual(Date.parse(live.createdAt) + 900_000);
+    await __TEST_ONLY__.releaseLease(env.DB, { ...(await env.DB.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url,created_at FROM factory_runs WHERE run_id=?").bind(live.runId).first()), lease_fence: leased?.lease_fence } as never);
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(live.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+
+    const expired = await add("1", new Date(Date.now() - 901_000).toISOString());
+    await expect(__TEST_ONLY__.schedule(schedulerEnv as never, { kind: "dispatch", dispatchId: expired.dispatch, runId: expired.runId, contractDigest: expired.contractDigest, contract: expired.contract })).resolves.toBe("needs-human");
+    await expect(env.DB.prepare("SELECT current_state,result_json FROM factory_runs WHERE run_id=?").bind(expired.runId).first<{ current_state: string; result_json: string }>()).resolves.toMatchObject({ current_state: "needs-human" });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(expired.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_reservations WHERE run_id=?").bind(expired.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
   });
 });

@@ -17,7 +17,11 @@ export default defineConfig({
       // Keep the authority-heavy Worker paths above the prior smoke-test floor.
       // The D1 suite exercises migrations, contention, fencing, renewal, and
       // exact release rather than counting lease-key strings.
-      thresholds: { statements: 23, branches: 21, functions: 41, lines: 26 },
+      // The behavioral scheduler/receipt/lease suite now exercises the
+      // authority-bearing paths enough to make a substantially stronger floor
+      // practical. Keep each dimension below the measured local result while
+      // requiring future changes to retain that coverage.
+      thresholds: { statements: 26, branches: 24, functions: 45, lines: 29 },
     },
   },
 });

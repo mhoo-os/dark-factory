@@ -870,6 +870,7 @@ async function dependenciesReady(job: Job, env: Env): Promise<"ready" | "blocked
 }
 
 type ConcurrencyLimits = { global: number; factory: number; repository: number; collision: number };
+type LeaseReservation = { fence: number; expiresAt: string };
 
 function runtimeConcurrencyLimits(env: Env, factory: ObjectValue): ConcurrencyLimits {
   const capacity = factory.capacity as ObjectValue | undefined;
@@ -895,9 +896,10 @@ function capacityLeaseScopes(run: Run, limits: ConcurrencyLimits): string[][] {
   ];
 }
 
-async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits): Promise<number | null> {
+async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits, expiresNoLaterThan?: number): Promise<LeaseReservation | null> {
   const now = new Date();
-  const expiry = new Date(now.getTime() + 30 * 60_000).toISOString();
+  if (expiresNoLaterThan !== undefined && (!Number.isFinite(expiresNoLaterThan) || expiresNoLaterThan <= now.getTime())) throw new Error("workflow_deadline_exceeded");
+  const expiry = new Date(Math.min(now.getTime() + 30 * 60_000, expiresNoLaterThan ?? Number.POSITIVE_INFINITY)).toISOString();
   const reservation = await db.prepare("INSERT INTO factory_lease_reservations(run_id,created_at) VALUES(?,?)").bind(run.run_id, now.toISOString()).run();
   const reservationId = Number(reservation.meta.last_row_id);
   if (!Number.isSafeInteger(reservationId) || reservationId < 1) throw new Error("lease_reservation_failed");
@@ -915,8 +917,10 @@ async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits)
       acquired.push(selected);
     }
     await db.batch(acquired.map((key) => db.prepare("INSERT INTO factory_lease_members(reservation_id,lease_key) VALUES(?,?)").bind(reservationId, key)));
+    const persisted = await db.prepare("SELECT MIN(expires_at) AS earliest,MAX(expires_at) AS latest,COUNT(*) AS count FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?)").bind(run.run_id, reservationId).first<{ earliest: string | null; latest: string | null; count: number }>();
+    if (persisted?.count !== acquired.length || persisted.earliest !== expiry || persisted.latest !== expiry) throw new Error("lease_expiry_persistence_failed");
     committed = true;
-    return reservationId;
+    return { fence: reservationId, expiresAt: expiry };
   } finally {
     if (!committed) {
       if (acquired.length > 0) await db.prepare(`DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (${acquired.map(() => "?").join(",")})`).bind(run.run_id, ...acquired).run();
@@ -1093,6 +1097,22 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     return "stopped";
   }
   if (!["admitted", "queued", "blocked-by-dependency"].includes(run.current_state)) return "already-handled";
+  let schedulerLimits: RuntimeLimits;
+  let deadlineAt: number;
+  try {
+    schedulerLimits = runtimeExecutionLimits(env, job.contract);
+    deadlineAt = runDeadlineAt(run, schedulerLimits);
+    if (deadlineAt <= Date.now()) throw new Error("workflow_deadline_exceeded");
+  } catch (error) {
+    try {
+      const reason = error instanceof Error ? error.message : "workflow_deadline_exceeded";
+      const actor: TransitionActor = run.current_state === "queued" ? "scheduler" : "reconciler";
+      await transitionRun(env.DB, job.runId, "needs-human", actor, `schedule:deadline:${job.runId}`, { result: { reason } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
+  }
   const dependencyState = await dependenciesReady(job, env);
   if (dependencyState === "unavailable") return "retryable";
   if (dependencyState === "blocked") {
@@ -1103,6 +1123,16 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     await transitionRun(env.DB, job.runId, "queued", "scheduler", `schedule:queue:${job.runId}`);
     run = await runById(env.DB, job.runId);
     if (!run) return "missing";
+  }
+  // The dependency/queue callbacks above may have consumed the remaining run
+  // budget. Re-check immediately before touching any capacity lease row.
+  if (deadlineAt <= Date.now()) {
+    try {
+      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:deadline:${job.runId}`, { result: { reason: "workflow_deadline_exceeded" } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
   }
   let concurrencyLimits: ConcurrencyLimits;
   try {
@@ -1118,26 +1148,36 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
       return "retryable";
     }
   }
-  const leaseFence = await acquireLease(env.DB, run, concurrencyLimits);
-  if (leaseFence === null) return "repo-busy";
-  const leaseExpiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
+  let lease: LeaseReservation | null;
   try {
-    await transitionRun(env.DB, job.runId, "leased", "scheduler", `schedule:lease:${job.runId}:${leaseFence}`, {
-      lease: { owner: "workflow", fence: leaseFence, expiresAt: leaseExpiresAt },
+    lease = await acquireLease(env.DB, run, concurrencyLimits, deadlineAt);
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "workflow_deadline_exceeded") return "retryable";
+    try {
+      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:deadline:${job.runId}`, { result: { reason: error.message } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
+  }
+  if (lease === null) return "repo-busy";
+  try {
+    await transitionRun(env.DB, job.runId, "leased", "scheduler", `schedule:lease:${job.runId}:${lease.fence}`, {
+      lease: { owner: "workflow", fence: lease.fence, expiresAt: lease.expiresAt },
     });
   } catch {
-    try { await releaseLease(env.DB, { ...run, lease_fence: leaseFence }); } catch { /* the competing state remains authoritative */ }
+    try { await releaseLease(env.DB, { ...run, lease_fence: lease.fence }); } catch { /* the competing state remains authoritative */ }
     return "already-handled";
   }
   try {
     const instance = await env.EXECUTION_WORKFLOW.create({ id: job.runId, params: job });
-    await transitionRun(env.DB, job.runId, "running", "workflow", `schedule:running:${job.runId}:${leaseFence}`, { leaseFence, fields: { workflowId: instance.id } });
+    await transitionRun(env.DB, job.runId, "running", "workflow", `schedule:running:${job.runId}:${lease.fence}`, { leaseFence: lease.fence, fields: { workflowId: instance.id } });
     return "dispatched";
   } catch {
     try {
-      await transitionRun(env.DB, job.runId, "queued", "reconciler", `schedule:workflow-failed:${job.runId}:${leaseFence}`, { result: { reason: "workflow_create_failed" }, leaseFence, lease: null });
+      await transitionRun(env.DB, job.runId, "queued", "reconciler", `schedule:workflow-failed:${job.runId}:${lease.fence}`, { result: { reason: "workflow_create_failed" }, leaseFence: lease.fence, lease: null });
     } catch { /* the next recovery pass will surface any fenced write */ }
-    try { await releaseLease(env.DB, { ...run, lease_fence: leaseFence }); } catch { /* the next recovery pass will surface the stale lease */ }
+    try { await releaseLease(env.DB, { ...run, lease_fence: lease.fence }); } catch { /* the next recovery pass will surface the stale lease */ }
     return "retryable";
   }
 }
@@ -1965,6 +2005,9 @@ export const __TEST_ONLY__ = {
   inherentEffectClasses,
   capacityLeaseScopes,
   runtimeConcurrencyLimits,
+  schedule,
+  digest,
+  profileDigest,
   acquireLease,
   renewLease,
   renewLeaseWithinRunDeadline,
