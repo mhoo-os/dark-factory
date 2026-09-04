@@ -6,7 +6,7 @@ import migration002 from "../migrations/0002_ingress-retry-state.sql?raw";
 import migration003 from "../migrations/0003-state-history-and-active-issue.sql?raw";
 import migration004 from "../migrations/0004-trusted-factory-registry.sql?raw";
 import migration005 from "../migrations/0005-runtime-capacity-leases.sql?raw";
-import worker, { __TEST_ONLY__ } from "../src/index";
+import worker, { __TEST_ONLY__, ExecutionWorkflow } from "../src/index";
 
 const registry = {
   factory_id: "foundation-pilot",
@@ -49,6 +49,11 @@ const contract = {
   },
   registry,
 };
+
+async function hmac(secret: string, body: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body))), (item) => item.toString(16).padStart(2, "0")).join("");
+}
 
 beforeAll(async () => {
   for (const migration of [migration001, migration002, migration003, migration004, migration005]) {
@@ -112,12 +117,73 @@ describe("local Worker control-plane behavior", () => {
     expect(__TEST_ONLY__.agentResult(receipt)).toMatchObject({ cost_usd: 0.4 });
     expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, cost_usd: 0.3 } })).toThrow("agent_provider_cost_mismatch");
     expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, provider: "other" } })).toThrow("agent_provider_usage_invalid");
+    expect(() => __TEST_ONLY__.agentResult({ ...receipt, provider_usage: { ...receipt.provider_usage, generation_id: "" } })).toThrow("agent_provider_usage_invalid");
     expect(__TEST_ONLY__.canonicalModel(contract as never)).toEqual({ policyKey: "static:execution-default-v1", provider: "openrouter", model: "z-ai/glm-5.3-flash", version: "2026-09-03", outputTokenUsd: 0.001, requestOverheadUsd: 0.5 });
     expect(__TEST_ONLY__.providerReceiptMatchesCanonical(receipt.provider_usage, __TEST_ONLY__.canonicalModel(contract as never))).toBe(true);
     expect(__TEST_ONLY__.providerReceiptMatchesCanonical({ ...receipt.provider_usage, model: "provider-drift" }, __TEST_ONLY__.canonicalModel(contract as never))).toBe(false);
     expect(() => __TEST_ONLY__.canonicalModel({ ...contract, factory_request: { ...contract.factory_request, model_policy_key: "static:drift-v1" } } as never)).toThrow("registry_model_policy_not_canonical");
     expect(__TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "1" } as never, contract as never).costUsd).toBe(1);
     expect(() => __TEST_ONLY__.runtimeExecutionLimits({ MAX_COST_USD: "9" } as never, contract as never)).toThrow("cost_cap_config_invalid");
+  });
+
+  it("accepts exactly one signed GitHub reconciliation webhook and rejects unsigned control-plane input", async () => {
+    const raw = JSON.stringify({
+      action: "synchronize", repository: { full_name: contract.target.repository },
+      pull_request: { number: 41, body: `<!-- mhoo-dark-factory-run:v1 run=${runId} -->` },
+    });
+    const secret = "webhook-test-secret";
+    const sent: unknown[] = [];
+    const webhookEnv = Object.assign(Object.create(env), {
+      GITHUB_WEBHOOK_SECRET: secret,
+      EXECUTION_QUEUE: { send: async (job: unknown) => { sent.push(job); } },
+    });
+    const request = () => new Request("https://control.test/webhooks/github", {
+      method: "POST",
+      headers: { "X-Hub-Signature-256": `sha256=${awaitedSignature}`, "X-GitHub-Event": "pull_request", "X-GitHub-Delivery": "delivery-authority-1" },
+      body: raw,
+    });
+    const awaitedSignature = await hmac(secret, raw);
+    await expect(worker.fetch(request(), webhookEnv as never)).resolves.toMatchObject({ status: 202 });
+    await expect(worker.fetch(request(), webhookEnv as never)).resolves.toMatchObject({ status: 200 });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ kind: "github-reconciliation", runId, repository: contract.target.repository, prNumber: 41 });
+    await expect(worker.fetch(new Request("https://control.test/webhooks/github", { method: "POST", body: raw }), webhookEnv as never)).resolves.toMatchObject({ status: 401 });
+    await expect(env.DB.prepare("SELECT handoff_state FROM factory_ingress_events WHERE provider='github' AND event_type='pull_request' ORDER BY received_at DESC LIMIT 1").first()).resolves.toMatchObject({ handoff_state: "enqueued" });
+  });
+
+  it("requires the admin bearer to change the protected stop control", async () => {
+    const controlEnv = Object.assign(Object.create(env), { FACTORY_ADMIN_SECRET: "admin-test-secret" });
+    await expect(worker.fetch(new Request("https://control.test/controls/stop", { method: "POST" }), controlEnv as never)).resolves.toMatchObject({ status: 403 });
+    const stop = await worker.fetch(new Request("https://control.test/controls/stop", { method: "POST", headers: { Authorization: "Bearer admin-test-secret" } }), controlEnv as never);
+    expect(await stop.json()).toEqual({ stopped: true });
+    const resume = await worker.fetch(new Request("https://control.test/controls/resume", { method: "POST", headers: { Authorization: "Bearer admin-test-secret" } }), controlEnv as never);
+    expect(await resume.json()).toEqual({ stopped: false });
+  });
+
+  it("publishes only a human-review PR with an auditable no-auto-merge marker", async () => {
+    const binding = await __TEST_ONLY__.resolveFactory({ project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" }, state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] } } as never, contract as never);
+    const publicationContract = { ...contract, dispatch_id: "MHO-224@publication", linear: { ...contract.linear, issue_id: "issue-publication", identifier: "MHO-228" }, registry: binding.identity };
+    const job = { kind: "dispatch", dispatchId: publicationContract.dispatch_id, runId: `run-v1-${"4".repeat(32)}`, contractDigest: await __TEST_ONLY__.digest(publicationContract), contract: publicationContract };
+    const agent = { status: "passed", reason: "ok", branch: "factory/mho-228-publication", head_sha: "b".repeat(40), cost_usd: 0.4, provider_usage: { provider: "openrouter", model: "z-ai/glm-5.3-flash", generation_id: "gen-publication", provider_created_at: 1_725_000_000, prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost_usd: 0.4 } };
+    const requests: Array<{ url: string; method: string; body: string }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      requests.push({ url, method: init?.method ?? "GET", body: typeof init?.body === "string" ? init.body : "" });
+      if (url.endsWith("/repos/mhoo-os/dark-factory")) return Response.json({ default_branch: "main" });
+      if (url.endsWith("/repos/mhoo-os/dark-factory/branches/main")) return Response.json({ commit: { sha: publicationContract.target.base_sha } });
+      if (url.includes("/pulls?state=all")) return Response.json([]);
+      return Response.json({ number: 77, html_url: "https://github.com/mhoo-os/dark-factory/pull/77", state: "open", merged: false, head: { ref: agent.branch, sha: agent.head_sha, repo: { full_name: contract.target.repository } }, base: { ref: "main", sha: publicationContract.target.base_sha, repo: { full_name: contract.target.repository } } });
+    };
+    try {
+      await expect(__TEST_ONLY__.publishPullRequest({ GITHUB_TOKEN: "test-token" } as never, job as never, agent as never)).resolves.toMatchObject({ number: 77 });
+      expect(requests.at(-1)).toMatchObject({ method: "POST" });
+      expect(requests.at(-1)?.body).toContain("Automatic merge is disabled; human review is required.");
+      expect(requests.at(-1)?.body).toContain(`run=${job.runId}`);
+      await expect(__TEST_ONLY__.publishPullRequest({ GITHUB_TOKEN: "test-token" } as never, { ...job, contract: { ...publicationContract, merge_policy: "auto-eligible" } } as never, agent as never)).rejects.toThrow("registry_merge_ceiling_exceeded");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("isolates global, factory, repository, and collision D1 capacity ceilings through migrations 0004/0005", async () => {
@@ -178,6 +244,61 @@ describe("local Worker control-plane behavior", () => {
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(successor.run_id).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(successorFence?.fence).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
     await expect(env.DB.prepare("SELECT lease_owner,lease_fence,lease_expires_at FROM factory_runs WHERE run_id=?").bind(successor.run_id).first()).resolves.toMatchObject({ lease_owner: null, lease_fence: null, lease_expires_at: null });
+  });
+
+  it("terminalizes a failed authority workflow and releases every D1 lease member", async () => {
+    const binding = await __TEST_ONLY__.resolveFactory({ project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" }, state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] } } as never, contract as never);
+    const workflowContract = { ...contract, dispatch_id: "MHO-224@workflow-cleanup", linear: { ...contract.linear, issue_id: "issue-workflow-cleanup", identifier: "MHO-229" }, registry: binding.identity };
+    const workflowRunId = `run-v1-${"5".repeat(32)}`;
+    const digest = await __TEST_ONLY__.digest(workflowContract);
+    const profile = await __TEST_ONLY__.profileDigest(workflowContract);
+    const createdAt = new Date().toISOString();
+    await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(workflowContract.dispatch_id, workflowRunId, digest, profile, binding.identity.factory_id, binding.identity.registry_version, binding.identity.registry_digest, binding.identity.entry_version, JSON.stringify(workflowContract), workflowContract.linear.project_id, workflowContract.linear.issue_id, workflowContract.linear.identifier, workflowContract.target.repository, workflowContract.target.collision_group, workflowContract.target.base_sha, "queued", createdAt, createdAt).run();
+    const lease = await __TEST_ONLY__.acquireLease(env.DB, { run_id: workflowRunId, factory_id: binding.identity.factory_id, repository: workflowContract.target.repository, collision_group: workflowContract.target.collision_group, registry_version: binding.identity.registry_version, registry_digest: binding.identity.registry_digest, registry_entry_version: binding.identity.entry_version, lease_fence: null, created_at: createdAt } as never, { global: 1, factory: 1, repository: 1, collision: 1 });
+    await env.DB.prepare("UPDATE factory_runs SET current_state='running',lease_owner='workflow',lease_fence=?,lease_expires_at=? WHERE run_id=?").bind(lease?.fence, lease?.expiresAt, workflowRunId).run();
+    const steps: string[] = [];
+    const step = { do: async (name: string, _options: unknown, callback: () => Promise<unknown>) => { steps.push(name); return await callback(); } };
+    const instance = Object.create(ExecutionWorkflow.prototype) as ExecutionWorkflow;
+    Object.defineProperty(instance, "env", { value: Object.assign(Object.create(env), { MAX_COST_USD: "8", MAX_FIX_ATTEMPTS: "0", OPENROUTER_MODEL: "z-ai/glm-5.3-flash" }) });
+    await expect(instance.run({ payload: { kind: "dispatch", dispatchId: workflowContract.dispatch_id, runId: workflowRunId, contractDigest: digest, contract: workflowContract } } as never, step as never)).resolves.toMatchObject({ status: "needs-human", reason: "workflow_step_failed" });
+    expect(steps).toEqual(expect.arrayContaining(["ground", "finalize", "release-lease"]));
+    await expect(env.DB.prepare("SELECT current_state,lease_fence FROM factory_runs WHERE run_id=?").bind(workflowRunId).first()).resolves.toMatchObject({ current_state: "needs-human", lease_fence: null });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(workflowRunId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+  });
+
+  it("reconciles a registered human-review PR and writes one Linear receipt", async () => {
+    const binding = await __TEST_ONLY__.resolveFactory({ project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" }, state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] } } as never, contract as never);
+    const reconciliationContract = { ...contract, dispatch_id: "MHO-230@reviewed", linear: { ...contract.linear, issue_id: "issue-reconciliation", identifier: "MHO-230" }, registry: binding.identity };
+    const reconciliationRunId = `run-v1-${"6".repeat(32)}`;
+    const headSha = "c".repeat(40);
+    const branch = `factory/mho-230-${reconciliationRunId.slice(-12)}`;
+    const contractDigest = await __TEST_ONLY__.digest(reconciliationContract);
+    const profile = await __TEST_ONLY__.profileDigest(reconciliationContract);
+    const createdAt = new Date().toISOString();
+    await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,branch,head_sha,pr_number,pr_url,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(reconciliationContract.dispatch_id, reconciliationRunId, contractDigest, profile, binding.identity.factory_id, binding.identity.registry_version, binding.identity.registry_digest, binding.identity.entry_version, JSON.stringify(reconciliationContract), reconciliationContract.linear.project_id, reconciliationContract.linear.issue_id, reconciliationContract.linear.identifier, reconciliationContract.target.repository, reconciliationContract.target.collision_group, reconciliationContract.target.base_sha, "pr-open", branch, headSha, 88, "https://github.com/mhoo-os/dark-factory/pull/88", createdAt, createdAt).run();
+    const { registry: _registry, ...planningContract } = reconciliationContract;
+    const issue = { id: reconciliationContract.linear.issue_id, identifier: reconciliationContract.linear.identifier, description: `<!-- mhoo-factory-dispatch:v1 -->\n${JSON.stringify(planningContract)}\n<!-- /mhoo-factory-dispatch:v1 -->`, project: { id: reconciliationContract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" }, state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] } };
+    const pull = { number: 88, html_url: "https://github.com/mhoo-os/dark-factory/pull/88", state: "open", merged: false, head: { ref: branch, sha: headSha, repo: { full_name: reconciliationContract.target.repository } }, base: { ref: "main", sha: reconciliationContract.target.base_sha, repo: { full_name: reconciliationContract.target.repository } } };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/88")) return Response.json(pull);
+      if (url === "https://api.linear.app/graphql") {
+        const request = JSON.parse(String(init?.body));
+        if (request.query.includes("comments(first:50")) return Response.json({ data: { issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } });
+        if (request.query.includes("commentCreate")) return Response.json({ data: { commentCreate: { success: true } } });
+        return Response.json({ data: { issue } });
+      }
+      throw new Error(`unexpected request ${url}`);
+    };
+    try {
+      await expect(__TEST_ONLY__.reconcileGithubEvent({ DB: env.DB, GITHUB_TOKEN: "github-test", LINEAR_API_KEY: "linear-test" } as never, { kind: "github-reconciliation", eventId: "reconcile-authority-1", runId: reconciliationRunId, repository: reconciliationContract.target.repository, prNumber: 88, action: "synchronize" } as never)).resolves.toBe("processed");
+      await expect(env.DB.prepare("SELECT current_state,head_sha,pr_number FROM factory_runs WHERE run_id=?").bind(reconciliationRunId).first()).resolves.toMatchObject({ current_state: "pr-open", head_sha: headSha, pr_number: 88 });
+      await expect(env.DB.prepare("SELECT status FROM factory_steps WHERE run_id=? AND step_key='reconciliation'").bind(reconciliationRunId).first()).resolves.toMatchObject({ status: "pr-open" });
+      await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_linear_reconciliations WHERE run_id=?").bind(reconciliationRunId).first<{ count: number }>()).resolves.toMatchObject({ count: 1 });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("rejects expired workflow callbacks and bounds terminal cleanup separately", () => {
@@ -246,5 +367,56 @@ describe("local Worker control-plane behavior", () => {
     await expect(env.DB.prepare("SELECT current_state,result_json FROM factory_runs WHERE run_id=?").bind(expired.runId).first<{ current_state: string; result_json: string }>()).resolves.toMatchObject({ current_state: "needs-human" });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(expired.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_reservations WHERE run_id=?").bind(expired.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+  });
+
+  it("fences a deterministic deadline expiry during D1 acquisition before Workflow creation", async () => {
+    const now = new Date("2030-01-01T00:00:00.000Z");
+      const issue = {
+        project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" },
+        state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] },
+      };
+      const binding = await __TEST_ONLY__.resolveFactory(issue as never, contract as never);
+      const createdAt = new Date(now.getTime() - 899_000).toISOString();
+      const deadline = now.getTime() + 1_000;
+      let clock = now.getTime();
+      const dispatch = "MHO-224@scheduler-race";
+      const raceRunId = `run-v1-${"2".repeat(32)}`;
+      const raceContract = { ...contract, dispatch_id: dispatch, linear: { ...contract.linear, issue_id: "issue-scheduler-race", identifier: "MHO-227" }, registry: binding.identity };
+      const contractDigest = await __TEST_ONLY__.digest(raceContract);
+      const profileDigest = await __TEST_ONLY__.profileDigest(raceContract);
+      await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(dispatch, raceRunId, contractDigest, profileDigest, binding.identity.factory_id, binding.identity.registry_version, binding.identity.registry_digest, binding.identity.entry_version, JSON.stringify(raceContract), raceContract.linear.project_id, raceContract.linear.issue_id, raceContract.linear.identifier, raceContract.target.repository, raceContract.target.collision_group, raceContract.target.base_sha, "queued", createdAt, createdAt).run();
+
+      let advanced = false;
+      const deadlineDb = new Proxy(env.DB as object, {
+        get(target, property) {
+          const value = Reflect.get(target, property, target);
+          if (property === "batch" && typeof value === "function") {
+            return async (...args: unknown[]) => {
+              const result = await value.apply(target, args);
+              if (!advanced) {
+                advanced = true;
+                clock = deadline + 1;
+              }
+              return result;
+            };
+          }
+          if (property !== "prepare" || typeof value !== "function") return typeof value === "function" ? value.bind(target) : value;
+          return value.bind(target);
+        },
+      });
+      let workflowCreates = 0;
+      const schedulerEnv = Object.assign(Object.create(env), {
+        DB: deadlineDb, FACTORY_ENABLED: "true", FACTORY_AUTONOMY: "1", MAX_COST_USD: "8", MAX_GLOBAL_CONCURRENCY: "1",
+        __TEST_CLOCK_NOW: () => clock,
+        EXECUTION_WORKFLOW: { create: async () => { workflowCreates += 1; return { id: "must-not-start" }; } },
+      });
+
+      const outcome = await __TEST_ONLY__.schedule(schedulerEnv as never, { kind: "dispatch", dispatchId: dispatch, runId: raceRunId, contractDigest, contract: raceContract });
+      expect(advanced).toBe(true);
+      expect(outcome).toBe("needs-human");
+      expect(workflowCreates).toBe(0);
+      await expect(env.DB.prepare("SELECT current_state,lease_fence,lease_expires_at FROM factory_runs WHERE run_id=?").bind(raceRunId).first()).resolves.toMatchObject({ current_state: "needs-human", lease_fence: null, lease_expires_at: null });
+      await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(raceRunId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+      await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id IN (SELECT reservation_id FROM factory_lease_reservations WHERE run_id=?)").bind(raceRunId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
   });
 });

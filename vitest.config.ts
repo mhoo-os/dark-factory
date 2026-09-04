@@ -17,11 +17,11 @@ export default defineConfig({
       // Keep the authority-heavy Worker paths above the prior smoke-test floor.
       // The D1 suite exercises migrations, contention, fencing, renewal, and
       // exact release rather than counting lease-key strings.
-      // The behavioral scheduler/receipt/lease suite now exercises the
-      // authority-bearing paths enough to make a substantially stronger floor
-      // practical. Keep each dimension below the measured local result while
-      // requiring future changes to retain that coverage.
-      thresholds: { statements: 26, branches: 24, functions: 45, lines: 29 },
+      // Authority-bearing behavior is covered through real D1, signed ingress,
+      // workflow cleanup, reconciliation, and protected publication paths.
+      // These broad floors apply to the complete Worker, rather than making a
+      // low bar that only the new test file can satisfy.
+      thresholds: { statements: 48, branches: 46, functions: 72, lines: 56 },
     },
   },
 });

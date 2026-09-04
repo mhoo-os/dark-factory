@@ -872,6 +872,16 @@ async function dependenciesReady(job: Job, env: Env): Promise<"ready" | "blocked
 type ConcurrencyLimits = { global: number; factory: number; repository: number; collision: number };
 type LeaseReservation = { fence: number; expiresAt: string };
 
+function schedulerNow(env: Env): number {
+  // A clock is accepted only on an in-memory test Env. Production bindings
+  // cannot supply functions, so production always uses the platform clock.
+  const candidate = (env as Env & { __TEST_CLOCK_NOW?: unknown }).__TEST_CLOCK_NOW;
+  if (typeof candidate !== "function") return Date.now();
+  const value = Number(candidate());
+  if (!Number.isFinite(value)) throw new Error("scheduler_clock_invalid");
+  return value;
+}
+
 function runtimeConcurrencyLimits(env: Env, factory: ObjectValue): ConcurrencyLimits {
   const capacity = factory.capacity as ObjectValue | undefined;
   if (!capacity || typeof capacity !== "object") throw new Error("registry_capacity_invalid");
@@ -896,8 +906,8 @@ function capacityLeaseScopes(run: Run, limits: ConcurrencyLimits): string[][] {
   ];
 }
 
-async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits, expiresNoLaterThan?: number): Promise<LeaseReservation | null> {
-  const now = new Date();
+async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits, expiresNoLaterThan?: number, nowAt = Date.now()): Promise<LeaseReservation | null> {
+  const now = new Date(nowAt);
   if (expiresNoLaterThan !== undefined && (!Number.isFinite(expiresNoLaterThan) || expiresNoLaterThan <= now.getTime())) throw new Error("workflow_deadline_exceeded");
   const expiry = new Date(Math.min(now.getTime() + 30 * 60_000, expiresNoLaterThan ?? Number.POSITIVE_INFINITY)).toISOString();
   const reservation = await db.prepare("INSERT INTO factory_lease_reservations(run_id,created_at) VALUES(?,?)").bind(run.run_id, now.toISOString()).run();
@@ -1065,6 +1075,26 @@ async function recoverStaleLeases(env: Env): Promise<void> {
   }
 }
 
+async function abandonExpiredSchedulerLease(env: Env, run: Run, job: Job, lease: LeaseReservation): Promise<"needs-human" | "retryable" | "missing"> {
+  // Acquisition is a series of D1 writes. The deadline can elapse after its
+  // first check, so remove every member before changing state; this path never
+  // creates a Workflow or leaves capacity held by an expired run.
+  try {
+    await releaseLease(env.DB, { ...run, lease_fence: lease.fence });
+  } catch {
+    return "retryable";
+  }
+  try {
+    const latest = await runById(env.DB, job.runId);
+    if (!latest) return "missing";
+    const actor: TransitionActor = latest.current_state === "leased" ? "reconciler" : "scheduler";
+    await transitionRun(env.DB, job.runId, "needs-human", actor, `schedule:deadline:${job.runId}:${lease.fence}`, { result: { reason: "workflow_deadline_exceeded" } });
+    return "needs-human";
+  } catch {
+    return "retryable";
+  }
+}
+
 async function schedule(env: Env, candidate: unknown): Promise<string> {
   const parsedJob = dispatchJob(candidate);
   if (!parsedJob) return "needs-human";
@@ -1102,7 +1132,7 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
   try {
     schedulerLimits = runtimeExecutionLimits(env, job.contract);
     deadlineAt = runDeadlineAt(run, schedulerLimits);
-    if (deadlineAt <= Date.now()) throw new Error("workflow_deadline_exceeded");
+    if (deadlineAt <= schedulerNow(env)) throw new Error("workflow_deadline_exceeded");
   } catch (error) {
     try {
       const reason = error instanceof Error ? error.message : "workflow_deadline_exceeded";
@@ -1126,7 +1156,7 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
   }
   // The dependency/queue callbacks above may have consumed the remaining run
   // budget. Re-check immediately before touching any capacity lease row.
-  if (deadlineAt <= Date.now()) {
+  if (deadlineAt <= schedulerNow(env)) {
     try {
       await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:deadline:${job.runId}`, { result: { reason: "workflow_deadline_exceeded" } });
       return "needs-human";
@@ -1150,7 +1180,7 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
   }
   let lease: LeaseReservation | null;
   try {
-    lease = await acquireLease(env.DB, run, concurrencyLimits, deadlineAt);
+    lease = await acquireLease(env.DB, run, concurrencyLimits, deadlineAt, schedulerNow(env));
   } catch (error) {
     if (!(error instanceof Error) || error.message !== "workflow_deadline_exceeded") return "retryable";
     try {
@@ -1161,6 +1191,9 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     }
   }
   if (lease === null) return "repo-busy";
+  // `acquireLease` can span several D1 mutations. Check the absolute boundary
+  // again before we write any lease ownership onto the run.
+  if (deadlineAt <= schedulerNow(env)) return await abandonExpiredSchedulerLease(env, run, job, lease);
   try {
     await transitionRun(env.DB, job.runId, "leased", "scheduler", `schedule:lease:${job.runId}:${lease.fence}`, {
       lease: { owner: "workflow", fence: lease.fence, expiresAt: lease.expiresAt },
@@ -1169,6 +1202,9 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     try { await releaseLease(env.DB, { ...run, lease_fence: lease.fence }); } catch { /* the competing state remains authoritative */ }
     return "already-handled";
   }
+  // State transition work itself may consume the final milliseconds. Do not
+  // create a Workflow once the run has crossed its authority deadline.
+  if (deadlineAt <= schedulerNow(env)) return await abandonExpiredSchedulerLease(env, run, job, lease);
   try {
     const instance = await env.EXECUTION_WORKFLOW.create({ id: job.runId, params: job });
     await transitionRun(env.DB, job.runId, "running", "workflow", `schedule:running:${job.runId}:${lease.fence}`, { leaseFence: lease.fence, fields: { workflowId: instance.id } });
@@ -2021,6 +2057,10 @@ export const __TEST_ONLY__ = {
   providerReceiptMatchesCanonical,
   agentResult,
   resolveFactory,
+  acceptGithub,
+  reconcileGithubEvent,
+  publishPullRequest,
+  protectedPath,
 };
 
 export default {
