@@ -22,6 +22,10 @@ ISSUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$")
 REPOSITORY_PATTERN = re.compile(r"^mhoo-os/[a-z0-9][a-z0-9._-]{0,99}$")
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 BASE_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+LINEAR_IDENTIFIER_LINK_PATTERN = re.compile(
+    r"^\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]"
+    r"\(https://linear\.app/[A-Za-z0-9_-]+/issue/\1(?:/[A-Za-z0-9._-]+)?\)$"
+)
 UTC_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 DRY_RUN_MODE = "approved-intake"
 DRY_RUN_MAX_TTL = timedelta(minutes=15)
@@ -118,6 +122,23 @@ def _dry_run_authorization_errors(value: Any, errors: list[str]) -> None:
         except ValueError:
             errors.append("dry_run_authorization.expires_at.format")
     _string(authorization.get("checkout_head_sha"), "dry_run_authorization.checkout_head_sha", errors, BASE_SHA_PATTERN, 40)
+
+
+def _normalize_linear_identifier(value: Any) -> Any:
+    """Undo only Linear's exact automatic issue-link serialization inside JSON."""
+    if not isinstance(value, dict) or not isinstance(value.get("linear"), dict):
+        return value
+    identifier = value["linear"].get("identifier")
+    if not isinstance(identifier, str):
+        return value
+    match = LINEAR_IDENTIFIER_LINK_PATTERN.fullmatch(identifier)
+    if match is None:
+        return value
+    normalized = dict(value)
+    normalized_linear = dict(value["linear"])
+    normalized_linear["identifier"] = match.group(1)
+    normalized["linear"] = normalized_linear
+    return normalized
 
 
 def _static_errors(value: Any) -> list[str]:
@@ -226,10 +247,11 @@ def validate_dispatch_contract(
     now: datetime | None = None,
 ) -> ContractValidation:
     """Validate static shape, then classify deterministic admission conditions."""
-    errors = _static_errors(value)
+    normalized_value = _normalize_linear_identifier(value)
+    errors = _static_errors(normalized_value)
     if errors:
         return ContractValidation("not-admitted", tuple(errors))
-    contract = _make_contract(value)
+    contract = _make_contract(normalized_value)
     document = contract.to_dict()
     authorization = contract.dry_run_authorization
     if authorization is not None:

@@ -19,6 +19,7 @@ const STALE_CONDITIONS = new Set([
 const SHA40 = /^[0-9a-f]{40}$/i;
 const REPOSITORY = /^mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}$/;
 const ISSUE_IDENTIFIER = /^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/;
+const LINEAR_ISSUE_LINK = /^\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]\(https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/\1(?:\/[A-Za-z0-9._-]+)?\)$/;
 const BRANCH = /^factory\/[a-z0-9][a-z0-9-]{0,127}$/;
 const RUN_ID = /^run-v1-[0-9a-f]{32}$/;
 const GITHUB_API_VERSION = "2022-11-28";
@@ -300,6 +301,11 @@ function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorizat
   return { authorization_id: authorizationId, mode: "approved-intake", non_executable: true, expires_at: expiresAt, checkout_head_sha: checkoutHead };
 }
 
+function canonicalLinearIdentifier(value: unknown): string {
+  const raw = text(value, "contract_identifier", 512);
+  return raw.match(LINEAR_ISSUE_LINK)?.[1] ?? raw;
+}
+
 function contractFromDescription(description: unknown, issue: ObjectValue, env: Env): Contract {
   const source = descriptionValue(description, "description", 100_000);
   if (source.split(CONTRACT_OPEN).length - 1 !== 1 || source.split(CONTRACT_CLOSE).length - 1 !== 1) {
@@ -318,7 +324,8 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   const linear = object(root.linear, ["project_id", "issue_id", "identifier", "planning_revision", "planning_fingerprint"], "linear");
   const issueId = text(issue.id, "issue_id");
   const identifier = text(issue.identifier, "identifier", 32);
-  if (linear.project_id !== projectId || linear.issue_id !== issueId || linear.identifier !== identifier) throw new AdmissionError("contract_linear_identity_mismatch");
+  const contractIdentifier = canonicalLinearIdentifier(linear.identifier);
+  if (linear.project_id !== projectId || linear.issue_id !== issueId || contractIdentifier !== identifier) throw new AdmissionError("contract_linear_identity_mismatch");
   if (!/^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/.test(identifier)) throw new AdmissionError("issue_identifier_invalid");
   const planningRevision = text(linear.planning_revision, "planning_revision");
   if (root.dispatch_id !== `${identifier}@${planningRevision}`) throw new AdmissionError("dispatch_id_not_bound_to_revision");
@@ -365,7 +372,7 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
     linear: {
       project_id: text(linear.project_id, "contract_project_id"),
       issue_id: text(linear.issue_id, "contract_issue_id"),
-      identifier: text(linear.identifier, "contract_identifier", 32),
+      identifier: contractIdentifier,
       planning_revision: planningRevision,
       planning_fingerprint: text(linear.planning_fingerprint, "planning_fingerprint", 71),
     },

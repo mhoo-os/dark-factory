@@ -33,6 +33,8 @@ test("temporary dry-run authorization is sealed and rejected before durable ingr
   assert.equal(authorization.properties.non_executable.const, true);
   assert.match(source, /const DRY_RUN_AUTHORIZATION_TTL_MS = 15 \* 60_000/);
   assert.match(source, /function dryRunContractReason\(/);
+  assert.match(source, /function canonicalLinearIdentifier\(/);
+  assert.match(source, /const LINEAR_ISSUE_LINK/);
   assert.match(source, /dry_run_authorization_non_executable/);
   const acceptLinear = source.slice(source.indexOf("async function acceptLinear"), source.indexOf("async function acceptGithub"));
   assert.ok(acceptLinear.indexOf("const dryRunReason = dryRunContractReason") < acceptLinear.indexOf("const receipt = await ingress"));

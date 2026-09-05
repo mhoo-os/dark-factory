@@ -107,18 +107,6 @@ def admit_linear_issue(
     if errors:
         return _reject(*errors)
     assert value is not None
-    linear = value.get("linear")
-    if isinstance(linear, Mapping):
-        identity_errors = []
-        if linear.get("project_id") != expected_project_id:
-            identity_errors.append("contract_project_mismatch")
-        if linear.get("issue_id") != issue_id:
-            identity_errors.append("contract_issue_mismatch")
-        if linear.get("identifier") != identifier:
-            identity_errors.append("contract_identifier_mismatch")
-        if identity_errors:
-            return _reject(*identity_errors)
-
     validation = validate_dispatch_contract(
         value,
         current_planning_revision=current_planning_revision,
@@ -131,6 +119,16 @@ def admit_linear_issue(
         return AdmissionDecision(validation.outcome, validation.reasons, validation.contract)
     assert validation.contract is not None
     contract_value = validation.contract.to_dict()
+    linear = contract_value["linear"]
+    identity_errors = []
+    if linear["project_id"] != expected_project_id:
+        identity_errors.append("contract_project_mismatch")
+    if linear["issue_id"] != issue_id:
+        identity_errors.append("contract_issue_mismatch")
+    if linear["identifier"] != identifier:
+        identity_errors.append("contract_identifier_mismatch")
+    if identity_errors:
+        return _reject(*identity_errors)
     dry_run_authorization = validation.contract.dry_run_authorization
     if dry_run_authorization is not None:
         if not allow_dry_run_authorization:
@@ -139,7 +137,7 @@ def admit_linear_issue(
             return AdmissionDecision("not-admitted", ("dry_run_authorization_checkout_head_missing",), validation.contract)
         if current_checkout_head.lower() != dry_run_authorization["checkout_head_sha"].lower():
             return AdmissionDecision("not-admitted", ("dry_run_authorization_checkout_head_mismatch",), validation.contract)
-    revision = contract_value["linear"]["planning_revision"]
+    revision = linear["planning_revision"]
     if validation.contract.dispatch_id != f"{identifier}@{revision}":
         return AdmissionDecision("not-admitted", ("dispatch_id_not_bound_to_issue_revision",), validation.contract)
 

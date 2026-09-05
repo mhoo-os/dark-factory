@@ -115,6 +115,16 @@ class AdmissionTests(unittest.TestCase):
         )
         self.assertEqual(mismatch.reasons, ("dry_run_authorization_checkout_head_mismatch",))
 
+    def test_linear_self_link_serialization_canonicalizes_before_identity_and_digest(self) -> None:
+        linked = valid_issue()
+        linked_contract = json.loads(linked["description"].split("\n")[1])
+        linked_contract["linear"]["identifier"] = "[MHO-900](https://linear.app/mhoo/issue/MHO-900/example)"
+        linked["description"] = contract_block(linked_contract)
+        direct = admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID)
+        normalized = admit_linear_issue(linked, expected_project_id=PROJECT_ID)
+        self.assertEqual(normalized.outcome, "admitted")
+        self.assertEqual(normalized.digest, direct.digest)
+
 
 if __name__ == "__main__":
     unittest.main()
