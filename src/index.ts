@@ -202,7 +202,10 @@ type AgentResult = {
   validation_digest?: string;
   validation_bytes?: number;
   changed_files?: string[];
+  files?: Array<{ path: string; content: string }>;
+  source_digest?: string;
 };
+type TrustedSource = { repository: string; baseSha: string; archive: string; digest: string };
 type PullRequest = {
   number: number;
   html_url: string;
@@ -243,6 +246,44 @@ function sandboxCredentials(env: Env, contract: Contract): SandboxCredentials {
 
 function sandboxRemote(repository: string): string {
   return `https://github.com/${repository}.git`;
+}
+
+function authenticatedSandboxRemote(repository: string, token: string): string {
+  if (!REPOSITORY.test(repository) || token.length === 0) throw new Error("trusted_source_identity_invalid");
+  return `https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`;
+}
+
+function base64(bytes: Uint8Array): string {
+  let value = "";
+  for (const byte of bytes) value += String.fromCharCode(byte);
+  return btoa(value);
+}
+
+async function archiveDigest(bytes: Uint8Array): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+  return `sha256:${[...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function trustedSource(env: Env, repository: string, baseSha: string): Promise<TrustedSource> {
+  const token = secret(env, "GITHUB_TOKEN");
+  if (!token || !REPOSITORY.test(repository) || !SHA40.test(baseSha)) throw new Error("trusted_source_identity_invalid");
+  const commit = await githubRequest(token, "GET", `/repos/${repositoryPath(repository)}/commits/${baseSha}`);
+  if (Array.isArray(commit) || commit.sha !== baseSha) throw new Error("trusted_source_sha_mismatch");
+  const response = await fetch(`https://api.github.com/repos/${repositoryPath(repository)}/tarball/${baseSha}`, {
+    headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": GITHUB_API_VERSION },
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+  });
+  const length = Number(response.headers.get("content-length"));
+  if (!response.ok || !Number.isSafeInteger(length) || length < 1 || length > 4 * 1024 * 1024) throw new Error("trusted_source_archive_invalid");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength !== length) throw new Error("trusted_source_archive_truncated");
+  return { repository, baseSha, archive: base64(bytes), digest: await archiveDigest(bytes) };
+}
+
+async function materializeInCandidateSandbox(sandbox: ReturnType<typeof getSandbox>, source: TrustedSource): Promise<boolean> {
+  await sandbox.writeFile("/tmp/factory-source.tar.gz", source.archive, { encoding: "base64" });
+  const extracted = await sandbox.exec("rm -rf /workspace/project && mkdir -p /workspace/project && tar -xzf /tmp/factory-source.tar.gz --strip-components=1 -C /workspace/project && rm -f /tmp/factory-source.tar.gz && test ! -e /workspace/project/.git", { timeout: 60_000 });
+  return extracted.success;
 }
 
 function pullRequestMarker(runId: string, dispatchId: string): string {
@@ -1356,8 +1397,10 @@ function agentResult(value: unknown): AgentResult {
     if (item.cost_usd !== usage.cost_usd) throw new Error("agent_provider_cost_mismatch");
   }
   if (item.changed_files !== undefined && (!Array.isArray(item.changed_files) || item.changed_files.length > 12 || item.changed_files.some((path) => typeof path !== "string" || path.length === 0 || path.length > 512 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")))) throw new Error("agent_changed_files_invalid");
-  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "cost_usd", "provider_usage"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
-  if (result.status === "passed" && (!result.branch || !result.head_sha || item.cost_usd === undefined || providerUsage === undefined)) throw new Error("agent_success_identity_or_provider_cost_missing");
+  if (item.source_digest !== undefined && (typeof item.source_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(item.source_digest))) throw new Error("agent_source_digest_invalid");
+  if (item.files !== undefined && (!Array.isArray(item.files) || item.files.length === 0 || item.files.length > 12 || item.files.some((file) => !file || typeof file !== "object" || Array.isArray(file) || typeof (file as ObjectValue).path !== "string" || typeof (file as ObjectValue).content !== "string" || String((file as ObjectValue).content).length > MAX_PROVIDER_BODY_BYTES))) throw new Error("agent_files_invalid");
+  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "files", "source_digest", "cost_usd", "provider_usage"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
+  if (result.status === "passed" && !result.files && (!result.branch || !result.head_sha || item.cost_usd === undefined || providerUsage === undefined)) throw new Error("agent_success_identity_or_handoff_missing");
   return result;
 }
 
@@ -1440,31 +1483,34 @@ type GroundingResult = { status: "passed" | "failed"; reason: string; digest: st
 type ReviewResult = { status: "passed" | "failed"; reason: string; digest: string; bytes: number };
 
 async function groundInSandbox(env: Env, job: Job): Promise<GroundingResult> {
-  let credentials: SandboxCredentials;
-  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
-    const reason = error instanceof Error ? error.message : "grounding_credentials_missing";
+  try {
+    const source = await trustedSource(env, job.contract.target.repository, job.contract.target.base_sha);
+    return { status: "passed", reason: "grounded_private_exact_base", digest: source.digest, bytes: Math.floor(source.archive.length * 3 / 4), file_count: 0 };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "grounding_unavailable";
     return { status: "failed", reason, digest: await textDigest(reason), bytes: 0, file_count: 0 };
   }
-  const repository = job.contract.target.repository;
-  const baseSha = job.contract.target.base_sha;
-  const sandbox = getSandbox(env.Sandbox, `ground-${job.runId}`);
-  try {
-    // Grounding handles untrusted repository bytes, never a credentialed remote.
-    const checkout = await sandbox.gitCheckout(sandboxRemote(repository), { depth: 1, targetDir: "/workspace/project" });
-    if (!checkout.success) return { status: "failed", reason: "grounding_checkout_failed", digest: await textDigest("grounding_checkout_failed"), bytes: 0, file_count: 0 };
-    const exactBase = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${baseSha} && git -C /workspace/project checkout --detach ${baseSha}`, { timeout: 60_000 });
-    if (!exactBase.success) return { status: "failed", reason: "grounding_base_unavailable", digest: await textDigest("grounding_base_unavailable"), bytes: 0, file_count: 0 };
-    const status = await sandbox.exec("git -C /workspace/project status --porcelain=v1 --untracked-files=all", { timeout: 30_000 });
-    const files = await sandbox.exec("git -C /workspace/project ls-files", { timeout: 30_000 });
-    const output = boundedTextValue(`${status.stdout}\n${status.stderr}\n${files.stdout}\n${files.stderr}`);
-    const fileCount = files.stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).length;
-    if (!status.success || !files.success || status.stdout.trim()) return { status: "failed", reason: "grounding_checkout_not_clean", digest: await textDigest(output), bytes: output.length, file_count: fileCount };
-    return { status: "passed", reason: "grounded_exact_base", digest: await textDigest(output), bytes: output.length, file_count: fileCount };
-  } catch {
-    return { status: "failed", reason: "grounding_unavailable", digest: await textDigest("grounding_unavailable"), bytes: 0, file_count: 0 };
-  } finally {
-    try { await sandbox.destroy(); } catch { /* the failed cleanup remains an operational signal */ }
-  }
+}
+
+async function trustedModelProposal(env: Env, job: Job, model: CanonicalModel, remainingCostUsd: number, findings: string[]): Promise<{ files: Array<{ path: string; content: string }>; usage: NonNullable<AgentResult["provider_usage"]> }> {
+  const key = secret(env, "OPENROUTER_API_KEY");
+  const limits = executionLimits(job.contract);
+  const requestMaxTokens = Math.min(limits.maxOutputTokens, Math.floor((remainingCostUsd - limits.requestOverheadUsd) / limits.outputTokenUsd));
+  if (!key || !Number.isSafeInteger(requestMaxTokens) || requestMaxTokens < 1) throw new Error("remaining_cost_exhausted");
+  const prompt = { repository: job.contract.target.repository, issue: job.contract.linear.identifier, acceptance_criteria: job.contract.acceptance_criteria, allowed_scope: job.contract.allowed_scope, fix_findings: findings.slice(0, 16), instruction: "Return JSON only: {files:[{path,content}]}." };
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: model.model, temperature: 0, max_tokens: requestMaxTokens, messages: [{ role: "system", content: "You are a bounded code editor." }, { role: "user", content: JSON.stringify(prompt) }] }), signal: AbortSignal.timeout(Math.min(PROVIDER_TIMEOUT_MS, limits.timeoutSeconds * 1000)) });
+  const text = await response.text();
+  if (!response.ok || text.length > MAX_PROVIDER_BODY_BYTES) throw new Error("model_request_failed");
+  let envelope: ObjectValue; try { envelope = JSON.parse(text) as ObjectValue; } catch { throw new Error("model_response_invalid"); }
+  const rawUsage = envelope.usage as ObjectValue | undefined;
+  const usage = rawUsage && typeof envelope.model === "string" && typeof envelope.id === "string" && Number.isSafeInteger(envelope.created) && Number.isSafeInteger(rawUsage.prompt_tokens) && Number.isSafeInteger(rawUsage.completion_tokens) && Number.isSafeInteger(rawUsage.total_tokens) && typeof rawUsage.cost === "number" && rawUsage.total_tokens === Number(rawUsage.prompt_tokens) + Number(rawUsage.completion_tokens)
+    ? { provider: "openrouter" as const, model: envelope.model, generation_id: envelope.id, provider_created_at: envelope.created as number, prompt_tokens: rawUsage.prompt_tokens as number, completion_tokens: rawUsage.completion_tokens as number, total_tokens: rawUsage.total_tokens as number, cost_usd: rawUsage.cost as number } : null;
+  if (!usage || usage.cost_usd < 0 || usage.cost_usd > remainingCostUsd || !providerReceiptMatchesCanonical(usage, model)) throw new Error("provider_usage_or_identity_invalid");
+  const content = (envelope.choices as Array<ObjectValue> | undefined)?.[0]?.message as ObjectValue | undefined;
+  let proposal: unknown; try { proposal = JSON.parse(String(content?.content ?? "")); } catch { throw new Error("model_files_invalid"); }
+  const files = (proposal as ObjectValue)?.files;
+  if (!Array.isArray(files) || files.length === 0 || files.length > job.contract.allowed_scope.max_files || files.some((file) => !file || typeof file !== "object" || typeof (file as ObjectValue).path !== "string" || typeof (file as ObjectValue).content !== "string")) throw new Error("model_file_scope_invalid");
+  return { files: files as Array<{ path: string; content: string }>, usage };
 }
 
 async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, remainingCostUsd: number, attempt = 0, findings: string[] = []): Promise<AgentResult> {
@@ -1479,16 +1525,17 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
   if (configuredModel !== model.model) return { status: "needs-human", reason: "openrouter_model_env_mismatch" };
   const repository = job.contract.target.repository;
   const baseSha = job.contract.target.base_sha;
-  // Candidate code runs only against a public read remote. The agent strips
-  // secrets from every child it executes and configures push credentials only
-  // after validation has completed.
-  const remote = sandboxRemote(repository);
+  let proposal: Awaited<ReturnType<typeof trustedModelProposal>>;
+  let source: TrustedSource;
+  try {
+    proposal = await trustedModelProposal(env, job, model, remainingCostUsd, findings);
+    source = await trustedSource(env, repository, baseSha);
+  } catch (error) {
+    return { status: "needs-human", reason: error instanceof Error ? error.message : "trusted_acquisition_failed" };
+  }
   const sandbox = getSandbox(env.Sandbox, `execution-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(remote, { depth: 1, targetDir: "/workspace/project" });
-    if (!checkout.success) return { status: "needs-human", reason: "repository_checkout_failed" };
-    const exactBase = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${baseSha} && git -C /workspace/project checkout --detach ${baseSha}`, { timeout: 60_000 });
-    if (!exactBase.success) return { status: "needs-replan", reason: "base_sha_unavailable" };
+    if (!await materializeInCandidateSandbox(sandbox, source)) return { status: "needs-human", reason: "trusted_source_materialization_failed" };
     const result = await sandbox.exec(env.SANDBOX_COMMAND, {
       cwd: "/workspace/project",
       timeout: Math.min(limits.timeoutSeconds, remainingSeconds) * 1_000,
@@ -1499,7 +1546,8 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
         FACTORY_REPOSITORY: repository,
         FACTORY_BASE_SHA: baseSha,
         FACTORY_ATTEMPT: String(attempt),
-        FACTORY_FINDINGS_JSON: stable(findings.slice(0, 16)),
+        FACTORY_SOURCE_DIGEST: source.digest,
+        FACTORY_PROPOSAL_JSON: stable(proposal.files),
         FACTORY_VALIDATION_COMMAND: validationCommand(job.contract.validation_profile),
         FACTORY_MAX_ITERATIONS: "8",
         FACTORY_MAX_COMMANDS: "24",
@@ -1509,20 +1557,48 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
         FACTORY_OUTPUT_TOKEN_USD: String(limits.outputTokenUsd),
         FACTORY_REQUEST_OVERHEAD_USD: String(limits.requestOverheadUsd),
         FACTORY_TIMEOUT_SECONDS: String(Math.min(limits.timeoutSeconds, remainingSeconds)),
-        GITHUB_TOKEN: credentials.githubToken,
-        OPENROUTER_API_KEY: credentials.openRouterKey,
-        OPENROUTER_MODEL: model.model,
-        FACTORY_MODEL_PROVIDER: model.provider,
       },
     }) as SandboxExecResult;
     const agent = parseAgentResult(result);
-    if (agent.provider_usage && !providerReceiptMatchesCanonical(agent.provider_usage, model)) return { status: "needs-human", reason: "provider_receipt_model_mismatch" };
-    return agent;
+    if (agent.source_digest !== source.digest || !agent.files) return { status: "needs-human", reason: "candidate_handoff_invalid" };
+    return { ...agent, cost_usd: proposal.usage.cost_usd, provider_usage: proposal.usage };
   } catch {
     return { status: "needs-human", reason: "sandbox_execution_failed" };
   } finally {
     try { await sandbox.destroy(); } catch { /* evidence is recorded by the caller */ }
   }
+}
+
+async function trustedPublishCandidate(env: Env, job: Job, candidate: AgentResult): Promise<AgentResult> {
+  const token = secret(env, "GITHUB_TOKEN");
+  if (!token || !candidate.files || !candidate.source_digest) return { status: "needs-human", reason: "publication_handoff_missing" };
+  const branch = `factory/${job.contract.linear.identifier.toLowerCase()}-${job.runId.slice(-12)}`;
+  const sandbox = getSandbox(env.Sandbox, `publication-${job.runId}`);
+  try {
+    const checkout = await sandbox.gitCheckout(authenticatedSandboxRemote(job.contract.target.repository, token), { depth: 1, targetDir: "/workspace/project" });
+    if (!checkout.success) return { status: "needs-human", reason: "trusted_private_checkout_failed" };
+    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project checkout --detach ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${sandboxRemote(job.contract.target.repository)} && git -C /workspace/project config --unset-all credential.helper || true`, { timeout: 60_000 });
+    if (!base.success) return { status: "needs-replan", reason: "trusted_base_unavailable" };
+    for (const file of candidate.files) {
+      if (!validCandidateFile(file, job.contract)) return { status: "needs-human", reason: "publication_handoff_scope_invalid" };
+      await sandbox.writeFile(`/workspace/project/${file.path}`, file.content);
+    }
+    const commit = await sandbox.exec(`git -C /workspace/project -c core.hooksPath=/dev/null -c user.name='Mhoo Factory' -c user.email='factory@mhoo.invalid' checkout -b ${branch} && git -C /workspace/project -c core.hooksPath=/dev/null add -- ${candidate.files.map((file) => file.path).join(" ")} && git -C /workspace/project -c core.hooksPath=/dev/null commit -m 'factory(${job.contract.linear.identifier}): bounded implementation' && git -C /workspace/project rev-parse HEAD`, { timeout: 60_000 });
+    const head = commit.stdout.trim().split(/\r?\n/).at(-1) ?? "";
+    if (!commit.success || !SHA40.test(head)) return { status: "needs-human", reason: "trusted_commit_failed" };
+    const header = btoa(`x-access-token:${token}`);
+    const push = await sandbox.exec(`git -C /workspace/project -c core.hooksPath=/dev/null -c credential.helper= -c http.extraHeader='Authorization: Basic ${header}' push origin HEAD:refs/heads/${branch}`, { timeout: 120_000 });
+    if (!push.success) return { status: "needs-human", reason: "trusted_push_failed" };
+    return { ...candidate, branch, head_sha: head };
+  } catch {
+    return { status: "needs-human", reason: "trusted_publication_unavailable" };
+  } finally {
+    try { await sandbox.destroy(); } catch { /* candidate and publisher never share a sandbox */ }
+  }
+}
+
+function validCandidateFile(file: { path: string; content: string }, contract: Contract): boolean {
+  return typeof file.path === "string" && typeof file.content === "string" && file.path.length > 0 && file.path.length < 512 && !file.path.startsWith("/") && !file.path.split("/").some((part) => !part || part === "." || part === "..") && pathMatchesScope(file.path, contract.allowed_scope.paths) && !protectedPath(file.path);
 }
 
 async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ValidationResult> {
@@ -1537,11 +1613,11 @@ async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): P
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `validation-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(sandboxRemote(repository), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(authenticatedSandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_checkout_failed"), output_bytes: 0, reason: "validation_checkout_failed", fixable: false };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
     if (!head.success || head.stdout.trim() !== agent.head_sha) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_head_mismatch"), output_bytes: Math.min(MAX_PROVIDER_BODY_BYTES, head.stdout.length + head.stderr.length), reason: "validation_head_mismatch", fixable: false };
-    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project diff --check ${job.contract.target.base_sha} HEAD`, { timeout: 60_000 });
+    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${sandboxRemote(repository)} && git -C /workspace/project diff --check ${job.contract.target.base_sha} HEAD`, { timeout: 60_000 });
     const checks = await sandbox.exec(`sh -lc ${JSON.stringify(validationCommand(job.contract.validation_profile))}`, { cwd: "/workspace/project", timeout: limits.timeoutSeconds * 1_000 }) as SandboxExecResult;
     const output = `${base.stdout}\n${base.stderr}\n${checks.stdout}\n${checks.stderr}`;
     const passed = base.success && checks.success;
@@ -1565,10 +1641,10 @@ async function reviewInFreshSandbox(env: Env, job: Job, agent: AgentResult): Pro
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `review-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(sandboxRemote(repository), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(authenticatedSandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", reason: "review_checkout_failed", digest: await textDigest("review_checkout_failed"), bytes: 0 };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
-    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha}`, { timeout: 60_000 });
+    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${sandboxRemote(repository)}`, { timeout: 60_000 });
     const names = await sandbox.exec(`git -C /workspace/project diff --name-only ${job.contract.target.base_sha} HEAD`, { timeout: 30_000 });
     const stats = await sandbox.exec(`git -C /workspace/project diff --numstat ${job.contract.target.base_sha} HEAD`, { timeout: 30_000 });
     const whitespace = await sandbox.exec(`git -C /workspace/project diff --check ${job.contract.target.base_sha} HEAD`, { timeout: 30_000 });
@@ -1958,12 +2034,19 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
           await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes, provider_usage: result.provider_usage });
           return result;
         });
-        if (execution.status === "needs-replan" || execution.status === "needs-human" || !execution.branch || !execution.head_sha || (execution.status === "failed" && execution.reason !== "validation_failed")) {
+        if (execution.status === "needs-replan" || execution.status === "needs-human" || !execution.files || (execution.status === "failed" && execution.reason !== "validation_failed")) {
           const state = execution.status === "needs-replan" ? "needs-replan" : execution.status === "failed" ? "failed" : "needs-human";
           return await finish(state, execution.reason, { head_sha: execution.head_sha ?? null, branch: execution.branch ?? null });
         }
         cumulativeCostUsd += execution.cost_usd ?? Number.POSITIVE_INFINITY;
         if (!Number.isFinite(cumulativeCostUsd) || cumulativeCostUsd > runtimeLimits.costUsd) return await finish("needs-human", "cost_cap_exceeded", { cost_usd: cumulativeCostUsd, cost_cap_usd: runtimeLimits.costUsd });
+        execution = await activeWorkflowStep<AgentResult>(step, `trusted-publication-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<AgentResult> => {
+          const result = await trustedPublishCandidate(this.env, job, execution as AgentResult);
+          assertActive();
+          await recordStep(this.env.DB, job.runId, `trusted-publication-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, source_digest: result.source_digest });
+          return result;
+        });
+        if (execution.status !== "passed" || !execution.branch || !execution.head_sha) return await finish(execution.status === "needs-replan" ? "needs-replan" : "needs-human", execution.reason);
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_validation", { head_sha: execution.head_sha, branch: execution.branch });
         assertActive();
         await transitionRun(this.env.DB, job.runId, "validating", "workflow", `workflow:validating:${job.runId}:${attempt}`, { leaseFence: run.lease_fence ?? undefined });
@@ -2058,6 +2141,9 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
 export const __TEST_ONLY__ = {
   sandboxCredentials,
   sandboxRemote,
+  trustedSource,
+  authenticatedSandboxRemote,
+  validCandidateFile,
   inherentEffectClasses,
   capacityLeaseScopes,
   runtimeConcurrencyLimits,

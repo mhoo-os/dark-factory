@@ -97,6 +97,28 @@ describe("local Worker control-plane behavior", () => {
     expect(__TEST_ONLY__.inherentEffectClasses(contract)).toEqual(["repository-write"]);
   });
 
+  it("binds a private exact-SHA archive before the credential-free candidate handoff", async () => {
+    const originalFetch = globalThis.fetch;
+    const bytes = new TextEncoder().encode("dummy-private-source");
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/mhoo-os/other/")) return Response.json({ sha: "b".repeat(40) });
+      if (url.includes(`/commits/${contract.target.base_sha}`)) return Response.json({ sha: contract.target.base_sha });
+      if (url.includes(`/tarball/${contract.target.base_sha}`)) return new Response(bytes, { headers: { "content-length": String(bytes.byteLength) } });
+      throw new Error(`unexpected request ${url}`);
+    };
+    try {
+      const source = await __TEST_ONLY__.trustedSource({ GITHUB_TOKEN: "dummy-private-token" } as never, contract.target.repository, contract.target.base_sha);
+      expect(source).toMatchObject({ repository: contract.target.repository, baseSha: contract.target.base_sha });
+      expect(source.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(source.archive).not.toContain("dummy-private-token");
+      expect(__TEST_ONLY__.authenticatedSandboxRemote(contract.target.repository, "dummy-private-token")).toContain("x-access-token:");
+      expect(__TEST_ONLY__.validCandidateFile({ path: "tests/only.ts", content: "ok" }, contract as never)).toBe(true);
+      expect(__TEST_ONLY__.validCandidateFile({ path: ".git/config", content: "x" }, contract as never)).toBe(false);
+      await expect(__TEST_ONLY__.trustedSource({ GITHUB_TOKEN: "dummy-private-token" } as never, "mhoo-os/other" , contract.target.base_sha)).rejects.toThrow();
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
   it("admits only registry-owned human, allowlisted authority and rejects broadened authority", async () => {
     const issue = {
       project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" },
@@ -263,7 +285,7 @@ describe("local Worker control-plane behavior", () => {
     const step = { do: async (name: string, _options: unknown, callback: () => Promise<unknown>) => { steps.push(name); return await callback(); } };
     const instance = Object.create(ExecutionWorkflow.prototype) as ExecutionWorkflow;
     Object.defineProperty(instance, "env", { value: Object.assign(Object.create(env), { MAX_COST_USD: "8", MAX_FIX_ATTEMPTS: "0", OPENROUTER_MODEL: "z-ai/glm-5.3-flash" }) });
-    await expect(instance.run({ payload: { kind: "dispatch", dispatchId: workflowContract.dispatch_id, runId: workflowRunId, contractDigest: digest, contract: workflowContract } } as never, step as never)).resolves.toMatchObject({ status: "needs-human", reason: "workflow_step_failed" });
+    await expect(instance.run({ payload: { kind: "dispatch", dispatchId: workflowContract.dispatch_id, runId: workflowRunId, contractDigest: digest, contract: workflowContract } } as never, step as never)).resolves.toMatchObject({ status: "needs-human", reason: "trusted_source_identity_invalid" });
     expect(steps).toEqual(expect.arrayContaining(["ground", "finalize", "release-lease"]));
     await expect(env.DB.prepare("SELECT current_state,lease_fence FROM factory_runs WHERE run_id=?").bind(workflowRunId).first()).resolves.toMatchObject({ current_state: "needs-human", lease_fence: null });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(workflowRunId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
