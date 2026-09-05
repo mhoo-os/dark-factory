@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
-import { handleChatLaneRequest, isChatLaneAdmin } from "../src/chat-lane-registry.ts";
+import { handleChatLaneRequest, isChatLaneAdmin, recoverExpiredChatLanes } from "../src/chat-lane-registry.ts";
 
 const migration4 = await readFile(new URL("../migrations/0004_chat_lane_registry.sql", import.meta.url), "utf8");
 const migration5 = await readFile(new URL("../migrations/0005_chat_lane_transition_guards.sql", import.meta.url), "utf8");
+const migration6 = await readFile(new URL("../migrations/0006_chat_lane_activation_guard.sql", import.meta.url), "utf8");
 const source = await readFile(new URL("../src/chat-lane-registry.ts", import.meta.url), "utf8");
 const index = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
 
@@ -14,18 +15,20 @@ function db() {
   database.exec("CREATE TABLE factory_schema_meta(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)");
   database.exec(migration4);
   database.exec(migration5);
+  database.exec(migration6);
   database.prepare("UPDATE chat_lanes SET chat_id=?,status='IDLE',updated_at=? WHERE lane_id='review-1'").run("chat-review-0001", "2026-09-05T00:00:00.000Z");
   return database;
 }
 
 class D1 {
-  constructor(database) { this.database = database; }
+  constructor(database, triggerInclusive = false) { this.database = database; this.triggerInclusive = triggerInclusive; }
   prepare(sql) {
     let values = [];
     const thisDatabase = this.database;
+    const triggerInclusive = this.triggerInclusive;
     return {
       bind(...next) { values = next; return this; },
-      async run() { const result = thisDatabase.prepare(sql).run(...values); return { meta: { changes: result.changes } }; },
+      async run() { const result = thisDatabase.prepare(sql).run(...values); return { meta: { changes: result.changes === 0 ? 0 : triggerInclusive ? 3 : result.changes } }; },
       async first() { return thisDatabase.prepare(sql).get(...values) ?? null; },
       async all() { return { results: thisDatabase.prepare(sql).all(...values) }; },
     };
@@ -45,7 +48,7 @@ function lease(database, id, expiresAt = "2099-09-05T00:10:00.000Z") {
 
 function transition(database, assignment, status, reason, at) {
   return database.prepare("UPDATE chat_lane_assignments SET status=?,transition_reason=?,updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status=?").run(
-    status, reason, at, assignment.assignment_id, assignment.lease_token, assignment.lease_fence, assignment.status,
+    status, `mho250-v2:${reason}`, at, assignment.assignment_id, assignment.lease_token, assignment.lease_fence, assignment.status,
   );
 }
 
@@ -55,7 +58,7 @@ test("fresh migration provisions ten fail-closed slots and the additive guard sc
   assert.equal(database.prepare("SELECT count(*) AS n FROM chat_lanes WHERE status='REPLACE'").get().n, 9);
   const columns = database.prepare("PRAGMA table_info(chat_lane_assignments)").all().map((row) => row.name);
   assert.deepEqual(columns.filter((name) => ["transition_reason", "attested_by", "attested_at"].includes(name)).sort(), ["attested_at", "attested_by", "transition_reason"]);
-  assert.equal(database.prepare("SELECT schema_version AS version FROM factory_schema_meta WHERE schema_name='factory-ledger'").get().version, 5);
+  assert.equal(database.prepare("SELECT schema_version AS version FROM factory_schema_meta WHERE schema_name='factory-ledger'").get().version, 6);
 });
 
 test("a winning completion atomically releases the lane and writes exactly one truthful event", () => {
@@ -202,6 +205,30 @@ test("handler reads a live lease then rejects mutation after expiry", async () =
   assert.equal(response.status, 409);
   assert.equal(database.prepare("SELECT status FROM chat_lane_assignments WHERE assignment_id=?").get(assignment.assignment_id).status, "RUNNING");
   assert.equal(database.prepare("SELECT count(*) AS n FROM chat_lane_events WHERE assignment_id=?").get(assignment.assignment_id).n, 1);
+});
+
+test("D1 trigger-inclusive change accounting acknowledges winners and recovery", async () => {
+  const database = db();
+  const d1 = new D1(database, true);
+  const assignment = { repository: "mhoo-os/dark-factory", pr_number: 29, linear_issue_id: "MHO-250", target_head_sha: "be74f4d21d6be28751d62734dcbb4716db382cc6", review_id: "MHOO-RL3-MHO-250-PR29-be74f4d21d6b-R1", verdict: "REQUEST CHANGES" };
+  const leased = await handleChatLaneRequest(new Request("https://example.test/chat-lanes/lease", { method: "POST", body: JSON.stringify({ lane_type: "review", idempotency_key: "d1-counts", assignment }) }), d1);
+  const leaseBody = await leased.json();
+  assert.equal((await handleChatLaneRequest(new Request(`https://example.test/chat-lane-assignments/${leaseBody.assignment_id}`, { method: "POST", body: JSON.stringify({ lease_token: leaseBody.lease_token, status: "PUBLISHING" }) }), d1)).status, 200);
+  assert.equal((await handleChatLaneRequest(new Request(`https://example.test/chat-lane-assignments/${leaseBody.assignment_id}`, { method: "POST", body: JSON.stringify({ lease_token: leaseBody.lease_token, status: "COMPLETED", output_digest: "sha256:" + "a".repeat(64), linear_output_url: "https://linear.app/mhoo/issue/MHO-250/trigger-bounded-chatgpt-work-autofix-from-trusted-pr-review-comments#comment-95d702de-076a-421c-aece-e83430cb0070", github_output_url: "https://github.com/mhoo-os/dark-factory/pull/29#issuecomment-5548673763", completion_manifest: { ...assignment, verification: { method: "authenticated_operator_v1", attested_by: "operator-1", attested_at: "2026-09-05T00:00:00.000Z" } } }) }), d1)).status, 200);
+  const expired = lease(database, "assignment-00000000-0000-4000-8000-000000000009", "2000-01-01T00:00:00.000Z");
+  assert.equal(await recoverExpiredChatLanes(d1, new Date("2026-09-05T00:00:00.000Z")), 1);
+  assert.equal(database.prepare("SELECT status FROM chat_lane_assignments WHERE assignment_id=?").get(expired.assignment_id).status, "BLOCKED");
+});
+
+test("readiness refuses absent and schema-4 registry routes without writes", async () => {
+  const absent = new DatabaseSync(":memory:");
+  absent.exec("CREATE TABLE factory_schema_meta(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)");
+  assert.equal((await handleChatLaneRequest(new Request("https://example.test/chat-lanes/lease", { method: "POST", body: "{}" }), new D1(absent))).status, 503);
+  const schema4 = new DatabaseSync(":memory:");
+  schema4.exec("CREATE TABLE factory_schema_meta(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)");
+  schema4.exec(migration4);
+  assert.equal((await handleChatLaneRequest(new Request("https://example.test/chat-lanes/lease", { method: "POST", body: "{}" }), new D1(schema4))).status, 503);
+  assert.equal(schema4.prepare("SELECT count(*) AS n FROM chat_lane_assignments").get().n, 0);
 });
 
 test("six concurrent handler leases atomically claim five slots with no leaked sixth receipt", async () => {

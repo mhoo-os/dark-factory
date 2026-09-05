@@ -53,8 +53,23 @@ function exactGithubCommentUrl(value: unknown, repository: string, prNumber: num
 function exactLinearCommentUrl(value: unknown, issueId: string): string {
   const url = optionalText(value, "linear_output_url", /^https:\/\/linear\.app\//, 2_048);
   if (!url) throw new Error("linear_output_url_invalid");
-  const escaped = issueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (!new RegExp(`/issue/${escaped}/[^#]+#comment-[0-9a-f-]{36}$`, "i").test(url)) throw new Error("linear_output_binding_invalid");
+  const parsed = new URL(url);
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parsed.protocol !== "https:" || parsed.hostname !== "linear.app" || parts[0] !== "mhoo" ||
+      parts[1] !== "issue" || parts[2] !== issueId || parts.length !== 4 ||
+      !/^comment-[0-9a-f-]{36}$/i.test(parsed.hash.slice(1))) throw new Error("linear_output_binding_invalid");
+  return url;
+}
+
+function concreteGithubOutputUrl(value: unknown): string {
+  const url = optionalText(value, "github_output_url", /^https:\/\/github\.com\//, 2_048);
+  if (!url) throw new Error("github_output_url_invalid");
+  const parsed = new URL(url);
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parsed.protocol !== "https:" || parsed.hostname !== "github.com" || parts.length !== 4 ||
+      !/^[A-Za-z0-9_.-]+$/.test(parts[0]) || !/^[A-Za-z0-9_.-]+$/.test(parts[1]) ||
+      !["pull", "issues"].includes(parts[2]) || !/^\d+$/.test(parts[3]) ||
+      !/^issuecomment-\d+$/.test(parsed.hash.slice(1))) throw new Error("github_output_binding_invalid");
   return url;
 }
 
@@ -86,10 +101,12 @@ function completionEvidence(laneType: string, assignment: Json, payload: Json): 
     const prNumber = Number(assignment.pr_number);
     const linearIssueId = requiredText(assignment.linear_issue_id, "linear_issue_id", ISSUE);
     const targetHeadSha = requiredText(assignment.target_head_sha, "target_head_sha", SHA40);
+    const reviewId = requiredText(assignment.review_id, "review_id", REVIEW_ID);
+    const verdict = requiredText(assignment.verdict, "verdict", VERDICT);
     if (!Number.isSafeInteger(prNumber) || prNumber < 1 ||
         manifest.repository !== repository || Number(manifest.pr_number) !== prNumber ||
         manifest.linear_issue_id !== linearIssueId || manifest.target_head_sha !== targetHeadSha ||
-        manifest.review_id !== assignment.review_id || manifest.verdict !== assignment.verdict) throw new Error("completion_binding_invalid");
+        manifest.review_id !== reviewId || manifest.verdict !== verdict) throw new Error("completion_binding_invalid");
     return {
       linearUrl: exactLinearCommentUrl(payload.linear_output_url, linearIssueId),
       githubUrl: exactGithubCommentUrl(payload.github_output_url, repository, prNumber),
@@ -99,7 +116,7 @@ function completionEvidence(laneType: string, assignment: Json, payload: Json): 
   if ((assignment.linear_issue_id && manifest.linear_issue_id !== assignment.linear_issue_id) ||
       (assignment.objective && manifest.objective !== assignment.objective)) throw new Error("completion_binding_invalid");
   const linearUrl = assignment.linear_issue_id ? exactLinearCommentUrl(payload.linear_output_url, String(assignment.linear_issue_id)) : null;
-  const githubUrl = payload.github_output_url === undefined ? null : optionalText(payload.github_output_url, "github_output_url", /^https:\/\/github\.com\//, 2_048);
+  const githubUrl = payload.github_output_url === undefined ? null : concreteGithubOutputUrl(payload.github_output_url);
   if (!linearUrl && !githubUrl) throw new Error("completion_evidence_required");
   return { linearUrl, githubUrl, outputDigest, attestedBy, attestedAt };
 }
@@ -125,6 +142,14 @@ async function list(db: D1Database): Promise<Response> {
   return json({ lanes: lanes.results ?? [] });
 }
 
+async function registryReady(db: D1Database): Promise<boolean> {
+  try {
+    const meta = await db.prepare("SELECT schema_version FROM factory_schema_meta WHERE schema_name='factory-ledger'").first<{ schema_version: number }>();
+    const trigger = await db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name='chat_lane_assignment_transition_guard_v2'").first();
+    return Number(meta?.schema_version) >= 6 && Boolean(trigger);
+  } catch { return false; }
+}
+
 export function isChatLaneAdmin(request: Request, adminSecret: string | null): boolean {
   return Boolean(adminSecret) && request.headers.get("Authorization") === `Bearer ${adminSecret}`;
 }
@@ -136,7 +161,7 @@ async function register(request: Request, db: D1Database, laneId: string): Promi
   const result = await db.prepare(
     "UPDATE chat_lanes SET chat_id=?,status='IDLE',updated_at=? WHERE lane_id=? AND status IN ('REPLACE','BLOCKED','IDLE') AND current_assignment_id IS NULL",
   ).bind(chatId, now, laneId).run();
-  if (result.meta.changes !== 1) return json({ error: "lane_not_registerable" }, 409);
+  if (result.meta.changes < 1) return json({ error: "lane_not_registerable" }, 409);
   return json({ lane_id: laneId, chat_id: chatId, status: "IDLE" });
 }
 
@@ -211,15 +236,15 @@ async function transition(request: Request, db: D1Database, assignmentId: string
     return json({ error: error instanceof Error ? error.message : "completion_evidence_required" }, 422);
   }
   const assignmentStatus = requested === "REPLACE" ? "BLOCKED" : requested;
-  const reason = requested === "REPLACE" ? "replace" : "operator_transition";
+  const reason = requested === "REPLACE" ? "mho250-v2:replace" : "mho250-v2:operator_transition";
   // The migration trigger owns lane state and event insertion. Its guard raises
   // inside SQLite if the assignment/lane/token/fence/expiry snapshot no longer
   // agrees, which rolls this assignment update back instead of committing a split state.
   const result = await db.prepare(
     "UPDATE chat_lane_assignments SET status=?,transition_reason=?,linear_output_url=COALESCE(?,linear_output_url),github_output_url=COALESCE(?,github_output_url),output_digest=COALESCE(?,output_digest),verified_at=CASE WHEN ?='COMPLETED' THEN ? ELSE verified_at END,completed_at=CASE WHEN ?='COMPLETED' THEN ? ELSE completed_at END,attested_by=COALESCE(?,attested_by),attested_at=COALESCE(?,attested_at),updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status=? AND lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND EXISTS (SELECT 1 FROM chat_lanes WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND status=?)",
   ).bind(assignmentStatus, reason, evidence.linearUrl, evidence.githubUrl, evidence.outputDigest, requested, now, requested, now, evidence.attestedBy, evidence.attestedAt, now, assignmentId, leaseToken, current.lease_fence, current.status, current.lane_id, assignmentId, leaseToken, current.lease_fence, current.status).run();
-  if (result.meta.changes !== 1) return json({ error: "lease_fenced_or_expired" }, 409);
-  const laneStatus = requested === "COMPLETED" ? "IDLE" : assignmentStatus;
+  if (result.meta.changes < 1) return json({ error: "lease_fenced_or_expired" }, 409);
+  const laneStatus = requested === "COMPLETED" ? "IDLE" : requested === "REPLACE" ? "REPLACE" : assignmentStatus;
   return json({ assignment_id: assignmentId, lane_id: current.lane_id, status: assignmentStatus, lane_status: laneStatus });
 }
 
@@ -231,15 +256,17 @@ export async function recoverExpiredChatLanes(db: D1Database, now = new Date()):
   let recovered = 0;
   for (const lane of expired.results ?? []) {
     const result = await db.prepare(
-      "UPDATE chat_lane_assignments SET status='BLOCKED',transition_reason='lease_expired',updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status IN ('RUNNING','PUBLISHING') AND EXISTS (SELECT 1 FROM chat_lanes WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND lease_expires_at<=?)",
+      "UPDATE chat_lane_assignments SET status='BLOCKED',transition_reason='mho250-v2:lease_expired',updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status IN ('RUNNING','PUBLISHING') AND EXISTS (SELECT 1 FROM chat_lanes WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND lease_expires_at<=?)",
     ).bind(timestamp, lane.current_assignment_id, lane.lease_token, lane.lease_fence, lane.lane_id, lane.current_assignment_id, lane.lease_token, lane.lease_fence, timestamp).run();
-    if (result.meta.changes === 1) recovered += 1;
+    if (result.meta.changes >= 1) recovered += 1;
   }
   return recovered;
 }
 
 export async function handleChatLaneRequest(request: Request, db: D1Database): Promise<Response | null> {
   const url = new URL(request.url);
+  if (!url.pathname.startsWith("/chat-lane")) return null;
+  if (!(await registryReady(db))) return json({ error: "registry_unready" }, 503);
   if (url.pathname === "/chat-lanes" && request.method === "GET") return await list(db);
   if (url.pathname === "/chat-lanes/lease" && request.method === "POST") return await lease(request, db);
   if (url.pathname === "/chat-lanes/recover" && request.method === "POST") return json({ recovered: await recoverExpiredChatLanes(db) });
@@ -247,6 +274,5 @@ export async function handleChatLaneRequest(request: Request, db: D1Database): P
   if (registerMatch && request.method === "PUT") return await register(request, db, `${registerMatch[1]}-${registerMatch[2]}`);
   const transitionMatch = url.pathname.match(/^\/chat-lane-assignments\/(assignment-[0-9a-f-]{36})$/i);
   if (transitionMatch && request.method === "POST") return await transition(request, db, transitionMatch[1]);
-  if (url.pathname.startsWith("/chat-lane")) return json({ error: "not_found" }, 404);
-  return null;
+  return json({ error: "not_found" }, 404);
 }

@@ -35,7 +35,7 @@ different input fails closed.
 ## Mutation and recovery safety
 
 The assignment row is the authoritative mutation boundary. Additive migration
-`0005_chat_lane_transition_guards.sql` installs SQLite guards and after-update
+`0005_chat_lane_transition_guards.sql` plus the schema-6 activation marker install SQLite guards and after-update
 triggers so a status transition, matching lane state, and its one audit event
 commit together or roll back together. Token/fence/state and lease liveness are
 checked inside that transaction. An expired token cannot publish completion or
@@ -45,7 +45,7 @@ fence, so old token/fence pairs remain fenced.
 
 ## Upgrade, readiness, and rollback
 
-Apply migrations in numerical order, including 0005, to a local/staging database
+Apply migrations in numerical order, including 0006, to a local/staging database
 before enabling any registry route or relying on scheduled registry recovery.
 Until the registry tables are ready, registry endpoints fail closed. The
 scheduled handler isolates a registry-readiness failure, records it, and still
@@ -53,9 +53,9 @@ runs the pre-existing factory recovery sequence; it never reports a registry
 recovery success for an unready schema.
 
 The migrations are additive. A populated schema-4 upgrade preserves assignments
-and events; a fresh install runs 0004 then 0005. If source is rolled back, leave
-the registry tables, assignment history, and audit events in place. The 0005
-triggers activate only when the new source writes its explicit
+and events; a fresh install runs 0004, 0005, then 0006. If source is rolled back, leave
+the registry tables, assignment history, and audit events in place. Schema 6
+activates only when the new source writes its explicit v2
 `transition_reason`; the pre-0005 source continues to use its original
 statement batch without a trigger abort or duplicate event. That preserves an
 old-code rollback path, but it intentionally restores the old source's weaker
