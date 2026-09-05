@@ -11,7 +11,8 @@
     "test:contract": "node --test tests/d1-migration-sequence.test.mjs tests/chat-lane-registry.test.mjs tests/worker-contract.test.mjs tests/worker-dry-run-execution.test.mjs",
     "test:worker": "vitest run",
     "test": "npm run test:python && npm run test:sandbox && npm run test:contract && npm run test:worker",
-    "test:coverage": "npm run test:native && npm run test:contract && vitest run --coverage"
+    "test:native-policy": "node --test --experimental-test-coverage --test-coverage-include=native/launch-policy.mjs --test-coverage-include=native/containment-contract.mjs --test-coverage-include=native/codex-jsonl.mjs --test-coverage-lines=95 --test-coverage-branches=95 --test-coverage-functions=95 tests/native-launch-policy.test.mjs tests/containment-contract.test.mjs tests/codex-jsonl.test.mjs",
+    "test:coverage": "npm run test:native-policy && npm run test:native && npm run test:contract && vitest run --coverage"
   },
   "dependencies": {
     "@cloudflare/sandbox": "0.12.9"
