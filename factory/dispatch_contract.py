@@ -22,9 +22,13 @@ ISSUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$")
 REPOSITORY_PATTERN = re.compile(r"^mhoo-os/[a-z0-9][a-z0-9._-]{0,99}$")
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 BASE_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
-LINEAR_ISSUE_LINK_PATTERN = re.compile(
+LINEAR_MARKDOWN_ISSUE_LINK_PATTERN = re.compile(
     r"\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]"
     r"\(https://linear\.app/[A-Za-z0-9_-]+/issue/\1(?:/[A-Za-z0-9._-]+)?\)"
+)
+LINEAR_RICH_ISSUE_LINK_PATTERN = re.compile(
+    r'<issue id="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" '
+    r'href="https://linear\.app/[A-Za-z0-9_-]+/issue/([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)(?:/[A-Za-z0-9._-]+)?">\1</issue>'
 )
 UTC_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 DRY_RUN_MODE = "approved-intake"
@@ -125,7 +129,8 @@ def _dry_run_authorization_errors(value: Any, errors: list[str]) -> None:
 
 
 def _canonical_linear_issue_links(text: str) -> str:
-    return LINEAR_ISSUE_LINK_PATTERN.sub(r"\1", text)
+    markdown_canonical = LINEAR_MARKDOWN_ISSUE_LINK_PATTERN.sub(r"\1", text)
+    return LINEAR_RICH_ISSUE_LINK_PATTERN.sub(r"\1", markdown_canonical)
 
 
 def _normalize_linear_issue_links(value: Any) -> Any:

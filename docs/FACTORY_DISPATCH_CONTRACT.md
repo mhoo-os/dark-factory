@@ -9,12 +9,11 @@ Required data binds one Linear issue and planning revision to one `mhoo-os/<repo
 
 The `linear.issue_id` field is the immutable provider identity for the Linear issue, while `linear.identifier` is its human-readable key (for example, `MHO-199`). Admission must verify that both values refer to the same issue; neither value is accepted as a substitute for the other.
 
-Linear may automatically serialize a bare issue key as its own Markdown issue link when
-it stores a description. The validators canonicalize only that exact self-link form
-(`[` + identifier + `](https://linear.app/.../issue/` + identifier + `...)`) back to
-the identifier in `linear.identifier`, `dispatch_id`, and a temporary authorization ID
-before identity comparison and digesting. Other Markdown or URLs remain invalid contract
-identifiers.
+Linear may automatically serialize a bare issue key as its own Markdown or rich-text
+`<issue …>` self-link when it stores a description. The validators canonicalize only
+those exact forms back to the identifier in `linear.identifier`, `dispatch_id`, and a
+temporary authorization ID before identity comparison and digesting. Other Markdown,
+rich text, or URLs remain invalid contract identifiers.
 
 Validation has three outcomes:
 

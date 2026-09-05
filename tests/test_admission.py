@@ -129,7 +129,10 @@ class AdmissionTests(unittest.TestCase):
     def test_linear_self_link_serialization_canonicalizes_dry_run_authorization(self) -> None:
         linked = dry_run_issue()
         linked_contract = json.loads(linked["description"].split("\n")[1])
-        link = "[MHO-900](https://linear.app/mhoo/issue/MHO-900/example)"
+        link = (
+            '<issue id="05d02267-3ff6-466d-b9c7-7cdbc30e5aac" '
+            'href="https://linear.app/mhoo/issue/MHO-900/example">MHO-900</issue>'
+        )
         linked_contract["linear"]["identifier"] = link
         linked_contract["dispatch_id"] = f"{link}@r1"
         linked_contract["dry_run_authorization"]["authorization_id"] = f"{link}-b5-receipt"

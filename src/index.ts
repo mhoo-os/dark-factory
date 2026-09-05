@@ -19,7 +19,8 @@ const STALE_CONDITIONS = new Set([
 const SHA40 = /^[0-9a-f]{40}$/i;
 const REPOSITORY = /^mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}$/;
 const ISSUE_IDENTIFIER = /^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/;
-const LINEAR_ISSUE_LINK = /\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]\(https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/\1(?:\/[A-Za-z0-9._-]+)?\)/g;
+const LINEAR_MARKDOWN_ISSUE_LINK = /\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]\(https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/\1(?:\/[A-Za-z0-9._-]+)?\)/g;
+const LINEAR_RICH_ISSUE_LINK = /<issue id="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" href="https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)(?:\/[A-Za-z0-9._-]+)?">\1<\/issue>/g;
 const BRANCH = /^factory\/[a-z0-9][a-z0-9-]{0,127}$/;
 const RUN_ID = /^run-v1-[0-9a-f]{32}$/;
 const GITHUB_API_VERSION = "2022-11-28";
@@ -302,7 +303,9 @@ function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorizat
 }
 
 function canonicalLinearIssueLinks(value: unknown, label: string, max: number): string {
-  return text(value, label, max).replace(LINEAR_ISSUE_LINK, "$1");
+  return text(value, label, max)
+    .replace(LINEAR_MARKDOWN_ISSUE_LINK, "$1")
+    .replace(LINEAR_RICH_ISSUE_LINK, "$1");
 }
 
 function canonicalLinearIdentifier(value: unknown): string {
