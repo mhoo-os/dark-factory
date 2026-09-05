@@ -146,7 +146,7 @@ async function registryReady(db: D1Database): Promise<boolean> {
   try {
     const meta = await db.prepare("SELECT schema_version FROM factory_schema_meta WHERE schema_name='factory-ledger'").first<{ schema_version: number }>();
     const trigger = await db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name='chat_lane_assignment_transition_guard_v2'").first();
-    return Number(meta?.schema_version) >= 6 && Boolean(trigger);
+    return Number(meta?.schema_version) >= 7 && Boolean(trigger);
   } catch { return false; }
 }
 

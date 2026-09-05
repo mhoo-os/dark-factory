@@ -7,15 +7,17 @@ import { handleChatLaneRequest, isChatLaneAdmin, recoverExpiredChatLanes } from 
 const migration4 = await readFile(new URL("../migrations/0004_chat_lane_registry.sql", import.meta.url), "utf8");
 const migration5 = await readFile(new URL("../migrations/0005_chat_lane_transition_guards.sql", import.meta.url), "utf8");
 const migration6 = await readFile(new URL("../migrations/0006_chat_lane_activation_guard.sql", import.meta.url), "utf8");
+const migration7 = await readFile(new URL("../migrations/0007_chat_lane_rollback_compatibility.sql", import.meta.url), "utf8");
 const source = await readFile(new URL("../src/chat-lane-registry.ts", import.meta.url), "utf8");
 const index = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
 
-function db() {
+function db(schemaVersion = 7) {
   const database = new DatabaseSync(":memory:");
   database.exec("CREATE TABLE factory_schema_meta(schema_name TEXT PRIMARY KEY, schema_version INTEGER NOT NULL)");
   database.exec(migration4);
   database.exec(migration5);
   database.exec(migration6);
+  if (schemaVersion >= 7) database.exec(migration7);
   database.prepare("UPDATE chat_lanes SET chat_id=?,status='IDLE',updated_at=? WHERE lane_id='review-1'").run("chat-review-0001", "2026-09-05T00:00:00.000Z");
   return database;
 }
@@ -58,7 +60,7 @@ test("fresh migration provisions ten fail-closed slots and the additive guard sc
   assert.equal(database.prepare("SELECT count(*) AS n FROM chat_lanes WHERE status='REPLACE'").get().n, 9);
   const columns = database.prepare("PRAGMA table_info(chat_lane_assignments)").all().map((row) => row.name);
   assert.deepEqual(columns.filter((name) => ["transition_reason", "attested_by", "attested_at"].includes(name)).sort(), ["attested_at", "attested_by", "transition_reason"]);
-  assert.equal(database.prepare("SELECT schema_version AS version FROM factory_schema_meta WHERE schema_name='factory-ledger'").get().version, 6);
+  assert.equal(database.prepare("SELECT schema_version AS version FROM factory_schema_meta WHERE schema_name='factory-ledger'").get().version, 7);
 });
 
 test("a winning completion atomically releases the lane and writes exactly one truthful event", () => {
@@ -123,6 +125,37 @@ test("schema-5 retains the pre-0005 source transition batch for a source rollbac
     .run(`transition:${assignment.assignment_id}:${assignment.lease_fence}:PUBLISHING`, assignment.assignment_id, "PUBLISHING", "old-source", at);
   assert.equal(database.prepare("SELECT status FROM chat_lane_assignments WHERE assignment_id=?").get(assignment.assignment_id).status, "PUBLISHING");
   assert.deepEqual(database.prepare("SELECT event_type FROM chat_lane_events WHERE assignment_id=? ORDER BY created_at,event_id").all(assignment.assignment_id).map((event) => event.event_type), ["LEASED", "PUBLISHING"]);
+});
+
+test("old source cannot re-enter v2 after a populated v2 transition", () => {
+  const database = db(6);
+  const assignment = lease(database, "assignment-00000000-0000-4000-8000-000000000010");
+  assert.equal(transition(database, assignment, "PUBLISHING", "operator_transition", "2099-09-05T00:01:00.000Z").changes, 1);
+  assert.equal(database.prepare("SELECT transition_reason FROM chat_lane_assignments WHERE assignment_id=?").get(assignment.assignment_id).transition_reason, "mho250-v2:operator_transition");
+  database.exec(migration7);
+  const publishing = database.prepare("SELECT * FROM chat_lane_assignments WHERE assignment_id=?").get(assignment.assignment_id);
+  assert.equal(publishing.transition_reason, null);
+
+  // Exact prior-source lane-first completion pattern after source rollback.
+  const completedAt = "2099-09-05T00:02:00.000Z";
+  database.exec("BEGIN");
+  try {
+    database.prepare("UPDATE chat_lanes SET status=?,chat_id=CASE WHEN ?='REPLACE' THEN NULL ELSE chat_id END,lease_token=NULL,lease_expires_at=NULL,current_assignment_id=NULL,updated_at=? WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=?")
+      .run("IDLE", "COMPLETED", completedAt, publishing.lane_id, publishing.assignment_id, publishing.lease_token, publishing.lease_fence);
+    database.prepare("UPDATE chat_lane_assignments SET status=?,linear_output_url=COALESCE(?,linear_output_url),github_output_url=COALESCE(?,github_output_url),output_digest=COALESCE(?,output_digest),verified_at=CASE WHEN ?='COMPLETED' THEN ? ELSE verified_at END,completed_at=CASE WHEN ?='COMPLETED' THEN ? ELSE completed_at END,updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status=?")
+      .run("COMPLETED", null, null, null, "COMPLETED", completedAt, "COMPLETED", completedAt, completedAt, publishing.assignment_id, publishing.lease_token, publishing.lease_fence, "PUBLISHING");
+    database.prepare("INSERT INTO chat_lane_events(event_id,assignment_id,event_type,payload_digest,created_at) VALUES(?,?,?,?,?)")
+      .run(`transition:${publishing.assignment_id}:${publishing.lease_fence}:COMPLETED`, publishing.assignment_id, "COMPLETED", "old-source", completedAt);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+
+  const completed = database.prepare("SELECT status,transition_reason FROM chat_lane_assignments WHERE assignment_id=?").get(assignment.assignment_id);
+  assert.equal(completed.status, "COMPLETED");
+  assert.equal(completed.transition_reason, null);
+  assert.deepEqual(database.prepare("SELECT event_type FROM chat_lane_events WHERE assignment_id=? ORDER BY created_at,event_id").all(assignment.assignment_id).map((event) => event.event_type), ["LEASED", "PUBLISHING", "COMPLETED"]);
 });
 
 test("handler executes idempotent leasing, no-capacity rollback, exact evidence and auth refusal", async () => {
@@ -229,6 +262,9 @@ test("readiness refuses absent and schema-4 registry routes without writes", asy
   schema4.exec(migration4);
   assert.equal((await handleChatLaneRequest(new Request("https://example.test/chat-lanes/lease", { method: "POST", body: "{}" }), new D1(schema4))).status, 503);
   assert.equal(schema4.prepare("SELECT count(*) AS n FROM chat_lane_assignments").get().n, 0);
+  schema4.exec(migration5);
+  schema4.exec(migration6);
+  assert.equal((await handleChatLaneRequest(new Request("https://example.test/chat-lanes/lease", { method: "POST", body: "{}" }), new D1(schema4))).status, 503);
 });
 
 test("six concurrent handler leases atomically claim five slots with no leaked sixth receipt", async () => {
