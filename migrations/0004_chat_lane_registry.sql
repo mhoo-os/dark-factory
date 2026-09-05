@@ -87,10 +87,12 @@ BEGIN
       lease_fence = (SELECT lease_fence FROM chat_lanes WHERE current_assignment_id = NEW.assignment_id)
   WHERE assignment_id = NEW.assignment_id;
 
-  SELECT CASE
+  -- Parentheses keep Cloudflare D1's remote trigger splitter from mistaking
+  -- this CASE END for the trigger's END. SQLite semantics are unchanged.
+  SELECT (CASE
     WHEN (SELECT lane_id FROM chat_lane_assignments WHERE assignment_id = NEW.assignment_id) IS NULL
     THEN RAISE(ABORT, 'chat_lane_unavailable')
-  END;
+  END);
 
   INSERT INTO chat_lane_events(event_id,assignment_id,event_type,payload_digest,created_at)
   VALUES('lease:' || NEW.assignment_id,NEW.assignment_id,'LEASED',NEW.request_digest,NEW.created_at);

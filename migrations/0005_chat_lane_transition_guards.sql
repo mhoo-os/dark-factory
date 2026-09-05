@@ -11,14 +11,14 @@ CREATE TRIGGER chat_lane_assignment_transition_guard
 BEFORE UPDATE OF status ON chat_lane_assignments
 WHEN NEW.status <> OLD.status AND NEW.transition_reason IS NOT NULL
 BEGIN
-  SELECT CASE
+  SELECT (CASE
     WHEN NOT (
       (OLD.status = 'RUNNING' AND NEW.status IN ('PUBLISHING', 'BLOCKED'))
       OR (OLD.status = 'PUBLISHING' AND NEW.status IN ('COMPLETED', 'BLOCKED'))
     ) THEN RAISE(ABORT, 'chat_lane_transition_denied')
-  END;
+  END);
 
-  SELECT CASE
+  SELECT (CASE
     WHEN NOT EXISTS (
       SELECT 1 FROM chat_lanes
       WHERE lane_id = OLD.lane_id
@@ -27,15 +27,15 @@ BEGIN
         AND lease_fence = OLD.lease_fence
         AND status = OLD.status
     ) THEN RAISE(ABORT, 'chat_lane_transition_raced')
-  END;
+  END);
 
-  SELECT CASE
+  SELECT (CASE
     WHEN NEW.transition_reason = 'lease_expired'
       AND OLD.lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now') THEN 1
     WHEN NEW.transition_reason <> 'lease_expired'
       AND OLD.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') THEN 1
     ELSE RAISE(ABORT, 'chat_lane_lease_expired')
-  END;
+  END);
 END;
 
 CREATE TRIGGER chat_lane_assignment_transition_apply
@@ -60,7 +60,7 @@ BEGIN
     AND lease_fence = OLD.lease_fence
     AND status = OLD.status;
 
-  SELECT CASE
+  SELECT (CASE
     WHEN NEW.status = 'PUBLISHING' AND NOT EXISTS (
       SELECT 1 FROM chat_lanes
       WHERE lane_id = OLD.lane_id
@@ -81,7 +81,7 @@ BEGIN
       SELECT 1 FROM chat_lanes WHERE lane_id = OLD.lane_id AND status = 'BLOCKED'
         AND current_assignment_id IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL
     ) THEN RAISE(ABORT, 'chat_lane_transition_raced')
-  END;
+  END);
 
   INSERT INTO chat_lane_events(event_id, assignment_id, event_type, payload_digest, created_at)
   VALUES(
