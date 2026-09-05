@@ -209,9 +209,12 @@ def pending_candidate(
         except TriageError:
             continue
     candidates.sort(key=lambda item: (item.priority, item.identifier))
+    dry_run_candidates = [candidate for candidate in candidates if candidate.dry_run_authorization_id is not None]
+    if dry_run_candidates:
+        if len(dry_run_candidates) != 1:
+            raise TriageError("dry_run_authorization_ambiguous")
+        return dry_run_candidates[0], None
     for candidate in candidates:
-        if candidate.dry_run_authorization_id is not None:
-            return candidate, None
         existing = existing_issue(candidate)
         if existing is None:
             return candidate, None

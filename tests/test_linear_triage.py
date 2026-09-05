@@ -139,6 +139,22 @@ class CandidateTests(unittest.TestCase):
         self.assertIn('"action": "approved-intake-dry-run"', output.getvalue())
         self.assertIn('"provider_mutations": false', output.getvalue())
 
+    def test_multiple_dry_run_authorizations_fail_closed_as_ambiguous(self):
+        first = {
+            "authorization_id": "MHO-1-b5-first",
+            "mode": "approved-intake",
+            "non_executable": True,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "checkout_head_sha": CHECKOUT_HEAD,
+        }
+        second = {**first, "authorization_id": "MHO-2-b5-second"}
+        with self.assertRaisesRegex(triage.TriageError, "dry_run_authorization_ambiguous"):
+            triage.pending_candidate(
+                [issue(dry_run_authorization=first), issue(identifier="MHO-2", dry_run_authorization=second)],
+                dry_run=True,
+                checkout_head=CHECKOUT_HEAD,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
