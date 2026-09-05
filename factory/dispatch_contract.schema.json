@@ -29,8 +29,12 @@
     "risk": {"type": "object", "additionalProperties": false, "required": ["risk_class", "authority_class"], "properties": {"risk_class": {"enum": ["low", "medium", "high"]}, "authority_class": {"enum": ["repository-local", "cross-system"]}}},
     "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
     "validation_profile": {"type": "string", "minLength": 1},
-    "allowed_scope": {"type": "object", "additionalProperties": false, "required": ["paths", "max_files", "max_changed_lines"], "properties": {"paths": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "max_files": {"type": "integer", "minimum": 1}, "max_changed_lines": {"type": "integer", "minimum": 1}}},
+    "allowed_scope": {"type": "object", "additionalProperties": false, "required": ["paths", "max_files", "max_changed_lines"], "properties": {"paths": {"type": "array", "minItems": 0, "items": {"type": "string"}}, "max_files": {"type": "integer", "minimum": 0}, "max_changed_lines": {"type": "integer", "minimum": 0}}},
     "merge_policy": {"enum": ["human", "auto-eligible"]},
-    "stale_conditions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["planning_revision_changed", "planning_fingerprint_changed", "base_sha_changed"]}}
-  }
+    "stale_conditions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["planning_revision_changed", "planning_fingerprint_changed", "base_sha_changed"]}},
+    "dry_run_authorization": {"type": "object", "additionalProperties": false, "required": ["authorization_id", "mode", "non_executable", "expires_at", "checkout_head_sha"], "properties": {"authorization_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,191}$"}, "mode": {"const": "approved-intake"}, "non_executable": {"const": true}, "expires_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}, "checkout_head_sha": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"}}}
+  },
+  "allOf": [
+    {"if": {"required": ["dry_run_authorization"]}, "then": {"properties": {"allowed_scope": {"properties": {"paths": {"maxItems": 0}, "max_files": {"const": 0}, "max_changed_lines": {"const": 0}}}}}, "else": {"properties": {"allowed_scope": {"properties": {"paths": {"minItems": 1}, "max_files": {"minimum": 1}, "max_changed_lines": {"minimum": 1}}}}}}
+  ]
 }

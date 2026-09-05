@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
+import re
 from typing import Any, Iterable, Mapping
 
 from factory.dispatch_contract import DispatchContract, validate_dispatch_contract
@@ -12,6 +14,7 @@ from factory.profile_registry import UnknownProfileError, resolve_profiles
 CONTRACT_OPEN = "<!-- mhoo-factory-dispatch:v1 -->"
 CONTRACT_CLOSE = "<!-- /mhoo-factory-dispatch:v1 -->"
 ELIGIBLE_STATE_TYPES = frozenset({"unstarted", "started"})
+CHECKOUT_HEAD_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,9 @@ def admit_linear_issue(
     existing_issue_dispatches: Mapping[str, Iterable[tuple[str, str]]] | None = None,
     seen_event_ids: Iterable[str] = (),
     event_id: str | None = None,
+    allow_dry_run_authorization: bool = False,
+    current_checkout_head: str | None = None,
+    now: datetime | None = None,
 ) -> AdmissionDecision:
     """Return a deterministic decision without network, model, or provider writes."""
     if not isinstance(issue, Mapping):
@@ -119,11 +125,20 @@ def admit_linear_issue(
         current_planning_fingerprint=current_planning_fingerprint,
         current_base_sha=current_base_sha,
         existing_dispatch_ids=existing_dispatch_ids,
+        now=now,
     )
     if validation.outcome != "admitted":
         return AdmissionDecision(validation.outcome, validation.reasons, validation.contract)
     assert validation.contract is not None
     contract_value = validation.contract.to_dict()
+    dry_run_authorization = validation.contract.dry_run_authorization
+    if dry_run_authorization is not None:
+        if not allow_dry_run_authorization:
+            return AdmissionDecision("not-admitted", ("dry_run_authorization_requires_dry_run",), validation.contract)
+        if not isinstance(current_checkout_head, str) or CHECKOUT_HEAD_PATTERN.fullmatch(current_checkout_head) is None:
+            return AdmissionDecision("not-admitted", ("dry_run_authorization_checkout_head_missing",), validation.contract)
+        if current_checkout_head.lower() != dry_run_authorization["checkout_head_sha"].lower():
+            return AdmissionDecision("not-admitted", ("dry_run_authorization_checkout_head_mismatch",), validation.contract)
     revision = contract_value["linear"]["planning_revision"]
     if validation.contract.dispatch_id != f"{identifier}@{revision}":
         return AdmissionDecision("not-admitted", ("dispatch_id_not_bound_to_issue_revision",), validation.contract)

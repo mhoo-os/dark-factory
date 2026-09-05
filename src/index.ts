@@ -24,6 +24,8 @@ const RUN_ID = /^run-v1-[0-9a-f]{32}$/;
 const GITHUB_API_VERSION = "2022-11-28";
 const MAX_PROVIDER_BODY_BYTES = 64 * 1024;
 const PROVIDER_TIMEOUT_MS = 30_000;
+const DRY_RUN_AUTHORIZATION_TTL_MS = 15 * 60_000;
+const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const GITHUB_EVENT_TYPES = new Set(["pull_request", "workflow_run"]);
 const PROFILE_DIGEST = "sha256:e56a438c8feb33cd39b03aca75a3b8596d63de5c90662f87a16729b9d467acfb";
 const SUPPORTED_TARGETS = {
@@ -106,6 +108,13 @@ const TRANSITION_ACTORS: Readonly<Record<string, readonly TransitionActor[]>> = 
 };
 
 type ObjectValue = Record<string, unknown>;
+type DryRunAuthorization = {
+  authorization_id: string;
+  mode: "approved-intake";
+  non_executable: true;
+  expires_at: string;
+  checkout_head_sha: string;
+};
 type Contract = {
   contract_version: "v1";
   dispatch_id: string;
@@ -130,6 +139,7 @@ type Contract = {
   allowed_scope: { paths: string[]; max_files: number; max_changed_lines: number };
   merge_policy: "human" | "auto-eligible";
   stale_conditions: string[];
+  dry_run_authorization?: DryRunAuthorization;
 };
 
 type DispatchJob = { kind: "dispatch"; dispatchId: string; runId: string; contractDigest: string; contract: Contract };
@@ -275,6 +285,21 @@ function integer(value: unknown, label: string, max: number): number {
   return value;
 }
 
+function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorization {
+  const authorization = object(value, ["authorization_id", "mode", "non_executable", "expires_at", "checkout_head_sha"], "dry_run_authorization");
+  const authorizationId = text(authorization.authorization_id, "dry_run_authorization_id", 192);
+  if (authorization.mode !== "approved-intake") throw new AdmissionError("dry_run_authorization_mode_invalid");
+  if (authorization.non_executable !== true) throw new AdmissionError("dry_run_authorization_non_executable_required");
+  const expiresAt = text(authorization.expires_at, "dry_run_authorization_expires_at", 20);
+  const expiresAtMillis = Date.parse(expiresAt);
+  if (!UTC_TIMESTAMP.test(expiresAt) || Number.isNaN(expiresAtMillis)) throw new AdmissionError("dry_run_authorization_expires_at_invalid");
+  if (expiresAtMillis <= now) throw new AdmissionError("dry_run_authorization_expired");
+  if (expiresAtMillis - now > DRY_RUN_AUTHORIZATION_TTL_MS) throw new AdmissionError("dry_run_authorization_ttl_exceeds_limit");
+  const checkoutHead = text(authorization.checkout_head_sha, "dry_run_authorization_checkout_head_sha", 40);
+  if (!SHA40.test(checkoutHead)) throw new AdmissionError("dry_run_authorization_checkout_head_sha_invalid");
+  return { authorization_id: authorizationId, mode: "approved-intake", non_executable: true, expires_at: expiresAt, checkout_head_sha: checkoutHead };
+}
+
 function contractFromDescription(description: unknown, issue: ObjectValue, env: Env): Contract {
   const source = descriptionValue(description, "description", 100_000);
   if (source.split(CONTRACT_OPEN).length - 1 !== 1 || source.split(CONTRACT_CLOSE).length - 1 !== 1) {
@@ -285,7 +310,8 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (end <= start) throw new AdmissionError("contract_block_order_invalid");
   let parsed: unknown;
   try { parsed = JSON.parse(source.slice(start, end).trim()); } catch { throw new AdmissionError("contract_json_invalid"); }
-  const root = object(parsed, ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions"], "contract");
+  const hasDryRunAuthorization = !!parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, "dry_run_authorization");
+  const root = object(parsed, hasDryRunAuthorization ? ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions", "dry_run_authorization"] : ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions"], "contract");
   if (root.contract_version !== "v1") throw new AdmissionError("contract_version_unsupported");
   if (env.ALLOWED_REPOSITORY_PREFIX !== "mhoo-os/") throw new AdmissionError("repository_prefix_invalid");
   const projectId = text(env.LINEAR_PROJECT_ID, "linear_project_id");
@@ -298,6 +324,7 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (root.dispatch_id !== `${identifier}@${planningRevision}`) throw new AdmissionError("dispatch_id_not_bound_to_revision");
   if (!/^sha256:[0-9a-f]{64}$/.test(text(linear.planning_fingerprint, "planning_fingerprint", 71))) throw new AdmissionError("planning_fingerprint_invalid");
   const target = object(root.target, ["repository", "work_type", "execution_profile", "collision_group", "base_sha"], "target");
+  const authorization = hasDryRunAuthorization ? dryRunAuthorization(root.dry_run_authorization) : undefined;
   const repository = text(target.repository, "repository");
   if (!REPOSITORY.test(repository) || !repository.startsWith(env.ALLOWED_REPOSITORY_PREFIX)) throw new AdmissionError("repository_not_allowed");
   text(target.work_type, "work_type");
@@ -322,11 +349,16 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (!["low", "medium", "high"].includes(String(risk.risk_class)) || !["repository-local", "cross-system"].includes(String(risk.authority_class))) throw new AdmissionError("risk_invalid");
   if (!Array.isArray(root.acceptance_criteria) || root.acceptance_criteria.length === 0 || root.acceptance_criteria.length > 50 || root.acceptance_criteria.some((item) => typeof item !== "string" || item.length === 0 || item.length > 512)) throw new AdmissionError("acceptance_criteria_invalid");
   const scope = object(root.allowed_scope, ["paths", "max_files", "max_changed_lines"], "allowed_scope");
-  if (!Array.isArray(scope.paths) || scope.paths.length === 0 || scope.paths.length > 100 || scope.paths.some((item) => typeof item !== "string" || item.length === 0 || item.length > 512 || item.startsWith("/") || item.split("/").some((part) => part === "" || part === "." || part === ".."))) throw new AdmissionError("allowed_paths_invalid");
-  integer(scope.max_files, "max_files", 12);
-  integer(scope.max_changed_lines, "max_changed_lines", 500);
+  if (authorization) {
+    if (!Array.isArray(scope.paths) || scope.paths.length !== 0 || scope.max_files !== 0 || scope.max_changed_lines !== 0) throw new AdmissionError("dry_run_authorization_allowed_scope_invalid");
+  } else {
+    if (!Array.isArray(scope.paths) || scope.paths.length === 0 || scope.paths.length > 100 || scope.paths.some((item) => typeof item !== "string" || item.length === 0 || item.length > 512 || item.startsWith("/") || item.split("/").some((part) => part === "" || part === "." || part === ".."))) throw new AdmissionError("allowed_paths_invalid");
+    integer(scope.max_files, "max_files", 12);
+    integer(scope.max_changed_lines, "max_changed_lines", 500);
+  }
   if (!["human", "auto-eligible"].includes(String(root.merge_policy))) throw new AdmissionError("merge_policy_invalid");
   if (!Array.isArray(root.stale_conditions) || root.stale_conditions.length === 0 || root.stale_conditions.length > STALE_CONDITIONS.size || root.stale_conditions.some((item) => typeof item !== "string" || !STALE_CONDITIONS.has(item)) || new Set(root.stale_conditions).size !== root.stale_conditions.length) throw new AdmissionError("stale_conditions_invalid");
+  if (authorization && ((root.dependencies as unknown[]).length !== 0 || risk.risk_class !== "low" || risk.authority_class !== "repository-local" || root.merge_policy !== "human")) throw new AdmissionError("dry_run_authorization_constraints_invalid");
   const contract: Contract = {
     contract_version: "v1",
     dispatch_id: text(root.dispatch_id, "dispatch_id", 192),
@@ -361,8 +393,27 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
     },
     merge_policy: root.merge_policy as Contract["merge_policy"],
     stale_conditions: root.stale_conditions as string[],
+    ...(authorization ? { dry_run_authorization: authorization } : {}),
   };
   return contract;
+}
+
+function dryRunContractReason(payload: ObjectValue, env: Env): string | null {
+  const issue = issueFromPayload(payload);
+  const description = issue.description;
+  if (typeof description !== "string" || description.split(CONTRACT_OPEN).length - 1 !== 1 || description.split(CONTRACT_CLOSE).length - 1 !== 1) return null;
+  const start = description.indexOf(CONTRACT_OPEN) + CONTRACT_OPEN.length;
+  const end = description.indexOf(CONTRACT_CLOSE);
+  let declared: unknown;
+  try { declared = JSON.parse(description.slice(start, end).trim()); } catch { return null; }
+  if (!declared || typeof declared !== "object" || Array.isArray(declared) || !Object.prototype.hasOwnProperty.call(declared, "dry_run_authorization")) return null;
+  try {
+    contractFromDescription(description, issue, env);
+  } catch (error) {
+    const reason = error instanceof AdmissionError ? error.message : "dry_run_authorization_contract_invalid";
+    return reason.startsWith("dry_run_authorization_") ? reason : "dry_run_authorization_contract_invalid";
+  }
+  return "dry_run_authorization_non_executable";
 }
 
 function issueFromPayload(payload: unknown): ObjectValue {
@@ -390,6 +441,7 @@ async function admit(raw: string, env: Env): Promise<Job> {
   if (typeof state !== "string" || !ISSUE_STATES.has(state)) throw new AdmissionError("issue_not_eligible");
   if (!labels(issue).includes("factory:accepted")) throw new AdmissionError("factory_acceptance_label_missing");
   const contract = contractFromDescription(issue.description, issue, env);
+  if (contract.dry_run_authorization) throw new AdmissionError("dry_run_authorization_non_executable");
   const risk = contract.risk;
   if (risk.risk_class === "high" || risk.authority_class === "cross-system") throw new AdmissionError("human_approval_required");
   const contractDigest = await digest(contract);
@@ -822,6 +874,8 @@ async function acceptLinear(request: Request, env: Env): Promise<Response> {
   if (!currentLinearTimestamp(raw, request.headers.get("Linear-Timestamp"))) return response({ error: "stale_or_missing_timestamp" }, 401);
   const payload = linearPayload(raw);
   if (payload.type !== "Issue" || !payload.data || typeof payload.data !== "object" || Array.isArray(payload.data)) return response({ error: "unsupported_event" }, 202);
+  const dryRunReason = dryRunContractReason(payload, env);
+  if (dryRunReason !== null) return response({ accepted: false, reason: dryRunReason }, 202);
   const delivery = request.headers.get("Linear-Delivery");
   if (!delivery || !/^[A-Za-z0-9._:-]{1,256}$/.test(delivery)) return response({ error: "missing_delivery_id" }, 401);
   const id = await eventId(raw, delivery);

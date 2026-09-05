@@ -18,6 +18,26 @@ Validation has three outcomes:
 `execution_failed` is deliberately not a contract outcome. It is a later runtime result after an admitted contract has entered execution.
 
 Admission may supply the current revision/base and the supported profile registry to `validate_dispatch_contract`; it must persist the returned digest and outcome without reinterpreting prose.
+
+## Temporary approved-intake dry run
+
+A narrowly authorized Gate-3 verification may add exactly one optional
+`dry_run_authorization` object. It is not a normal execution capability. The object
+requires an authorization identity, `mode: "approved-intake"`,
+`non_executable: true`, an RFC3339 UTC expiry no more than fifteen minutes ahead, and
+the exact clean checkout head. It also requires an empty allowed scope (`paths: []`,
+`max_files: 0`, `max_changed_lines: 0`), no dependencies, low repository-local risk,
+and human merge policy.
+
+The Python intake accepts this object only when explicitly called with `--dry-run` from
+the exact clean checkout. Its only result is an `approved-intake-dry-run` receipt with
+`normal_dispatch: false` and `provider_mutations: false`; it does not create or update
+Linear/GitHub resources. A replay before expiry is another no-mutation receipt; expiry,
+head mismatch, missing mode, or any scope/constraint mismatch is not admitted.
+
+The Worker parses the same shape but rejects it before ingress persistence, queue handoff,
+run creation, or provider execution. The authorization is therefore usable only by the
+local disabled-factory Gate-3 path and cannot become a Cloudflare dispatch capability.
 ## Linear admission envelope
 
 The Linear description must contain exactly one explicit envelope:

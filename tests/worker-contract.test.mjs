@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 
 const config = JSON.parse(await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
 const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
+const dispatchContractSchema = JSON.parse(await readFile(new URL("../factory/dispatch_contract.schema.json", import.meta.url), "utf8"));
 const stateContract = JSON.parse(await readFile(new URL("../factory/state_contract.json", import.meta.url), "utf8"));
 const migration = await readFile(new URL("../migrations/0001_factory.sql", import.meta.url), "utf8");
 const retryMigration = await readFile(new URL("../migrations/0002_ingress-retry-state.sql", import.meta.url), "utf8");
@@ -23,6 +24,19 @@ test("multiline Linear descriptions remain valid contract input", () => {
   assert.match(source, /function descriptionValue\(/);
   assert.match(source, /const source = descriptionValue\(description, "description", 100_000\)/);
   assert.doesNotMatch(source, /const source = text\(description, "description"/);
+});
+
+test("temporary dry-run authorization is sealed and rejected before durable ingress", () => {
+  const authorization = dispatchContractSchema.properties.dry_run_authorization;
+  assert.deepEqual(authorization.required, ["authorization_id", "mode", "non_executable", "expires_at", "checkout_head_sha"]);
+  assert.equal(authorization.properties.mode.const, "approved-intake");
+  assert.equal(authorization.properties.non_executable.const, true);
+  assert.match(source, /const DRY_RUN_AUTHORIZATION_TTL_MS = 15 \* 60_000/);
+  assert.match(source, /function dryRunContractReason\(/);
+  assert.match(source, /dry_run_authorization_non_executable/);
+  const acceptLinear = source.slice(source.indexOf("async function acceptLinear"), source.indexOf("async function acceptGithub"));
+  assert.ok(acceptLinear.indexOf("const dryRunReason = dryRunContractReason") < acceptLinear.indexOf("const receipt = await ingress"));
+  assert.ok(acceptLinear.indexOf("const dryRunReason = dryRunContractReason") < acceptLinear.indexOf("env.EXECUTION_QUEUE.send(job)"));
 });
 
 test("reviewable source binds the safety boundaries", () => {
