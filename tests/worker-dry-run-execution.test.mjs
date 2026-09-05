@@ -20,7 +20,7 @@ function contract() {
     },
     target: {
       repository: "mhoo-os/dark-factory",
-      work_type: "verification",
+      work_type: "test",
       execution_profile: "python-tests-v1",
       collision_group: "dark-factory-runtime",
       base_sha: "0123456789abcdef0123456789abcdef01234567",
@@ -78,6 +78,9 @@ test("an authenticated approved-intake dry run reaches the real Worker and canno
         identifier: "MHO-250",
         description,
         project: { id: PROJECT_ID },
+        team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" },
+        state: { type: "started" },
+        labels: { nodes: [{ name: "factory:accepted" }] },
       },
     });
     const signature = createHmac("sha256", SECRET).update(raw).digest("hex");

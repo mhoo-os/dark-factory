@@ -1,7 +1,0 @@
-{
-  "version": "v1",
-  "execution_profiles": [{"id":"python-tests-v1","runtime":"python:3.12-slim","checkout_steps":["checkout_repository_at_declared_base","install_declared_dependencies"],"allowed_tools":["bash","git","python3"],"model_policy":"static:execution-default-v1","limits":{"timeout_seconds":900,"max_changed_lines":500,"max_files":12,"cost_usd":8},"artifacts":["diff","test-log","run-receipt"]}],
-  "validation_profiles": [{"id":"python-tests-v1","quick_checks":["python3 -m py_compile factory/*.py"],"full_checks":["python3 -m unittest discover -s tests -v"],"required_markers":["APP_STARTED","E2E_PASSED","PROTECTED_OK","GATE_OK"],"governance_checks":["no-template-placeholders","autonomy-default-disabled"],"holdout_hooks":["independent-checkout","builder-reasoning-withheld"],"merge_eligibility":"human-only-until-ratchet"}],
-  "collision_groups": [{"id":"dark-factory-governance","paths":["MISSION.md","FACTORY.md","FACTORY_RULES.md","CLAUDE.md","factory/config.sh"]},{"id":"dark-factory-runtime","paths":["factory/**","tests/**"]},{"id":"dark-factory-reference","paths":["README.md","docs/**"]}],
-  "targets": [{"repository":"mhoo-os/dark-factory","execution_profile":"python-tests-v1","validation_profile":"python-tests-v1","collision_groups":["dark-factory-governance","dark-factory-runtime","dark-factory-reference"]}]
-}

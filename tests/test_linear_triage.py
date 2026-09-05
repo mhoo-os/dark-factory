@@ -25,8 +25,9 @@ def issue(dry_run_authorization=None, **overrides):
     value = {
         "id": "uuid", "identifier": "MHO-1", "title": "Candidate", "url": "https://linear.app/mhoo/issue/MHO-1", "priority": 3,
         "project": {"id": triage.PROJECT_ID},
+        "team": {"id": triage.TEAM_ID},
         "state": {"id": "in-progress", "name": "In Progress", "type": "started"},
-        "labels": {"nodes": []},
+        "labels": {"nodes": [{"name": "factory:accepted"}]},
     }
     value.update(overrides)
     contract = {
@@ -169,7 +170,17 @@ class CandidateTests(unittest.TestCase):
                 dry_run=True,
                 checkout_head=CHECKOUT_HEAD,
             )
+    def test_live_intake_enumerates_each_active_registry_mapping(self):
+        calls = []
+        original = triage.eligible_issues_for
+        try:
+            triage.eligible_issues_for = lambda team_id, project_id: calls.append((team_id, project_id)) or []
+            self.assertEqual(triage.eligible_issues(), [])
+        finally:
+            triage.eligible_issues_for = original
+        self.assertEqual(calls, [(team_id, project_id) for _, project_id, team_id in triage.active_intake_mappings()])
 
 
 if __name__ == "__main__":
     unittest.main()
+

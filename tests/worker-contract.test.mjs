@@ -15,7 +15,7 @@ test("production defaults keep the factory stopped", () => {
   assert.equal(config.vars.FACTORY_ENABLED, "false");
   assert.equal(config.vars.FACTORY_AUTONOMY, "0");
   assert.equal(config.vars.AUTO_MERGE, "false");
-  assert.equal(config.vars.LINEAR_PROJECT_ID, "2dab9206-cb92-49a4-aeef-95ec45280098");
+  assert.equal(config.vars.LINEAR_PROJECT_ID, undefined);
   assert.equal(config.vars.MAX_GLOBAL_CONCURRENCY, "1");
   assert.equal(config.vars.LINEAR_PROJECT_SLUG, undefined);
 });
@@ -39,8 +39,8 @@ test("temporary dry-run authorization is sealed and rejected before durable ingr
   assert.match(source, /dry_run_authorization_non_executable/);
   assert.match(source, /dry_run_authorization_identity_mismatch/);
   const acceptLinear = source.slice(source.indexOf("async function acceptLinear"), source.indexOf("async function acceptGithub"));
-  assert.ok(acceptLinear.indexOf("const dryRunReason = dryRunContractReason") < acceptLinear.indexOf("const receipt = await ingress"));
-  assert.ok(acceptLinear.indexOf("const dryRunReason = dryRunContractReason") < acceptLinear.indexOf("env.EXECUTION_QUEUE.send(job)"));
+  assert.ok(acceptLinear.indexOf("const dryRunReason = await dryRunContractReason") < acceptLinear.indexOf("const receipt = await ingress"));
+  assert.ok(acceptLinear.indexOf("const dryRunReason = await dryRunContractReason") < acceptLinear.indexOf("env.EXECUTION_QUEUE.send(job)"));
 });
 
 test("reviewable source binds the safety boundaries", () => {
@@ -107,5 +107,5 @@ test("Linear receipt lookup paginates and fails closed on an unbounded history",
 
 test("provider calls have an explicit timeout", () => {
   const timeouts = source.match(/signal: AbortSignal\.timeout\(PROVIDER_TIMEOUT_MS\)/g) ?? [];
-  assert.equal(timeouts.length, 3);
+  assert.equal(timeouts.length, 4);
 });

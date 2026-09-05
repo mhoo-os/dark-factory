@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from factory.factory_registry import RegistryBinding
+
 CONTRACT_VERSION = "v1"
 SUPPORTED_OUTCOMES = ("admitted", "not-admitted", "needs-replan")
 STALE_CONDITIONS = frozenset(
@@ -58,6 +60,11 @@ class DispatchContract:
         value = self.to_dict().get("dry_run_authorization")
         return value if isinstance(value, dict) else None
 
+    @property
+    def factory_id(self) -> str | None:
+        registry = self.to_dict().get("registry")
+        return registry.get("factory_id") if isinstance(registry, dict) else None
+
 
 @dataclass(frozen=True)
 class ContractValidation:
@@ -78,10 +85,10 @@ def _mapping(value: Any, path: str, errors: list[str]) -> Mapping[str, Any] | No
     return value
 
 
-def _keys(value: Mapping[str, Any], expected: set[str], path: str, errors: list[str]) -> None:
+def _keys(value: Mapping[str, Any], expected: set[str], path: str, errors: list[str], *, optional: set[str] = frozenset()) -> None:
     for key in sorted(expected - value.keys()):
         errors.append(f"{path}.missing:{key}")
-    for key in sorted(value.keys() - expected):
+    for key in sorted(value.keys() - expected - optional):
         errors.append(f"{path}.unexpected:{key}")
 
 
@@ -180,6 +187,7 @@ def _static_errors(value: Any) -> list[str]:
         {"contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions", "dry_run_authorization"} if "dry_run_authorization" in root else {"contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions"},
         "contract",
         errors,
+        optional={"factory_request", "registry"},
     )
     if root.get("contract_version") != CONTRACT_VERSION:
         errors.append("contract_version.unsupported")
@@ -256,6 +264,26 @@ def _static_errors(value: Any) -> list[str]:
                 errors.append(f"allowed_scope.{field}.positive_integer")
         if has_dry_run_authorization and scope.get("paths") != []:
             errors.append("dry_run_authorization.allowed_scope.paths.must_be_empty")
+
+    if "factory_request" in root:
+        request = _mapping(root.get("factory_request"), "factory_request", errors)
+        if request is not None:
+            _keys(request, set(), "factory_request", errors, optional={"credential_profile", "concurrency", "model_policy_key", "escalation_class", "effect_classes"})
+            for field in ("credential_profile", "model_policy_key", "escalation_class"):
+                if field in request:
+                    _string(request.get(field), f"factory_request.{field}", errors, ID_PATTERN, 128)
+            if "concurrency" in request and (not isinstance(request["concurrency"], int) or isinstance(request["concurrency"], bool) or request["concurrency"] < 1):
+                errors.append("factory_request.concurrency.positive_integer")
+            if "effect_classes" in request:
+                _string_list(request.get("effect_classes"), "factory_request.effect_classes", errors, allow_empty=True, max_items=20)
+
+    if "registry" in root:
+        registry = _mapping(root.get("registry"), "registry", errors)
+        if registry is not None:
+            _keys(registry, {"factory_id", "registry_version", "registry_digest", "entry_version"}, "registry", errors)
+            for field in ("factory_id", "registry_version", "entry_version"):
+                _string(registry.get(field), f"registry.{field}", errors, ID_PATTERN, 192)
+            _string(registry.get("registry_digest"), "registry.registry_digest", errors, SHA256_PATTERN, 71)
     return errors
 
 
@@ -263,6 +291,18 @@ def _make_contract(value: Mapping[str, Any]) -> DispatchContract:
     serialized = canonical_json(value)
     digest = "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return DispatchContract(serialized, digest)
+
+
+def bind_registry_identity(contract: DispatchContract, binding: RegistryBinding) -> DispatchContract:
+    """Materialize trusted registry identity after issue-authored validation."""
+    document = contract.to_dict()
+    if "registry" in document:
+        raise ValueError("registry_identity_already_present")
+    # Persist the effective request, including registry-derived defaults, so a
+    # later dispatcher never has to guess which ceiling was actually admitted.
+    document["factory_request"] = dict(binding.request)
+    document["registry"] = binding.identity()
+    return _make_contract(document)
 
 
 def validate_dispatch_contract(

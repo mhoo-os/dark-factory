@@ -5,7 +5,7 @@ Linear issue. It never fills missing fields by guessing.
 
 The machine-readable schema is [`factory/dispatch_contract.schema.json`](../factory/dispatch_contract.schema.json), and the pure validator is [`factory/dispatch_contract.py`](../factory/dispatch_contract.py).
 
-Required data binds one Linear issue and planning revision to one `mhoo-os/<repository>`, base commit, execution/validation profiles, dependency list, risk and authority class, acceptance criteria, allowed scope, merge policy, and explicit stale conditions. `dispatch_id` is the idempotency identity; the canonical JSON digest binds the exact contract contents.
+Required issue-authored data binds one Linear issue and planning revision to one `mhoo-os/<repository>`, base commit, execution/validation profiles, dependency list, risk and authority class, acceptance criteria, allowed scope, merge policy, and explicit stale conditions. Admission then materializes the trusted `factory_id`, registry version, entry version, and registry digest into the normalized contract. `dispatch_id` is the idempotency identity; the canonical JSON digest binds both the requested contents and resolved registry authority.
 
 The `linear.issue_id` field is the immutable provider identity for the Linear issue, while `linear.identifier` is its human-readable key (for example, `MHO-199`). Admission must verify that both values refer to the same issue; neither value is accepted as a substitute for the other.
 
@@ -46,6 +46,11 @@ head mismatch, missing mode, or any scope/constraint mismatch is not admitted.
 The Worker parses the same shape but rejects it before ingress persistence, queue handoff,
 run creation, or provider execution. The authorization is therefore usable only by the
 local disabled-factory Gate-3 path and cannot become a Cloudflare dispatch capability.
+
+An optional `factory_request` may request a credential profile, concurrency class,
+model-policy key, escalation class, and explicit effect classes. Missing values normalize to the least
+privileged v1 defaults. `factory_id` and `registry` are never accepted from issue
+content; they come only from `factory/factory_registry.json`.
 ## Linear admission envelope
 
 The Linear description must contain exactly one explicit envelope:
@@ -69,3 +74,4 @@ dispatch identity is bound to `IDENTIFIER@PLANNING_REVISION`; the canonical
 contract digest is the identity of the exact admitted contents. Existing ledger
 identities and replayed event IDs must be supplied by the caller before any
 queue handoff.
+

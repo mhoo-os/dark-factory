@@ -49,6 +49,7 @@ class LeaseCoordinator:
         dispatch_id: str,
         now: int,
         ttl_seconds: int,
+        registry_identity: Mapping[str, str] | None = None,
     ) -> LeaseGrant:
         ordered = tuple(sorted(set(keys)))
         if not ordered or not owner or not dispatch_id or ttl_seconds < 1:
@@ -68,9 +69,9 @@ class LeaseCoordinator:
                     continue
                 fence = (row["fence"] if row is not None else 0) + 1
                 self.connection.execute(
-                    "INSERT INTO factory_leases(lease_key, owner, dispatch_id, fence, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner, dispatch_id=excluded.dispatch_id, fence=excluded.fence, acquired_at=excluded.acquired_at, expires_at=excluded.expires_at",
-                    (key, owner, dispatch_id, fence, now, expires_at),
+                    "INSERT INTO factory_leases(lease_key, owner, dispatch_id, factory_id, registry_version, registry_digest, registry_entry_version, fence, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner, dispatch_id=excluded.dispatch_id, factory_id=excluded.factory_id, registry_version=excluded.registry_version, registry_digest=excluded.registry_digest, registry_entry_version=excluded.registry_entry_version, fence=excluded.fence, acquired_at=excluded.acquired_at, expires_at=excluded.expires_at",
+                    (key, owner, dispatch_id, (registry_identity or {}).get("factory_id"), (registry_identity or {}).get("registry_version"), (registry_identity or {}).get("registry_digest"), (registry_identity or {}).get("entry_version"), fence, now, expires_at),
                 )
                 fences[key] = fence
             self.connection.commit()

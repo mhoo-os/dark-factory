@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import json
 import re
+import time
 from typing import Any, Protocol
 
 from factory.dispatch_contract import DispatchContract
@@ -14,6 +15,7 @@ SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 SAFE_FAILURES = frozenset({
     "lease_unavailable", "grounding_failed", "implementation_failed", "validation_failed",
     "review_failed", "publish_failed", "lease_release_failed", "workflow_restarted",
+    "workflow_deadline_exceeded",
 })
 
 
@@ -32,6 +34,7 @@ class WorkflowRequest:
     snapshot: RepositorySnapshot
     max_fix_attempts: int = 2
     max_cost_usd: float = 8.0
+    timeout_seconds: int = 900
     stop_requested: bool = False
     stop_readable: bool = True
 
@@ -158,10 +161,19 @@ def _safe_failure(error: WorkflowFailure) -> str:
 class DurableWorkflow:
     """Execute the fixed ground -> implement -> validate -> review -> PR path."""
 
-    def __init__(self, store: WorkflowStore, backend: WorkflowBackend):
+    def __init__(self, store: WorkflowStore, backend: WorkflowBackend, *, clock: Any = time.monotonic):
         self.store, self.backend = store, backend
+        self.clock = clock
+        self._deadline: float | None = None
+
+    def _assert_deadline(self, key: str) -> None:
+        # Releasing a held lease and recording the terminal receipt are cleanup,
+        # never fresh external operations.
+        if key not in {"lease:release", "workflow:final"} and self._deadline is not None and self.clock() >= self._deadline:
+            raise WorkflowFailure("workflow_deadline_exceeded")
 
     def _step(self, request: WorkflowRequest, key: str, action: Any) -> Any:
+        self._assert_deadline(key)
         existing = self.store.get_step(request.run_id, key)
         if existing and existing.status == "completed":
             return existing.result
@@ -169,6 +181,7 @@ class DurableWorkflow:
         self.store.record_event(request.run_id, key, "started", {})
         try:
             result = action(f"{request.run_id}:{key}")
+            self._assert_deadline(key)
         except WorkflowFailure as error:
             self.store.record_event(request.run_id, key, "failed", {"reason": _safe_failure(error)})
             raise
@@ -208,6 +221,9 @@ class DurableWorkflow:
             return self._finish(request, None, "needs-human", "fix_cap_invalid", 0, None)
         if not isinstance(request.max_cost_usd, (int, float)) or isinstance(request.max_cost_usd, bool) or request.max_cost_usd < 0:
             return self._finish(request, None, "needs-human", "cost_cap_invalid", 0, None)
+        if not isinstance(request.timeout_seconds, int) or isinstance(request.timeout_seconds, bool) or request.timeout_seconds < 1:
+            return self._finish(request, None, "needs-human", "timeout_cap_invalid", 0, None)
+        self._deadline = self.clock() + request.timeout_seconds
 
         lease: LeaseReceipt | None = None
         try:
@@ -218,8 +234,11 @@ class DurableWorkflow:
 
             validation: ValidationResult | None = None
             implementation: ImplementationResult | None = None
+            cumulative_cost = 0.0
             attempt = 0
             for attempt in range(request.max_fix_attempts + 1):
+                if cumulative_cost >= request.max_cost_usd:
+                    return self._finish(request, lease, "needs-human", "cost_cap_exhausted", attempt, None)
                 findings = validation.findings if validation else ()
                 key = "implement:0" if attempt == 0 else f"fix:{attempt}"
                 implementation = self._step(
@@ -231,7 +250,10 @@ class DurableWorkflow:
                     return self._finish(request, lease, state, implementation.reason or "implementation_failed", attempt, None)
                 if implementation.base_sha != request.snapshot.base_sha or not implementation.head_sha or not SHA.fullmatch(implementation.head_sha) or not implementation.diff_digest:
                     return self._finish(request, lease, "needs-human", "implementation_identity_invalid", attempt, None)
-                if not isinstance(implementation.cost_usd, (int, float)) or isinstance(implementation.cost_usd, bool) or implementation.cost_usd < 0 or implementation.cost_usd > request.max_cost_usd:
+                if not isinstance(implementation.cost_usd, (int, float)) or isinstance(implementation.cost_usd, bool) or implementation.cost_usd < 0:
+                    return self._finish(request, lease, "needs-human", "cost_cap_exceeded", attempt, None)
+                cumulative_cost += implementation.cost_usd
+                if cumulative_cost > request.max_cost_usd:
                     return self._finish(request, lease, "needs-human", "cost_cap_exceeded", attempt, None)
                 input = ValidationInput(request.contract.digest, implementation.base_sha, implementation.head_sha, implementation.diff_digest, implementation.changed_files, implementation.output_digests)
                 validation = self._step(
@@ -254,3 +276,5 @@ class DurableWorkflow:
             return self._finish(request, lease, "pr-open", "pr_published", attempt, pr)
         except WorkflowFailure as error:
             return self._finish(request, lease, "needs-human", _safe_failure(error), 0, None)
+        finally:
+            self._deadline = None
