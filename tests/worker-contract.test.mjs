@@ -85,7 +85,7 @@ test("worker actor permissions stay aligned with the canonical state contract", 
 });
 
 test("runtime carries the admitted identity through independent validation and publication", () => {
-  for (const marker of ["FACTORY_CONTRACT_JSON", "GITHUB_TOKEN", "ground", "independent-validation", "independent-review", "publish-pr", "linear-receipt", "release-lease", "fetch --depth=1 origin"]) {
+  for (const marker of ["FACTORY_CONTRACT_JSON", "githubInstallationToken", "ground", "independent-validation", "independent-review", "publish-pr", "linear-receipt", "release-lease", "fetch --depth=1 origin"]) {
     assert.match(source, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
   assert.match(dockerfile, /apt-get install -y --no-install-recommends python3/);
