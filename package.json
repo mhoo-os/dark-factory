@@ -7,10 +7,11 @@
     "build": "wrangler deploy --dry-run --containers-rollout=none",
     "test:python": "python3 -m unittest discover -s tests -v",
     "test:sandbox": "node --test tests/sandbox-agent.test.mjs",
+    "test:native": "node --test --experimental-test-coverage --test-coverage-include=src/native-candidate.ts --test-coverage-include=native/mock-codex-runner.mjs --test-coverage-lines=95 --test-coverage-branches=95 --test-coverage-functions=95 tests/native-candidate.test.mjs tests/native-codex-runner.test.mjs",
     "test:contract": "node --test tests/d1-migration-sequence.test.mjs tests/chat-lane-registry.test.mjs tests/worker-contract.test.mjs tests/worker-dry-run-execution.test.mjs",
     "test:worker": "vitest run",
     "test": "npm run test:python && npm run test:sandbox && npm run test:contract && npm run test:worker",
-    "test:coverage": "npm run test:contract && vitest run --coverage"
+    "test:coverage": "npm run test:native && npm run test:contract && vitest run --coverage"
   },
   "dependencies": {
     "@cloudflare/sandbox": "0.12.9"
