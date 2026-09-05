@@ -4,6 +4,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
+import { handleChatLaneRequest, isChatLaneAdmin, recoverExpiredChatLanes } from "./chat-lane-registry";
 import registryArtifact from "../factory/factory_registry.json";
 
 export { Sandbox } from "@cloudflare/sandbox";
@@ -19,11 +20,15 @@ const STALE_CONDITIONS = new Set([
 const SHA40 = /^[0-9a-f]{40}$/i;
 const REPOSITORY = /^mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}$/;
 const ISSUE_IDENTIFIER = /^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/;
+const LINEAR_MARKDOWN_ISSUE_LINK = /\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]\(https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/\1(?:\/[A-Za-z0-9._-]+)?\)/g;
+const LINEAR_RICH_ISSUE_LINK = /<issue id="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" href="https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)(?:\/[A-Za-z0-9._-]+)?">\1<\/issue>/g;
 const BRANCH = /^factory\/[a-z0-9][a-z0-9-]{0,127}$/;
 const RUN_ID = /^run-v1-[0-9a-f]{32}$/;
 const GITHUB_API_VERSION = "2022-11-28";
 const MAX_PROVIDER_BODY_BYTES = 64 * 1024;
 const PROVIDER_TIMEOUT_MS = 30_000;
+const DRY_RUN_AUTHORIZATION_TTL_MS = 15 * 60_000;
+const UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const GITHUB_EVENT_TYPES = new Set(["pull_request", "workflow_run"]);
 const FACTORY_REGISTRY = registryArtifact as unknown as ObjectValue;
 const ACTIVE_FACTORY_STATES = new Set(["pilot", "limited", "enabled"]);
@@ -104,6 +109,17 @@ const TRANSITION_ACTORS: Readonly<Record<string, readonly TransitionActor[]>> = 
 };
 
 type ObjectValue = Record<string, unknown>;
+type DryRunAuthorization = {
+  authorization_id: string;
+  mode: "approved-intake";
+  non_executable: true;
+  expires_at: string;
+  repository: string;
+  pr_number: number;
+  linear_issue: string;
+  review_id: string;
+  checkout_head_sha: string;
+};
 type Contract = {
   contract_version: "v1";
   dispatch_id: string;
@@ -128,6 +144,7 @@ type Contract = {
   allowed_scope: { paths: string[]; max_files: number; max_changed_lines: number };
   merge_policy: "human" | "auto-eligible";
   stale_conditions: string[];
+  dry_run_authorization?: DryRunAuthorization;
   factory_request: {
     credential_profile: string;
     concurrency: number;
@@ -574,6 +591,37 @@ function integer(value: unknown, label: string, max: number): number {
   return value;
 }
 
+function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorization {
+  const authorization = object(value, ["authorization_id", "mode", "non_executable", "expires_at", "repository", "pr_number", "linear_issue", "review_id", "checkout_head_sha"], "dry_run_authorization");
+  const authorizationId = canonicalLinearIssueLinks(authorization.authorization_id, "dry_run_authorization_id", 192);
+  if (authorization.mode !== "approved-intake") throw new AdmissionError("dry_run_authorization_mode_invalid");
+  if (authorization.non_executable !== true) throw new AdmissionError("dry_run_authorization_non_executable_required");
+  const expiresAt = text(authorization.expires_at, "dry_run_authorization_expires_at", 20);
+  const expiresAtMillis = Date.parse(expiresAt);
+  if (!UTC_TIMESTAMP.test(expiresAt) || Number.isNaN(expiresAtMillis)) throw new AdmissionError("dry_run_authorization_expires_at_invalid");
+  if (expiresAtMillis <= now) throw new AdmissionError("dry_run_authorization_expired");
+  if (expiresAtMillis - now > DRY_RUN_AUTHORIZATION_TTL_MS) throw new AdmissionError("dry_run_authorization_ttl_exceeds_limit");
+  const repository = text(authorization.repository, "dry_run_authorization_repository", 128);
+  if (!REPOSITORY.test(repository)) throw new AdmissionError("dry_run_authorization_repository_invalid");
+  const prNumber = integer(authorization.pr_number, "dry_run_authorization_pr_number", 1_000_000_000);
+  const linearIssue = text(authorization.linear_issue, "dry_run_authorization_linear_issue", 32);
+  if (!ISSUE_IDENTIFIER.test(linearIssue)) throw new AdmissionError("dry_run_authorization_linear_issue_invalid");
+  const reviewId = text(authorization.review_id, "dry_run_authorization_review_id", 192);
+  const checkoutHead = text(authorization.checkout_head_sha, "dry_run_authorization_checkout_head_sha", 40);
+  if (!SHA40.test(checkoutHead)) throw new AdmissionError("dry_run_authorization_checkout_head_sha_invalid");
+  return { authorization_id: authorizationId, mode: "approved-intake", non_executable: true, expires_at: expiresAt, repository, pr_number: prNumber, linear_issue: linearIssue, review_id: reviewId, checkout_head_sha: checkoutHead };
+}
+
+function canonicalLinearIssueLinks(value: unknown, label: string, max: number): string {
+  return text(value, label, max)
+    .replace(LINEAR_MARKDOWN_ISSUE_LINK, "$1")
+    .replace(LINEAR_RICH_ISSUE_LINK, "$1");
+}
+
+function canonicalLinearIdentifier(value: unknown): string {
+  return canonicalLinearIssueLinks(value, "contract_identifier", 512);
+}
+
 async function contractFromDescription(description: unknown, issue: ObjectValue): Promise<Contract> {
   const source = descriptionValue(description, "description", 100_000);
   if (source.split(CONTRACT_OPEN).length - 1 !== 1 || source.split(CONTRACT_CLOSE).length - 1 !== 1) {
@@ -584,23 +632,30 @@ async function contractFromDescription(description: unknown, issue: ObjectValue)
   if (end <= start) throw new AdmissionError("contract_block_order_invalid");
   let parsed: unknown;
   try { parsed = JSON.parse(source.slice(start, end).trim()); } catch { throw new AdmissionError("contract_json_invalid"); }
+  const hasDryRunAuthorization = !!parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, "dry_run_authorization");
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && ("factory_id" in parsed || "registry" in parsed)) throw new AdmissionError("issue_factory_identity_forbidden");
   const parsedRoot = parsed as ObjectValue;
-  const rootKeys = ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions", ...(parsedRoot?.factory_request === undefined ? [] : ["factory_request"])];
+  const rootKeys = ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions", ...(parsedRoot?.factory_request === undefined ? [] : ["factory_request"]), ...(hasDryRunAuthorization ? ["dry_run_authorization"] : [])];
   const root = object(parsed, rootKeys, "contract");
   if (root.contract_version !== "v1") throw new AdmissionError("contract_version_unsupported");
   const projectId = providerId(issue, "project");
   const linear = object(root.linear, ["project_id", "issue_id", "identifier", "planning_revision", "planning_fingerprint"], "linear");
   const issueId = text(issue.id, "issue_id");
   const identifier = text(issue.identifier, "identifier", 32);
-  if (linear.project_id !== projectId || linear.issue_id !== issueId || linear.identifier !== identifier) throw new AdmissionError("contract_linear_identity_mismatch");
+  const contractIdentifier = canonicalLinearIdentifier(linear.identifier);
+  if (linear.project_id !== projectId || linear.issue_id !== issueId || contractIdentifier !== identifier) throw new AdmissionError("contract_linear_identity_mismatch");
   if (!/^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/.test(identifier)) throw new AdmissionError("issue_identifier_invalid");
   const planningRevision = text(linear.planning_revision, "planning_revision");
-  if (root.dispatch_id !== `${identifier}@${planningRevision}`) throw new AdmissionError("dispatch_id_not_bound_to_revision");
+  const dispatchId = canonicalLinearIssueLinks(root.dispatch_id, "dispatch_id", 192);
+  if (dispatchId !== `${identifier}@${planningRevision}`) throw new AdmissionError("dispatch_id_not_bound_to_revision");
   if (!/^sha256:[0-9a-f]{64}$/.test(text(linear.planning_fingerprint, "planning_fingerprint", 71))) throw new AdmissionError("planning_fingerprint_invalid");
   const target = object(root.target, ["repository", "work_type", "execution_profile", "collision_group", "base_sha"], "target");
+  const authorization = hasDryRunAuthorization ? dryRunAuthorization(root.dry_run_authorization) : undefined;
   const repository = text(target.repository, "repository");
   if (!REPOSITORY.test(repository)) throw new AdmissionError("repository_not_allowed");
+  if (authorization && (authorization.repository !== repository || authorization.linear_issue !== identifier)) {
+    throw new AdmissionError("dry_run_authorization_identity_mismatch");
+  }
   text(target.work_type, "work_type");
   const executionProfile = text(target.execution_profile, "execution_profile");
   const validationProfile = text(root.validation_profile, "validation_profile");
@@ -620,11 +675,16 @@ async function contractFromDescription(description: unknown, issue: ObjectValue)
   if (!["low", "medium", "high"].includes(String(risk.risk_class)) || !["repository-local", "cross-system"].includes(String(risk.authority_class))) throw new AdmissionError("risk_invalid");
   if (!Array.isArray(root.acceptance_criteria) || root.acceptance_criteria.length === 0 || root.acceptance_criteria.length > 50 || root.acceptance_criteria.some((item) => typeof item !== "string" || item.length === 0 || item.length > 512)) throw new AdmissionError("acceptance_criteria_invalid");
   const scope = object(root.allowed_scope, ["paths", "max_files", "max_changed_lines"], "allowed_scope");
-  if (!Array.isArray(scope.paths) || scope.paths.length === 0 || scope.paths.length > 100 || scope.paths.some((item) => typeof item !== "string" || item.length === 0 || item.length > 512 || item.startsWith("/") || item.split("/").some((part) => part === "" || part === "." || part === ".."))) throw new AdmissionError("allowed_paths_invalid");
-  integer(scope.max_files, "max_files", 12);
-  integer(scope.max_changed_lines, "max_changed_lines", 500);
+  if (authorization) {
+    if (!Array.isArray(scope.paths) || scope.paths.length !== 0 || scope.max_files !== 0 || scope.max_changed_lines !== 0) throw new AdmissionError("dry_run_authorization_allowed_scope_invalid");
+  } else {
+    if (!Array.isArray(scope.paths) || scope.paths.length === 0 || scope.paths.length > 100 || scope.paths.some((item) => typeof item !== "string" || item.length === 0 || item.length > 512 || item.startsWith("/") || item.split("/").some((part) => part === "" || part === "." || part === ".."))) throw new AdmissionError("allowed_paths_invalid");
+    integer(scope.max_files, "max_files", 12);
+    integer(scope.max_changed_lines, "max_changed_lines", 500);
+  }
   if (!["human", "auto-eligible"].includes(String(root.merge_policy))) throw new AdmissionError("merge_policy_invalid");
   if (!Array.isArray(root.stale_conditions) || root.stale_conditions.length === 0 || root.stale_conditions.length > STALE_CONDITIONS.size || root.stale_conditions.some((item) => typeof item !== "string" || !STALE_CONDITIONS.has(item)) || new Set(root.stale_conditions).size !== root.stale_conditions.length) throw new AdmissionError("stale_conditions_invalid");
+  if (authorization && ((root.dependencies as unknown[]).length !== 0 || risk.risk_class !== "low" || risk.authority_class !== "repository-local" || root.merge_policy !== "human")) throw new AdmissionError("dry_run_authorization_constraints_invalid");
   const execution = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid").find((item) => item.id === executionProfile);
   if (!execution) throw new AdmissionError("registry_execution_profile_not_allowed");
   const rawRequest = root.factory_request === undefined ? {} : root.factory_request;
@@ -635,11 +695,11 @@ async function contractFromDescription(description: unknown, issue: ObjectValue)
   const concurrency = requestObject.concurrency === undefined ? 1 : integer(requestObject.concurrency, "factory_request_concurrency", 32);
   const contract: Omit<Contract, "registry"> = {
     contract_version: "v1",
-    dispatch_id: text(root.dispatch_id, "dispatch_id", 192),
+    dispatch_id: dispatchId,
     linear: {
       project_id: text(linear.project_id, "contract_project_id"),
       issue_id: text(linear.issue_id, "contract_issue_id"),
-      identifier: text(linear.identifier, "contract_identifier", 32),
+      identifier: contractIdentifier,
       planning_revision: planningRevision,
       planning_fingerprint: text(linear.planning_fingerprint, "planning_fingerprint", 71),
     },
@@ -667,6 +727,7 @@ async function contractFromDescription(description: unknown, issue: ObjectValue)
     },
     merge_policy: root.merge_policy as Contract["merge_policy"],
     stale_conditions: root.stale_conditions as string[],
+    ...(authorization ? { dry_run_authorization: authorization } : {}),
     factory_request: {
       credential_profile: requestObject.credential_profile === undefined ? "none" : text(requestObject.credential_profile, "factory_request_credential_profile", 128),
       concurrency,
@@ -677,6 +738,24 @@ async function contractFromDescription(description: unknown, issue: ObjectValue)
   };
   const binding = await resolveFactory(issue, contract);
   return { ...contract, registry: binding.identity };
+}
+
+async function dryRunContractReason(payload: ObjectValue): Promise<string | null> {
+  const issue = issueFromPayload(payload);
+  const description = issue.description;
+  if (typeof description !== "string" || description.split(CONTRACT_OPEN).length - 1 !== 1 || description.split(CONTRACT_CLOSE).length - 1 !== 1) return null;
+  const start = description.indexOf(CONTRACT_OPEN) + CONTRACT_OPEN.length;
+  const end = description.indexOf(CONTRACT_CLOSE);
+  let declared: unknown;
+  try { declared = JSON.parse(description.slice(start, end).trim()); } catch { return null; }
+  if (!declared || typeof declared !== "object" || Array.isArray(declared) || !Object.prototype.hasOwnProperty.call(declared, "dry_run_authorization")) return null;
+  try {
+    await contractFromDescription(description, issue);
+  } catch (error) {
+    const reason = error instanceof AdmissionError ? error.message : "dry_run_authorization_contract_invalid";
+    return reason.startsWith("dry_run_authorization_") ? reason : "dry_run_authorization_contract_invalid";
+  }
+  return "dry_run_authorization_non_executable";
 }
 
 function issueFromPayload(payload: unknown): ObjectValue {
@@ -704,6 +783,9 @@ async function admit(raw: string, env: Env): Promise<Job> {
   if (typeof state !== "string" || !ISSUE_STATES.has(state)) throw new AdmissionError("issue_not_eligible");
   if (!labels(issue).includes("factory:accepted")) throw new AdmissionError("factory_acceptance_label_missing");
   const contract = await contractFromDescription(issue.description, issue);
+  if (contract.dry_run_authorization) throw new AdmissionError("dry_run_authorization_non_executable");
+  const risk = contract.risk;
+  if (risk.risk_class === "high" || risk.authority_class === "cross-system") throw new AdmissionError("human_approval_required");
   const contractDigest = await digest(contract);
   const dispatchId = contract.dispatch_id;
   const runId = `run-v1-${(await digest({ dispatchId, contractDigest, baseSha: contract.target.base_sha })).slice(7, 39)}`;
@@ -1284,6 +1366,8 @@ async function acceptLinear(request: Request, env: Env): Promise<Response> {
   if (!currentLinearTimestamp(raw, request.headers.get("Linear-Timestamp"))) return response({ error: "stale_or_missing_timestamp" }, 401);
   const payload = linearPayload(raw);
   if (payload.type !== "Issue" || !payload.data || typeof payload.data !== "object" || Array.isArray(payload.data)) return response({ error: "unsupported_event" }, 202);
+  const dryRunReason = await dryRunContractReason(payload);
+  if (dryRunReason !== null) return response({ accepted: false, reason: dryRunReason }, 202);
   const delivery = request.headers.get("Linear-Delivery");
   if (!delivery || !/^[A-Za-z0-9._:-]{1,256}$/.test(delivery)) return response({ error: "missing_delivery_id" }, 401);
   const id = await eventId(raw, delivery);
@@ -2183,7 +2267,12 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
-      if (url.pathname === "/health") return response({ ok: true });
+      if (url.pathname === "/health") return response({ ok: true, stopped: await stopped(env.DB), automaticMerge: false, source: "github-reviewable" });
+      if (url.pathname.startsWith("/chat-lane")) {
+        const admin = secret(env, "FACTORY_ADMIN_SECRET");
+        if (!isChatLaneAdmin(request, admin ?? null)) return response({ error: "forbidden" }, 403);
+        return (await handleChatLaneRequest(request, env.DB)) ?? response({ error: "not_found" }, 404);
+      }
       if (url.pathname === "/ops/status") {
         const admin = secret(env, "FACTORY_ADMIN_SECRET");
         if (request.method !== "GET" || !admin || request.headers.get("Authorization") !== `Bearer ${admin}`) return response({ error: "forbidden" }, 403);
@@ -2228,6 +2317,14 @@ export default {
     }
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    // The registry is additive and may not yet be migrated on an older
+    // installation. Preserve the existing reconciliation path while making
+    // registry access itself fail closed and observable.
+    try {
+      await recoverExpiredChatLanes(env.DB);
+    } catch (error) {
+      console.error("chat_lane_registry_recovery_failed", error);
+    }
     await recoverStaleLeases(env);
     if (await stopped(env.DB)) return;
     await recoverIngress(env);

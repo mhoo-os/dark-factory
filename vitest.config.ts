@@ -10,7 +10,8 @@ export default defineConfig({
       // Istanbul instruments the bundle and works in Miniflare/workerd.
       provider: "istanbul",
       reporter: ["text", "json-summary"],
-      include: ["src/**/*.ts"],
+      // Lane coverage runs in the Node/SQLite behavioral suite before this Workerd coverage pass.
+      include: ["src/index.ts"],
       // The Worker is intentionally small but its external-provider paths are
       // isolated in local tests. These floors prevent coverage from silently
       // dropping while allowing each provider boundary to remain mocked.

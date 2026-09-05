@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
+import re
 from typing import Any, Iterable, Mapping
 
 from factory.dispatch_contract import DispatchContract, bind_registry_identity, validate_dispatch_contract
@@ -13,6 +15,7 @@ from factory.profile_registry import UnknownProfileError, resolve_profiles
 CONTRACT_OPEN = "<!-- mhoo-factory-dispatch:v1 -->"
 CONTRACT_CLOSE = "<!-- /mhoo-factory-dispatch:v1 -->"
 ELIGIBLE_STATE_TYPES = frozenset({"unstarted", "started"})
+CHECKOUT_HEAD_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,7 @@ def admit_linear_issue(
     issue: Mapping[str, Any],
     *,
     registry: Mapping[str, Any] = REGISTRY,
+    expected_project_id: str | None = None,
     current_planning_revision: str | None = None,
     current_planning_fingerprint: str | None = None,
     current_base_sha: str | None = None,
@@ -84,6 +88,9 @@ def admit_linear_issue(
     existing_issue_dispatches: Mapping[str, Iterable[tuple[str, str]]] | None = None,
     seen_event_ids: Iterable[str] = (),
     event_id: str | None = None,
+    allow_dry_run_authorization: bool = False,
+    current_checkout_head: str | None = None,
+    now: datetime | None = None,
     admitted_registry_identity: Mapping[str, Any] | None = None,
 ) -> AdmissionDecision:
     """Return a deterministic decision without network, model, or provider writes."""
@@ -103,21 +110,21 @@ def admit_linear_issue(
     linear = value.get("linear")
     if isinstance(linear, Mapping):
         identity_errors = []
-        if linear.get("project_id") != _project_id(issue):
+        if linear.get("project_id") != _project_id(issue) or (
+            expected_project_id is not None and linear.get("project_id") != expected_project_id
+        ):
             identity_errors.append("contract_project_mismatch")
         if linear.get("issue_id") != issue_id:
             identity_errors.append("contract_issue_mismatch")
-        if linear.get("identifier") != identifier:
-            identity_errors.append("contract_identifier_mismatch")
         if identity_errors:
             return _reject(*identity_errors)
-
     validation = validate_dispatch_contract(
         value,
         current_planning_revision=current_planning_revision,
         current_planning_fingerprint=current_planning_fingerprint,
         current_base_sha=current_base_sha,
         existing_dispatch_ids=existing_dispatch_ids,
+        now=now,
     )
     if validation.outcome != "admitted":
         return AdmissionDecision(validation.outcome, validation.reasons, validation.contract)
@@ -134,6 +141,14 @@ def admit_linear_issue(
     revision = contract_value["linear"]["planning_revision"]
     if bound_contract.dispatch_id != f"{identifier}@{revision}":
         return AdmissionDecision("not-admitted", ("dispatch_id_not_bound_to_issue_revision",), bound_contract)
+    dry_run_authorization = bound_contract.dry_run_authorization
+    if dry_run_authorization is not None:
+        if not allow_dry_run_authorization:
+            return AdmissionDecision("not-admitted", ("dry_run_authorization_requires_dry_run",), bound_contract)
+        if not isinstance(current_checkout_head, str) or CHECKOUT_HEAD_PATTERN.fullmatch(current_checkout_head) is None:
+            return AdmissionDecision("not-admitted", ("dry_run_authorization_checkout_head_missing",), bound_contract)
+        if current_checkout_head.lower() != dry_run_authorization["checkout_head_sha"].lower():
+            return AdmissionDecision("not-admitted", ("dry_run_authorization_checkout_head_mismatch",), bound_contract)
 
     target = contract_value["target"]
     try:

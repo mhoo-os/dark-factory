@@ -1,6 +1,7 @@
 """Pure validation and canonicalization for Factory Dispatch Contract v1."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -23,6 +24,17 @@ ISSUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$")
 REPOSITORY_PATTERN = re.compile(r"^mhoo-os/[a-z0-9][a-z0-9._-]{0,99}$")
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 BASE_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+LINEAR_MARKDOWN_ISSUE_LINK_PATTERN = re.compile(
+    r"\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]"
+    r"\(https://linear\.app/[A-Za-z0-9_-]+/issue/\1(?:/[A-Za-z0-9._-]+)?\)"
+)
+LINEAR_RICH_ISSUE_LINK_PATTERN = re.compile(
+    r'<issue id="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" '
+    r'href="https://linear\.app/[A-Za-z0-9_-]+/issue/([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)(?:/[A-Za-z0-9._-]+)?">\1</issue>'
+)
+UTC_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+DRY_RUN_MODE = "approved-intake"
+DRY_RUN_MAX_TTL = timedelta(minutes=15)
 
 
 @dataclass(frozen=True)
@@ -42,6 +54,11 @@ class DispatchContract:
     @property
     def execution_profile(self) -> str:
         return self.to_dict()["target"]["execution_profile"]
+
+    @property
+    def dry_run_authorization(self) -> Mapping[str, Any] | None:
+        value = self.to_dict().get("dry_run_authorization")
+        return value if isinstance(value, dict) else None
 
     @property
     def factory_id(self) -> str | None:
@@ -92,6 +109,74 @@ def _string_list(value: Any, path: str, errors: list[str], *, allow_empty: bool 
         errors.append(f"{path}.duplicate")
 
 
+def _dry_run_authorization_errors(value: Any, errors: list[str]) -> None:
+    authorization = _mapping(value, "dry_run_authorization", errors)
+    if authorization is None:
+        return
+    _keys(
+        authorization,
+        {"authorization_id", "mode", "non_executable", "expires_at", "repository", "pr_number", "linear_issue", "review_id", "checkout_head_sha"},
+        "dry_run_authorization",
+        errors,
+    )
+    _string(authorization.get("authorization_id"), "dry_run_authorization.authorization_id", errors, ID_PATTERN, 192)
+    if authorization.get("mode") != DRY_RUN_MODE:
+        errors.append("dry_run_authorization.mode.unsupported")
+    if authorization.get("non_executable") is not True:
+        errors.append("dry_run_authorization.non_executable.required")
+    expires_at = authorization.get("expires_at")
+    if not isinstance(expires_at, str) or UTC_TIMESTAMP_PATTERN.fullmatch(expires_at) is None:
+        errors.append("dry_run_authorization.expires_at.format")
+    else:
+        try:
+            datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            errors.append("dry_run_authorization.expires_at.format")
+    _string(authorization.get("checkout_head_sha"), "dry_run_authorization.checkout_head_sha", errors, BASE_SHA_PATTERN, 40)
+    _string(authorization.get("repository"), "dry_run_authorization.repository", errors, REPOSITORY_PATTERN, 128)
+    pr_number = authorization.get("pr_number")
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or not 1 <= pr_number <= 1_000_000_000:
+        errors.append("dry_run_authorization.pr_number.integer")
+    _string(authorization.get("linear_issue"), "dry_run_authorization.linear_issue", errors, ISSUE_PATTERN, 32)
+    _string(authorization.get("review_id"), "dry_run_authorization.review_id", errors, ID_PATTERN, 192)
+
+
+def _canonical_linear_issue_links(text: str) -> str:
+    markdown_canonical = LINEAR_MARKDOWN_ISSUE_LINK_PATTERN.sub(r"\1", text)
+    return LINEAR_RICH_ISSUE_LINK_PATTERN.sub(r"\1", markdown_canonical)
+
+
+def _normalize_linear_issue_links(value: Any) -> Any:
+    """Undo only Linear's exact automatic issue-link serialization inside JSON fields."""
+    if not isinstance(value, dict):
+        return value
+    normalized = dict(value)
+    changed = False
+    raw_dispatch = normalized.get("dispatch_id")
+    if isinstance(raw_dispatch, str):
+        canonical = _canonical_linear_issue_links(raw_dispatch)
+        if canonical != raw_dispatch:
+            normalized["dispatch_id"] = canonical
+            changed = True
+    linear = normalized.get("linear")
+    if isinstance(linear, dict) and isinstance(linear.get("identifier"), str):
+        canonical = _canonical_linear_issue_links(linear["identifier"])
+        if canonical != linear["identifier"]:
+            normalized_linear = dict(linear)
+            normalized_linear["identifier"] = canonical
+            normalized["linear"] = normalized_linear
+            changed = True
+    authorization = normalized.get("dry_run_authorization")
+    if isinstance(authorization, dict) and isinstance(authorization.get("authorization_id"), str):
+        canonical = _canonical_linear_issue_links(authorization["authorization_id"])
+        if canonical != authorization["authorization_id"]:
+            normalized_authorization = dict(authorization)
+            normalized_authorization["authorization_id"] = canonical
+            normalized["dry_run_authorization"] = normalized_authorization
+            changed = True
+    return normalized if changed else value
+
+
 def _static_errors(value: Any) -> list[str]:
     errors: list[str] = []
     root = _mapping(value, "contract", errors)
@@ -99,7 +184,7 @@ def _static_errors(value: Any) -> list[str]:
         return errors
     _keys(
         root,
-        {"contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions"},
+        {"contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions", "dry_run_authorization"} if "dry_run_authorization" in root else {"contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions"},
         "contract",
         errors,
         optional={"factory_request", "registry"},
@@ -114,6 +199,9 @@ def _static_errors(value: Any) -> list[str]:
     _string_list(root.get("stale_conditions"), "stale_conditions", errors, max_items=10)
     if isinstance(root.get("stale_conditions"), list) and any(item not in STALE_CONDITIONS for item in root["stale_conditions"]):
         errors.append("stale_conditions.unsupported")
+    has_dry_run_authorization = "dry_run_authorization" in root
+    if has_dry_run_authorization:
+        _dry_run_authorization_errors(root.get("dry_run_authorization"), errors)
 
     linear = _mapping(root.get("linear"), "linear", errors)
     if linear is not None:
@@ -160,15 +248,22 @@ def _static_errors(value: Any) -> list[str]:
     scope = _mapping(root.get("allowed_scope"), "allowed_scope", errors)
     if scope is not None:
         _keys(scope, {"paths", "max_files", "max_changed_lines"}, "allowed_scope", errors)
-        _string_list(scope.get("paths"), "allowed_scope.paths", errors, max_items=100)
+        _string_list(scope.get("paths"), "allowed_scope.paths", errors, allow_empty=has_dry_run_authorization, max_items=100)
         if isinstance(scope.get("paths"), list) and any(
             not isinstance(path, str) or path.startswith("/") or path in {".", ".."} or ".." in path.split("/")
             for path in scope["paths"]
         ):
             errors.append("allowed_scope.paths.unsafe")
         for field in ("max_files", "max_changed_lines"):
-            if not isinstance(scope.get(field), int) or isinstance(scope.get(field), bool) or scope[field] < 1:
+            value = scope.get(field)
+            if not isinstance(value, int) or isinstance(value, bool):
+                errors.append(f"allowed_scope.{field}.integer")
+            elif has_dry_run_authorization and value != 0:
+                errors.append(f"dry_run_authorization.allowed_scope.{field}.must_be_zero")
+            elif not has_dry_run_authorization and value < 1:
                 errors.append(f"allowed_scope.{field}.positive_integer")
+        if has_dry_run_authorization and scope.get("paths") != []:
+            errors.append("dry_run_authorization.allowed_scope.paths.must_be_empty")
 
     if "factory_request" in root:
         request = _mapping(root.get("factory_request"), "factory_request", errors)
@@ -218,13 +313,37 @@ def validate_dispatch_contract(
     current_base_sha: str | None = None,
     existing_dispatch_ids: Iterable[str] = (),
     supported_profiles: Iterable[str] | None = None,
+    now: datetime | None = None,
 ) -> ContractValidation:
     """Validate static shape, then classify deterministic admission conditions."""
-    errors = _static_errors(value)
+    normalized_value = _normalize_linear_issue_links(value)
+    errors = _static_errors(normalized_value)
     if errors:
         return ContractValidation("not-admitted", tuple(errors))
-    contract = _make_contract(value)
+    contract = _make_contract(normalized_value)
     document = contract.to_dict()
+    authorization = contract.dry_run_authorization
+    if authorization is not None:
+        if authorization["repository"] != document["target"]["repository"]:
+            return ContractValidation("not-admitted", ("dry_run_authorization_repository_mismatch",), contract)
+        if authorization["linear_issue"] != document["linear"]["identifier"]:
+            return ContractValidation("not-admitted", ("dry_run_authorization_linear_issue_mismatch",), contract)
+        expires_at = datetime.strptime(authorization["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        current_time = now or datetime.now(timezone.utc)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        else:
+            current_time = current_time.astimezone(timezone.utc)
+        if expires_at <= current_time:
+            return ContractValidation("not-admitted", ("dry_run_authorization_expired",), contract)
+        if expires_at - current_time > DRY_RUN_MAX_TTL:
+            return ContractValidation("not-admitted", ("dry_run_authorization_ttl_exceeds_limit",), contract)
+        if document["dependencies"]:
+            return ContractValidation("not-admitted", ("dry_run_authorization_dependencies_must_be_empty",), contract)
+        if document["risk"] != {"risk_class": "low", "authority_class": "repository-local"}:
+            return ContractValidation("not-admitted", ("dry_run_authorization_risk_must_be_low_repository_local",), contract)
+        if document["merge_policy"] != "human":
+            return ContractValidation("not-admitted", ("dry_run_authorization_merge_policy_must_be_human",), contract)
     if contract.dispatch_id in set(existing_dispatch_ids):
         return ContractValidation("not-admitted", ("duplicate_dispatch_id",), contract)
     if supported_profiles is not None and contract.execution_profile not in set(supported_profiles):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import unittest
@@ -11,11 +12,32 @@ from factory.admission import admit_linear_issue, contract_block
 ROOT = Path(__file__).parents[1]
 CASE = json.loads((ROOT / "tests/fixtures/admission_cases.json").read_text())["valid"]
 PROJECT_ID = CASE["project_id"]
+NOW = datetime(2026, 9, 5, 6, 0, tzinfo=timezone.utc)
+CHECKOUT_HEAD = "fedcba9876543210fedcba9876543210fedcba98"
 
 
 def valid_issue() -> dict[str, object]:
     issue = copy.deepcopy(CASE["issue"])
     issue["description"] = contract_block(CASE["contract"])
+    return issue
+
+
+def dry_run_issue() -> dict[str, object]:
+    contract = copy.deepcopy(CASE["contract"])
+    contract["allowed_scope"] = {"paths": [], "max_files": 0, "max_changed_lines": 0}
+    contract["dry_run_authorization"] = {
+        "authorization_id": "MHO-900-b5-receipt",
+        "mode": "approved-intake",
+        "non_executable": True,
+        "expires_at": "2026-09-05T06:10:00Z",
+        "repository": CASE["contract"]["target"]["repository"],
+        "pr_number": 29,
+        "linear_issue": CASE["issue"]["identifier"],
+        "review_id": "MHOO-RX5-MHO-900-PR29-FINAL",
+        "checkout_head_sha": CHECKOUT_HEAD,
+    }
+    issue = copy.deepcopy(CASE["issue"])
+    issue["description"] = contract_block(contract)
     return issue
 
 
@@ -79,6 +101,64 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(decision.outcome, "not-admitted")
         self.assertEqual(decision.reasons, ("registry_authority_ceiling_exceeded",))
 
+    def test_dry_run_authorization_requires_explicit_mode_and_exact_clean_head(self) -> None:
+        blocked = admit_linear_issue(dry_run_issue(), expected_project_id=PROJECT_ID, now=NOW)
+        self.assertEqual(blocked.reasons, ("dry_run_authorization_requires_dry_run",))
+
+        admitted = admit_linear_issue(
+            dry_run_issue(),
+            expected_project_id=PROJECT_ID,
+            allow_dry_run_authorization=True,
+            current_checkout_head=CHECKOUT_HEAD,
+            now=NOW,
+        )
+        self.assertEqual(admitted.outcome, "admitted")
+        self.assertEqual(admitted.contract.dry_run_authorization["authorization_id"], "MHO-900-b5-receipt")
+
+        mismatch = admit_linear_issue(
+            dry_run_issue(),
+            expected_project_id=PROJECT_ID,
+            allow_dry_run_authorization=True,
+            current_checkout_head="0123456789abcdef0123456789abcdef01234567",
+            now=NOW,
+        )
+        self.assertEqual(mismatch.reasons, ("dry_run_authorization_checkout_head_mismatch",))
+
+    def test_linear_self_link_serialization_canonicalizes_before_identity_and_digest(self) -> None:
+        linked = valid_issue()
+        linked_contract = json.loads(linked["description"].split("\n")[1])
+        linked_contract["linear"]["identifier"] = "[MHO-900](https://linear.app/mhoo/issue/MHO-900/example)"
+        linked_contract["dispatch_id"] = "[MHO-900](https://linear.app/mhoo/issue/MHO-900/example)@r1"
+        linked["description"] = contract_block(linked_contract)
+        direct = admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID)
+        normalized = admit_linear_issue(linked, expected_project_id=PROJECT_ID)
+        self.assertEqual(normalized.outcome, "admitted")
+        self.assertEqual(normalized.digest, direct.digest)
+
+    def test_linear_self_link_serialization_canonicalizes_dry_run_authorization(self) -> None:
+        linked = dry_run_issue()
+        linked_contract = json.loads(linked["description"].split("\n")[1])
+        link = (
+            '<issue id="05d02267-3ff6-466d-b9c7-7cdbc30e5aac" '
+            'href="https://linear.app/mhoo/issue/MHO-900/example">MHO-900</issue>'
+        )
+        linked_contract["linear"]["identifier"] = link
+        linked_contract["dispatch_id"] = f"{link}@r1"
+        linked_contract["dry_run_authorization"]["authorization_id"] = f"{link}-b5-receipt"
+        linked["description"] = contract_block(linked_contract)
+        decision = admit_linear_issue(
+            linked,
+            expected_project_id=PROJECT_ID,
+            allow_dry_run_authorization=True,
+            current_checkout_head=CHECKOUT_HEAD,
+            now=NOW,
+        )
+        self.assertEqual(decision.outcome, "admitted")
+        self.assertEqual(decision.dispatch_id, "MHO-900@r1")
+        self.assertEqual(decision.contract.dry_run_authorization["authorization_id"], "MHO-900-b5-receipt")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

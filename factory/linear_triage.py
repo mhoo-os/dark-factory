@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -25,6 +26,7 @@ TEAM_ID = _DEFAULT_MAPPING[2]
 PROJECT_ID = _DEFAULT_MAPPING[1]
 ORG = "mhoo-os"
 MARKER = "mhoo-dark-factory:v1"
+CHECKOUT_HEAD_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
 
 class TriageError(RuntimeError):
@@ -46,6 +48,7 @@ class Candidate:
     repository: str
     dispatch_id: str
     contract_digest: str
+    dry_run_authorization: dict[str, Any] | None
 
     @property
     def bridge_key(self) -> str:
@@ -91,17 +94,27 @@ def remote_stop_requested(repositories: set[str]) -> None:
             raise TriageError(f"remote factory:stop is present for {repository}")
 
 
-def admission_for(issue: dict[str, Any]) -> AdmissionDecision:
-    return admit_linear_issue(issue)
+def admission_for(
+    issue: dict[str, Any], *, dry_run: bool = False, checkout_head: str | None = None
+) -> AdmissionDecision:
+    return admit_linear_issue(
+        issue,
+        expected_project_id=PROJECT_ID,
+        allow_dry_run_authorization=dry_run,
+        current_checkout_head=checkout_head,
+    )
 
 
-def candidate_from(issue: dict[str, Any]) -> Candidate:
-    admission = admission_for(issue)
+def candidate_from(
+    issue: dict[str, Any], *, dry_run: bool = False, checkout_head: str | None = None
+) -> Candidate:
+    admission = admission_for(issue, dry_run=dry_run, checkout_head=checkout_head)
     if admission.outcome != "admitted" or admission.contract is None:
         reasons = ",".join(admission.reasons) or admission.outcome
         raise TriageError(f"admission_{admission.outcome}:{reasons}")
     document = admission.contract.to_dict()
     target = document["target"]
+    authorization = admission.contract.dry_run_authorization
     labels = tuple(label["name"] for label in issue["labels"]["nodes"])
     return Candidate(
         id=issue["id"], identifier=issue["identifier"], title=issue["title"],
@@ -110,6 +123,7 @@ def candidate_from(issue: dict[str, Any]) -> Candidate:
         state_name=issue["state"]["name"], labels=labels,
         candidate_key=admission.contract.dispatch_id, repository=target["repository"],
         dispatch_id=admission.contract.dispatch_id, contract_digest=admission.contract.digest,
+        dry_run_authorization=dict(authorization) if authorization else None,
     )
 
 
@@ -176,10 +190,12 @@ def eligible_issues() -> list[dict[str, Any]]:
     return issues
 
 
-def admission_report(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def admission_report(
+    issues: list[dict[str, Any]], *, dry_run: bool = False, checkout_head: str | None = None
+) -> list[dict[str, Any]]:
     report = []
     for issue in issues:
-        decision = admission_for(issue)
+        decision = admission_for(issue, dry_run=dry_run, checkout_head=checkout_head)
         report.append({
             "issue": issue.get("identifier", "unknown"),
             "outcome": decision.outcome,
@@ -190,30 +206,77 @@ def admission_report(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return report
 
 
-def select(issues: list[dict[str, Any]]) -> Candidate | None:
+def select(issues: list[dict[str, Any]], *, dry_run: bool = False, checkout_head: str | None = None) -> Candidate | None:
     candidates: list[Candidate] = []
     for issue in issues:
         try:
-            candidates.append(candidate_from(issue))
+            candidates.append(candidate_from(issue, dry_run=dry_run, checkout_head=checkout_head))
         except TriageError:
             continue
     candidates.sort(key=lambda item: (item.priority, item.identifier))
     return candidates[0] if candidates else None
 
 
-def pending_candidate(issues: list[dict[str, Any]]) -> tuple[Candidate, str | None] | None:
+def pending_candidate(
+    issues: list[dict[str, Any]], *, dry_run: bool = False, checkout_head: str | None = None
+) -> tuple[Candidate, str | None] | None:
     candidates: list[Candidate] = []
     for issue in issues:
         try:
-            candidates.append(candidate_from(issue))
+            candidates.append(candidate_from(issue, dry_run=dry_run, checkout_head=checkout_head))
         except TriageError:
             continue
     candidates.sort(key=lambda item: (item.priority, item.identifier))
+    dry_run_candidates = [candidate for candidate in candidates if candidate.dry_run_authorization is not None]
+    if dry_run_candidates:
+        if len(dry_run_candidates) != 1:
+            raise TriageError("dry_run_authorization_ambiguous")
+        return dry_run_candidates[0], None
     for candidate in candidates:
         existing = existing_issue(candidate)
         if existing is None:
             return candidate, None
     return None
+
+
+def clean_checkout_head() -> str:
+    """Bind a temporary authorization to one clean checkout before any provider write path."""
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, text=True, capture_output=True)
+    if status.returncode or status.stdout:
+        raise TriageError("dry_run_authorization_checkout_not_clean")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True)
+    value = head.stdout.strip()
+    if head.returncode or CHECKOUT_HEAD_PATTERN.fullmatch(value) is None:
+        raise TriageError("dry_run_authorization_checkout_head_unreadable")
+    return value.lower()
+
+
+def plan_candidate(candidate: Candidate, *, dry_run: bool) -> dict[str, Any]:
+    """Return the only plan allowed for a temporary B5 authorization before any writes."""
+    if candidate.dry_run_authorization is not None:
+        if not dry_run:
+            raise TriageError("dry_run_authorization_requires_dry_run")
+        return {
+            "action": "approved-intake-dry-run",
+            "candidate": candidate.identifier,
+            "dispatch_id": candidate.dispatch_id,
+            "contract_digest": candidate.contract_digest,
+            "authorization_id": candidate.dry_run_authorization["authorization_id"],
+            "repository": candidate.dry_run_authorization["repository"],
+            "pr_number": candidate.dry_run_authorization["pr_number"],
+            "linear_issue": candidate.dry_run_authorization["linear_issue"],
+            "review_id": candidate.dry_run_authorization["review_id"],
+            "checkout_head_sha": candidate.dry_run_authorization["checkout_head_sha"],
+            "normal_dispatch": False,
+            "provider_mutations": False,
+        }
+    existing = existing_issue(candidate)
+    return {
+        "candidate": candidate.identifier,
+        "repository": candidate.repository,
+        "github_execution_issue": existing,
+        "action": "unchanged" if existing else "create",
+    }
 
 
 def main() -> int:
@@ -224,23 +287,27 @@ def main() -> int:
     try:
         if (ROOT / ".factory/STOP").exists():
             raise TriageError("local .factory/STOP is present")
+        checkout_head = clean_checkout_head() if args.dry_run else None
         issues = json.loads(args.fixture.read_text()) if args.fixture else eligible_issues()
         admitted = []
         for issue in issues:
             try:
-                admitted.append(candidate_from(issue))
+                admitted.append(candidate_from(issue, dry_run=args.dry_run, checkout_head=checkout_head))
             except TriageError:
                 continue
         remote_stop_requested({candidate.repository for candidate in admitted})
-        selected = pending_candidate(issues)
+        selected = pending_candidate(issues, dry_run=args.dry_run, checkout_head=checkout_head)
         if selected is None:
-            print(json.dumps({"action": "noop", "reason": "no_admitted_linear_contract", "admissions": admission_report(issues)}, sort_keys=True))
+            print(json.dumps({"action": "noop", "reason": "no_admitted_linear_contract", "admissions": admission_report(issues, dry_run=args.dry_run, checkout_head=checkout_head)}, sort_keys=True))
             return 0
         candidate, existing = selected
-        plan = {"candidate": candidate.identifier, "repository": candidate.repository, "github_execution_issue": existing, "action": "unchanged" if existing else "create"}
+        plan = plan_candidate(candidate, dry_run=args.dry_run)
         if args.dry_run:
             print(json.dumps(plan, sort_keys=True))
             return 0
+        if candidate.dry_run_authorization is not None:
+            raise TriageError("dry_run_authorization_requires_dry_run")
+        assert existing is not None or plan["action"] == "create"
         github_url = create_issue(candidate)
         update_linear(candidate, github_url)
         print(json.dumps({**plan, "github_execution_issue": github_url}, sort_keys=True))
@@ -252,3 +319,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
