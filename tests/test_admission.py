@@ -119,11 +119,31 @@ class AdmissionTests(unittest.TestCase):
         linked = valid_issue()
         linked_contract = json.loads(linked["description"].split("\n")[1])
         linked_contract["linear"]["identifier"] = "[MHO-900](https://linear.app/mhoo/issue/MHO-900/example)"
+        linked_contract["dispatch_id"] = "[MHO-900](https://linear.app/mhoo/issue/MHO-900/example)@r1"
         linked["description"] = contract_block(linked_contract)
         direct = admit_linear_issue(valid_issue(), expected_project_id=PROJECT_ID)
         normalized = admit_linear_issue(linked, expected_project_id=PROJECT_ID)
         self.assertEqual(normalized.outcome, "admitted")
         self.assertEqual(normalized.digest, direct.digest)
+
+    def test_linear_self_link_serialization_canonicalizes_dry_run_authorization(self) -> None:
+        linked = dry_run_issue()
+        linked_contract = json.loads(linked["description"].split("\n")[1])
+        link = "[MHO-900](https://linear.app/mhoo/issue/MHO-900/example)"
+        linked_contract["linear"]["identifier"] = link
+        linked_contract["dispatch_id"] = f"{link}@r1"
+        linked_contract["dry_run_authorization"]["authorization_id"] = f"{link}-b5-receipt"
+        linked["description"] = contract_block(linked_contract)
+        decision = admit_linear_issue(
+            linked,
+            expected_project_id=PROJECT_ID,
+            allow_dry_run_authorization=True,
+            current_checkout_head=CHECKOUT_HEAD,
+            now=NOW,
+        )
+        self.assertEqual(decision.outcome, "admitted")
+        self.assertEqual(decision.dispatch_id, "MHO-900@r1")
+        self.assertEqual(decision.contract.dry_run_authorization["authorization_id"], "MHO-900-b5-receipt")
 
 
 if __name__ == "__main__":

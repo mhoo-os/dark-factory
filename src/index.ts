@@ -19,7 +19,7 @@ const STALE_CONDITIONS = new Set([
 const SHA40 = /^[0-9a-f]{40}$/i;
 const REPOSITORY = /^mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}$/;
 const ISSUE_IDENTIFIER = /^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/;
-const LINEAR_ISSUE_LINK = /^\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]\(https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/\1(?:\/[A-Za-z0-9._-]+)?\)$/;
+const LINEAR_ISSUE_LINK = /\[([A-Z][A-Z0-9]{1,9}-[1-9][0-9]*)\]\(https:\/\/linear\.app\/[A-Za-z0-9_-]+\/issue\/\1(?:\/[A-Za-z0-9._-]+)?\)/g;
 const BRANCH = /^factory\/[a-z0-9][a-z0-9-]{0,127}$/;
 const RUN_ID = /^run-v1-[0-9a-f]{32}$/;
 const GITHUB_API_VERSION = "2022-11-28";
@@ -288,7 +288,7 @@ function integer(value: unknown, label: string, max: number): number {
 
 function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorization {
   const authorization = object(value, ["authorization_id", "mode", "non_executable", "expires_at", "checkout_head_sha"], "dry_run_authorization");
-  const authorizationId = text(authorization.authorization_id, "dry_run_authorization_id", 192);
+  const authorizationId = canonicalLinearIssueLinks(authorization.authorization_id, "dry_run_authorization_id", 192);
   if (authorization.mode !== "approved-intake") throw new AdmissionError("dry_run_authorization_mode_invalid");
   if (authorization.non_executable !== true) throw new AdmissionError("dry_run_authorization_non_executable_required");
   const expiresAt = text(authorization.expires_at, "dry_run_authorization_expires_at", 20);
@@ -301,9 +301,12 @@ function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorizat
   return { authorization_id: authorizationId, mode: "approved-intake", non_executable: true, expires_at: expiresAt, checkout_head_sha: checkoutHead };
 }
 
+function canonicalLinearIssueLinks(value: unknown, label: string, max: number): string {
+  return text(value, label, max).replace(LINEAR_ISSUE_LINK, "$1");
+}
+
 function canonicalLinearIdentifier(value: unknown): string {
-  const raw = text(value, "contract_identifier", 512);
-  return raw.match(LINEAR_ISSUE_LINK)?.[1] ?? raw;
+  return canonicalLinearIssueLinks(value, "contract_identifier", 512);
 }
 
 function contractFromDescription(description: unknown, issue: ObjectValue, env: Env): Contract {
@@ -328,7 +331,8 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (linear.project_id !== projectId || linear.issue_id !== issueId || contractIdentifier !== identifier) throw new AdmissionError("contract_linear_identity_mismatch");
   if (!/^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$/.test(identifier)) throw new AdmissionError("issue_identifier_invalid");
   const planningRevision = text(linear.planning_revision, "planning_revision");
-  if (root.dispatch_id !== `${identifier}@${planningRevision}`) throw new AdmissionError("dispatch_id_not_bound_to_revision");
+  const dispatchId = canonicalLinearIssueLinks(root.dispatch_id, "dispatch_id", 192);
+  if (dispatchId !== `${identifier}@${planningRevision}`) throw new AdmissionError("dispatch_id_not_bound_to_revision");
   if (!/^sha256:[0-9a-f]{64}$/.test(text(linear.planning_fingerprint, "planning_fingerprint", 71))) throw new AdmissionError("planning_fingerprint_invalid");
   const target = object(root.target, ["repository", "work_type", "execution_profile", "collision_group", "base_sha"], "target");
   const authorization = hasDryRunAuthorization ? dryRunAuthorization(root.dry_run_authorization) : undefined;
@@ -368,7 +372,7 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (authorization && ((root.dependencies as unknown[]).length !== 0 || risk.risk_class !== "low" || risk.authority_class !== "repository-local" || root.merge_policy !== "human")) throw new AdmissionError("dry_run_authorization_constraints_invalid");
   const contract: Contract = {
     contract_version: "v1",
-    dispatch_id: text(root.dispatch_id, "dispatch_id", 192),
+    dispatch_id: dispatchId,
     linear: {
       project_id: text(linear.project_id, "contract_project_id"),
       issue_id: text(linear.issue_id, "contract_issue_id"),

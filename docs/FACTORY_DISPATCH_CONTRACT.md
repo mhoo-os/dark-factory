@@ -12,8 +12,9 @@ The `linear.issue_id` field is the immutable provider identity for the Linear is
 Linear may automatically serialize a bare issue key as its own Markdown issue link when
 it stores a description. The validators canonicalize only that exact self-link form
 (`[` + identifier + `](https://linear.app/.../issue/` + identifier + `...)`) back to
-the identifier before identity comparison and digesting. Other Markdown or URLs remain
-invalid contract identifiers.
+the identifier in `linear.identifier`, `dispatch_id`, and a temporary authorization ID
+before identity comparison and digesting. Other Markdown or URLs remain invalid contract
+identifiers.
 
 Validation has three outcomes:
 
