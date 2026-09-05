@@ -46,6 +46,7 @@ test("agent source has no raw-output or credential logging path", async () => {
   assert.doesNotMatch(source, /console\.log\((?:validation|body|process\.env)/);
   assert.match(source, /delete env\.OPENROUTER_API_KEY/);
   assert.match(source, /delete env\.GITHUB_TOKEN/);
+  assert.match(source, /remote", "set-url", "origin", `https:\/\/github\.com\/\$\{repository\}\.git`/);
   assert.match(source, /ls-files/);
   assert.match(source, /lstat/);
   assert.match(source, /finally/);

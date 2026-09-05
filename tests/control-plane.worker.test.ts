@@ -93,6 +93,7 @@ describe("local Worker control-plane behavior", () => {
 
   it("keeps the none credential profile empty", () => {
     expect(__TEST_ONLY__.sandboxCredentials({ GITHUB_TOKEN: "must-not-leak", OPENROUTER_API_KEY: "must-not-leak" } as never, contract)).toEqual({});
+    expect(__TEST_ONLY__.sandboxRemote(contract.target.repository)).toBe("https://github.com/mhoo-os/dark-factory.git");
     expect(__TEST_ONLY__.inherentEffectClasses(contract)).toEqual(["repository-write"]);
   });
 
@@ -129,7 +130,7 @@ describe("local Worker control-plane behavior", () => {
   it("accepts exactly one signed GitHub reconciliation webhook and rejects unsigned control-plane input", async () => {
     const raw = JSON.stringify({
       action: "synchronize", repository: { full_name: contract.target.repository },
-      pull_request: { number: 41, body: `<!-- mhoo-dark-factory-run:v1 run=${runId} -->` },
+      pull_request: { number: 41, body: __TEST_ONLY__.pullRequestMarker(runId, dispatchId) },
     });
     const secret = "webhook-test-secret";
     const sent: unknown[] = [];
@@ -146,7 +147,9 @@ describe("local Worker control-plane behavior", () => {
     await expect(worker.fetch(request(), webhookEnv as never)).resolves.toMatchObject({ status: 202 });
     await expect(worker.fetch(request(), webhookEnv as never)).resolves.toMatchObject({ status: 200 });
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toMatchObject({ kind: "github-reconciliation", runId, repository: contract.target.repository, prNumber: 41 });
+    expect(sent[0]).toMatchObject({ kind: "github-reconciliation", runId, dispatchId, repository: contract.target.repository, prNumber: 41 });
+    expect(__TEST_ONLY__.pullRequestMarkerBinding(`<!-- mhoo-dark-factory-run:v1 run=${runId} -->`)).toBeNull();
+    expect(__TEST_ONLY__.pullRequestMarkerBinding(`${__TEST_ONLY__.pullRequestMarker(runId, dispatchId)}\n${__TEST_ONLY__.pullRequestMarker(runId, dispatchId)}`)).toBeNull();
     await expect(worker.fetch(new Request("https://control.test/webhooks/github", { method: "POST", body: raw }), webhookEnv as never)).resolves.toMatchObject({ status: 401 });
     await expect(env.DB.prepare("SELECT handoff_state FROM factory_ingress_events WHERE provider='github' AND event_type='pull_request' ORDER BY received_at DESC LIMIT 1").first()).resolves.toMatchObject({ handoff_state: "enqueued" });
   });
@@ -335,6 +338,13 @@ describe("local Worker control-plane behavior", () => {
   });
 
   it("schedules only a live queued job, persists its capped initial expiry, and leaves an expired job lease-free", async () => {
+    const liveIssues = new Map<string, unknown>();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      if (String(input) !== "https://api.linear.app/graphql") throw new Error(`unexpected request ${String(input)}`);
+      const request = JSON.parse(String(init?.body));
+      return Response.json({ data: { issue: liveIssues.get(request.variables.issueId) } });
+    };
     const issue = {
       project: { id: contract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" },
       state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] },
@@ -342,19 +352,26 @@ describe("local Worker control-plane behavior", () => {
     const binding = await __TEST_ONLY__.resolveFactory(issue as never, contract as never);
     const schedulerEnv = Object.assign(Object.create(env), {
       FACTORY_ENABLED: "true", FACTORY_AUTONOMY: "1", MAX_COST_USD: "8", MAX_GLOBAL_CONCURRENCY: "1",
+      LINEAR_API_KEY: "linear-test",
       EXECUTION_WORKFLOW: { create: async () => ({ id: "local-workflow" }) },
     });
     const add = async (suffix: string, createdAt: string) => {
-      const dispatch = `MHO-224@scheduler-${suffix}`;
+      const identifier = `MHO-${suffix === "0" ? "225" : "226"}`;
+      const dispatch = `${identifier}@scheduler-${suffix}`;
       const runId = `run-v1-${suffix.repeat(32)}`;
-      const liveContract = { ...contract, dispatch_id: dispatch, linear: { ...contract.linear, issue_id: `issue-scheduler-${suffix}`, identifier: `MHO-${suffix === "0" ? "225" : "226"}` }, registry: binding.identity };
+      const liveContract = { ...contract, dispatch_id: dispatch, linear: { ...contract.linear, issue_id: `issue-scheduler-${suffix}`, identifier, planning_revision: `scheduler-${suffix}` }, registry: binding.identity };
+      const { registry: _registry, ...planningContract } = liveContract;
+      liveIssues.set(liveContract.linear.issue_id, { id: liveContract.linear.issue_id, identifier: liveContract.linear.identifier, description: `<!-- mhoo-factory-dispatch:v1 -->\n${JSON.stringify(planningContract)}\n<!-- /mhoo-factory-dispatch:v1 -->`, project: { id: liveContract.linear.project_id }, team: { id: "085d25a0-104f-4e80-82fb-b0ea7c476b0b" }, state: { type: "started" }, labels: { nodes: [{ name: "factory:accepted" }] } });
       const contractDigest = await __TEST_ONLY__.digest(liveContract);
       const profileDigest = await __TEST_ONLY__.profileDigest(liveContract);
       await env.DB.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(dispatch, runId, contractDigest, profileDigest, binding.identity.factory_id, binding.identity.registry_version, binding.identity.registry_digest, binding.identity.entry_version, JSON.stringify(liveContract), liveContract.linear.project_id, liveContract.linear.issue_id, liveContract.linear.identifier, liveContract.target.repository, liveContract.target.collision_group, liveContract.target.base_sha, "queued", createdAt, createdAt).run();
       return { dispatch, runId, contract: liveContract, contractDigest, createdAt };
     };
+    try {
     const live = await add("0", new Date().toISOString());
-    await expect(__TEST_ONLY__.schedule(schedulerEnv as never, { kind: "dispatch", dispatchId: live.dispatch, runId: live.runId, contractDigest: live.contractDigest, contract: live.contract })).resolves.toBe("dispatched");
+    const scheduled = await __TEST_ONLY__.schedule(schedulerEnv as never, { kind: "dispatch", dispatchId: live.dispatch, runId: live.runId, contractDigest: live.contractDigest, contract: live.contract });
+    const schedulingRecord = await env.DB.prepare("SELECT current_state,result_json FROM factory_runs WHERE run_id=?").bind(live.runId).first();
+    expect({ scheduled, schedulingRecord }).toMatchObject({ scheduled: "dispatched" });
     const leased = await env.DB.prepare("SELECT lease_fence,lease_expires_at FROM factory_runs WHERE run_id=?").bind(live.runId).first<{ lease_fence: number; lease_expires_at: string }>();
     const lease = await env.DB.prepare("SELECT expires_at FROM factory_leases WHERE dispatch_id=? LIMIT 1").bind(live.runId).first<{ expires_at: string }>();
     expect(leased?.lease_expires_at).toBe(lease?.expires_at);
@@ -362,11 +379,21 @@ describe("local Worker control-plane behavior", () => {
     await __TEST_ONLY__.releaseLease(env.DB, { ...(await env.DB.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url,created_at FROM factory_runs WHERE run_id=?").bind(live.runId).first()), lease_fence: leased?.lease_fence } as never);
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(live.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
 
+    const revoked = await add("3", new Date().toISOString());
+    const current = liveIssues.get(revoked.contract.linear.issue_id) as { labels: { nodes: unknown[] } };
+    liveIssues.set(revoked.contract.linear.issue_id, { ...current, labels: { nodes: [] } });
+    await expect(__TEST_ONLY__.schedule(schedulerEnv as never, { kind: "dispatch", dispatchId: revoked.dispatch, runId: revoked.runId, contractDigest: revoked.contractDigest, contract: revoked.contract })).resolves.toBe("needs-human");
+    await expect(env.DB.prepare("SELECT current_state FROM factory_runs WHERE run_id=?").bind(revoked.runId).first()).resolves.toMatchObject({ current_state: "needs-human" });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(revoked.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+
     const expired = await add("1", new Date(Date.now() - 901_000).toISOString());
     await expect(__TEST_ONLY__.schedule(schedulerEnv as never, { kind: "dispatch", dispatchId: expired.dispatch, runId: expired.runId, contractDigest: expired.contractDigest, contract: expired.contract })).resolves.toBe("needs-human");
     await expect(env.DB.prepare("SELECT current_state,result_json FROM factory_runs WHERE run_id=?").bind(expired.runId).first<{ current_state: string; result_json: string }>()).resolves.toMatchObject({ current_state: "needs-human" });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(expired.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_reservations WHERE run_id=?").bind(expired.runId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("fences a deterministic deadline expiry during D1 acquisition before Workflow creation", async () => {

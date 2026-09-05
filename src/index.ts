@@ -154,6 +154,7 @@ type GitHubReconciliationJob = {
   kind: "github-reconciliation";
   eventId: string;
   runId?: string;
+  dispatchId?: string;
   branch?: string;
   repository: string;
   prNumber?: number;
@@ -240,10 +241,20 @@ function sandboxCredentials(env: Env, contract: Contract): SandboxCredentials {
   return { githubToken, openRouterKey };
 }
 
-function sandboxRemote(repository: string, githubToken?: string): string {
-  return githubToken
-    ? `https://x-access-token:${encodeURIComponent(githubToken)}@github.com/${repository}.git`
-    : `https://github.com/${repository}.git`;
+function sandboxRemote(repository: string): string {
+  return `https://github.com/${repository}.git`;
+}
+
+function pullRequestMarker(runId: string, dispatchId: string): string {
+  if (!RUN_ID.test(runId) || !/^[A-Za-z0-9._:@-]{1,192}$/.test(dispatchId)) throw new Error("pull_request_marker_invalid");
+  return `<!-- mhoo-dark-factory-run:v1 run=${runId} dispatch=${dispatchId} -->`;
+}
+
+function pullRequestMarkerBinding(body: string): { runId: string; dispatchId: string } | null {
+  const matches = body.match(/<!-- mhoo-dark-factory-run:v1 run=(run-v1-[0-9a-f]{32}) dispatch=([A-Za-z0-9._:@-]{1,192}) -->/g);
+  if (!matches || matches.length !== 1) return null;
+  const match = matches[0].match(/^<!-- mhoo-dark-factory-run:v1 run=(run-v1-[0-9a-f]{32}) dispatch=([A-Za-z0-9._:@-]{1,192}) -->$/);
+  return match ? { runId: match[1], dispatchId: match[2] } : null;
 }
 
 function configInteger(env: Env, name: string, minimum: number, maximum: number): number | null {
@@ -1026,9 +1037,9 @@ function githubSelectors(payload: ObjectValue, eventType: string): ObjectValue |
     const number = (pull as ObjectValue).number;
     if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1 || number > 1_000_000_000) throw new AdmissionError("github_pr_number_invalid");
     const body = typeof (pull as ObjectValue).body === "string" ? boundedTextValue((pull as ObjectValue).body as string) : "";
-    const match = body.match(/<!-- mhoo-dark-factory-run:v1 run=(run-v1-[0-9a-f]{32}) -->/);
-    if (!match) return null;
-    return { kind: "github-pull-request", run_id: match[1], repository: fullName, pr_number: number, action };
+    const marker = pullRequestMarkerBinding(body);
+    if (!marker) return null;
+    return { kind: "github-pull-request", run_id: marker.runId, dispatch_id: marker.dispatchId, repository: fullName, pr_number: number, action };
   }
   const workflow = payload.workflow_run;
   if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) return null;
@@ -1105,12 +1116,14 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
   try {
     const contract = storedContract(run);
     registryBinding = await assertCurrentRegistry(contract);
+    const currentContract = await linearPlanningSnapshot(env, run);
+    if (stable(currentContract) !== stable(contract)) throw new Error("linear_authority_stale_re_admission_required");
     if (run.factory_id !== contract.registry.factory_id || run.registry_version !== contract.registry.registry_version || run.registry_digest !== contract.registry.registry_digest || run.registry_entry_version !== contract.registry.entry_version || run.profile_digest !== await profileDigest(contract) || run.dispatch_id !== job.dispatchId || run.contract_digest !== job.contractDigest || await digest(contract) !== run.contract_digest) throw new Error("dispatch_identity_conflict");
     job = { ...job, dispatchId: run.dispatch_id, runId: run.run_id, contractDigest: run.contract_digest, contract };
   } catch (error) {
     try {
       const reason = error instanceof Error ? error.message : "dispatch_identity_conflict";
-      const stale = reason === "registry_stale_re_admission_required" || reason === "registry_factory_disabled";
+      const stale = reason === "registry_stale_re_admission_required" || reason === "registry_factory_disabled" || reason === "linear_authority_stale_re_admission_required";
       await transitionRun(env.DB, job.runId, stale ? "needs-replan" : "needs-human", "reconciler", `schedule:identity-conflict:${job.runId}`, { result: { reason } });
       return stale ? "needs-replan" : "needs-human";
     } catch {
@@ -1436,7 +1449,8 @@ async function groundInSandbox(env: Env, job: Job): Promise<GroundingResult> {
   const baseSha = job.contract.target.base_sha;
   const sandbox = getSandbox(env.Sandbox, `ground-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(sandboxRemote(repository, credentials.githubToken), { depth: 1, targetDir: "/workspace/project" });
+    // Grounding handles untrusted repository bytes, never a credentialed remote.
+    const checkout = await sandbox.gitCheckout(sandboxRemote(repository), { depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", reason: "grounding_checkout_failed", digest: await textDigest("grounding_checkout_failed"), bytes: 0, file_count: 0 };
     const exactBase = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${baseSha} && git -C /workspace/project checkout --detach ${baseSha}`, { timeout: 60_000 });
     if (!exactBase.success) return { status: "failed", reason: "grounding_base_unavailable", digest: await textDigest("grounding_base_unavailable"), bytes: 0, file_count: 0 };
@@ -1465,7 +1479,10 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
   if (configuredModel !== model.model) return { status: "needs-human", reason: "openrouter_model_env_mismatch" };
   const repository = job.contract.target.repository;
   const baseSha = job.contract.target.base_sha;
-  const remote = sandboxRemote(repository, credentials.githubToken);
+  // Candidate code runs only against a public read remote. The agent strips
+  // secrets from every child it executes and configures push credentials only
+  // after validation has completed.
+  const remote = sandboxRemote(repository);
   const sandbox = getSandbox(env.Sandbox, `execution-${job.runId}`);
   try {
     const checkout = await sandbox.gitCheckout(remote, { depth: 1, targetDir: "/workspace/project" });
@@ -1520,7 +1537,7 @@ async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): P
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `validation-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(sandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(sandboxRemote(repository), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_checkout_failed"), output_bytes: 0, reason: "validation_checkout_failed", fixable: false };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
     if (!head.success || head.stdout.trim() !== agent.head_sha) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_head_mismatch"), output_bytes: Math.min(MAX_PROVIDER_BODY_BYTES, head.stdout.length + head.stderr.length), reason: "validation_head_mismatch", fixable: false };
@@ -1548,7 +1565,7 @@ async function reviewInFreshSandbox(env: Env, job: Job, agent: AgentResult): Pro
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `review-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(sandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(sandboxRemote(repository), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", reason: "review_checkout_failed", digest: await textDigest("review_checkout_failed"), bytes: 0 };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
     const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha}`, { timeout: 60_000 });
@@ -1619,7 +1636,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
     if (existing.base.ref !== defaultBranch || existing.base.sha !== job.contract.target.base_sha) throw new Error("publication_base_changed");
     return existing;
   }
-  const marker = `<!-- mhoo-dark-factory-run:v1 run=${job.runId} dispatch=${job.dispatchId} -->`;
+  const marker = pullRequestMarker(job.runId, job.dispatchId);
   const created = await githubRequest(token, "POST", `/repos/${repo}/pulls`, {
     title: `[Factory] ${job.contract.linear.identifier} bounded execution`,
     head: agent.branch,
@@ -1704,10 +1721,10 @@ async function linearPlanningSnapshot(env: Env, run: Run): Promise<Contract> {
 }
 
 async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Promise<"processed" | "ignored"> {
-  if ((!job.runId && !job.branch) || (job.runId !== undefined && !RUN_ID.test(job.runId)) || (job.branch !== undefined && !BRANCH.test(job.branch)) || !REPOSITORY.test(job.repository) || (job.prNumber !== undefined && (!Number.isSafeInteger(job.prNumber) || job.prNumber < 1)) || !/^[A-Za-z0-9._-]{1,64}$/.test(job.action)) throw new Error("reconciliation_job_invalid");
+  if ((!job.runId && !job.branch) || (job.runId !== undefined && !RUN_ID.test(job.runId)) || (job.dispatchId !== undefined && !/^[A-Za-z0-9._:@-]{1,192}$/.test(job.dispatchId)) || (job.branch !== undefined && !BRANCH.test(job.branch)) || !REPOSITORY.test(job.repository) || (job.prNumber !== undefined && (!Number.isSafeInteger(job.prNumber) || job.prNumber < 1)) || !/^[A-Za-z0-9._-]{1,64}$/.test(job.action)) throw new Error("reconciliation_job_invalid");
   const run = job.runId ? await runById(env.DB, job.runId) : await runByBranch(env.DB, job.repository, job.branch as string);
   if (!run) return "ignored";
-  if (run.repository !== job.repository || (run.branch !== null && job.branch !== undefined && run.branch !== job.branch) || (run.pr_number !== null && job.prNumber !== undefined && run.pr_number !== job.prNumber)) throw new Error("reconciliation_identity_conflict");
+  if (run.repository !== job.repository || (job.dispatchId !== undefined && run.dispatch_id !== job.dispatchId) || (run.branch !== null && job.branch !== undefined && run.branch !== job.branch) || (run.pr_number !== null && job.prNumber !== undefined && run.pr_number !== job.prNumber)) throw new Error("reconciliation_identity_conflict");
   const stored = storedContract(run);
   await assertCurrentRegistry(stored);
   if (run.registry_digest !== stored.registry.registry_digest || run.profile_digest !== await profileDigest(stored)) throw new Error("reconciliation_registry_identity_conflict");
@@ -1774,9 +1791,10 @@ function isGitHubReconciliationJob(value: unknown): value is GitHubReconciliatio
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const item = value as ObjectValue;
   const runIdValid = item.runId === undefined || (typeof item.runId === "string" && RUN_ID.test(item.runId));
+  const dispatchIdValid = item.dispatchId === undefined || (typeof item.dispatchId === "string" && /^[A-Za-z0-9._:@-]{1,192}$/.test(item.dispatchId));
   const branchValid = item.branch === undefined || (typeof item.branch === "string" && BRANCH.test(item.branch));
   const prNumberValid = item.prNumber === undefined || (typeof item.prNumber === "number" && Number.isSafeInteger(item.prNumber) && item.prNumber > 0);
-  return item.kind === "github-reconciliation" && typeof item.eventId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(item.eventId) && (item.runId !== undefined || item.branch !== undefined) && runIdValid && branchValid && prNumberValid && typeof item.repository === "string" && REPOSITORY.test(item.repository) && typeof item.action === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(item.action);
+  return item.kind === "github-reconciliation" && typeof item.eventId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(item.eventId) && (item.runId !== undefined || item.branch !== undefined) && runIdValid && dispatchIdValid && branchValid && prNumberValid && typeof item.repository === "string" && REPOSITORY.test(item.repository) && typeof item.action === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(item.action);
 }
 
 function reconciliationJob(eventId: string, selector: ObjectValue): GitHubReconciliationJob {
@@ -1784,6 +1802,7 @@ function reconciliationJob(eventId: string, selector: ObjectValue): GitHubReconc
     kind: "github-reconciliation",
     eventId,
     ...(typeof selector.run_id === "string" ? { runId: selector.run_id } : {}),
+    ...(typeof selector.dispatch_id === "string" ? { dispatchId: selector.dispatch_id } : {}),
     ...(typeof selector.branch === "string" ? { branch: selector.branch } : {}),
     repository: String(selector.repository),
     ...(typeof selector.pr_number === "number" ? { prNumber: selector.pr_number } : {}),
@@ -2038,6 +2057,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
 // are not attached to the public fetch surface.
 export const __TEST_ONLY__ = {
   sandboxCredentials,
+  sandboxRemote,
   inherentEffectClasses,
   capacityLeaseScopes,
   runtimeConcurrencyLimits,
@@ -2057,6 +2077,8 @@ export const __TEST_ONLY__ = {
   providerReceiptMatchesCanonical,
   agentResult,
   resolveFactory,
+  pullRequestMarker,
+  pullRequestMarkerBinding,
   acceptGithub,
   reconcileGithubEvent,
   publishPullRequest,

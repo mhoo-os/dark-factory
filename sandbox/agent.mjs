@@ -107,6 +107,10 @@ async function main() {
     const based = await commandResult("git", ["merge-base", "--is-ancestor", baseSha, "HEAD"]);
     if (based.code !== 0) return result("needs-replan", "fix_branch_base_changed");
   }
+  // The candidate and its tests run before any publishing credential is
+  // configured. Keep origin public even if a checkout implementation supplied
+  // an authenticated URL.
+  if ((await commandResult("git", ["remote", "set-url", "origin", `https://github.com/${repository}.git`])).code !== 0) return result("needs-human", "repository_remote_setup_failed");
   const { files, providerUsage } = await modelFiles(contract); await writeFiles(files);
   const changed = await commandResult("git", ["diff", "--name-only", baseSha]); const untracked = await commandResult("git", ["ls-files", "--others", "--exclude-standard"]); const changedFiles = [...new Set([...(changed.stdout.trim() ? changed.stdout.trim().split("\n") : []), ...(untracked.stdout.trim() ? untracked.stdout.trim().split("\n") : [])])];
   if (changed.code !== 0 || untracked.code !== 0 || changedFiles.length === 0) return result("needs-human", "no_changes");
@@ -121,8 +125,6 @@ async function main() {
   const head = await commandResult("git", ["rev-parse", "HEAD"]); if (head.code !== 0 || !/^[0-9a-f]{40}$/i.test(head.stdout.trim())) return result("needs-human", "head_sha_invalid");
   const home = `/tmp/factory-home-${process.env.FACTORY_RUN_ID}`; await mkdir(home, { recursive: true }); await writeFile(`${home}/.git-credentials`, `https://x-access-token:${process.env.GITHUB_TOKEN}@github.com\n`, { mode: 0o600 });
   let push;
-  const publicRemote = await commandResult("git", ["remote", "set-url", "origin", `https://github.com/${repository}.git`]);
-  if (publicRemote.code !== 0) return result("needs-human", "repository_remote_setup_failed");
   try { push = await commandResult("git", ["-c", "credential.helper=store", "-c", "credential.useHttpPath=true", "push", "--set-upstream", "origin", branch], { timeout: 120000, env: { HOME: home, GIT_TERMINAL_PROMPT: "0" } }); }
   finally { await rm(`${home}/.git-credentials`, { force: true }); await rm(home, { recursive: true, force: true }); }
   if (push.code !== 0) return result("needs-human", "git_push_failed");
