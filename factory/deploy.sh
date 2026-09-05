@@ -35,6 +35,12 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+REPOSITORY="$(git config --get remote.origin.url 2>/dev/null | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')"
+[ -n "$REPOSITORY" ] || { echo "DEPLOY_REFUSED: repository identity is unavailable"; exit 78; }
+python3 -m factory.legacy_policy deploy --repository "$REPOSITORY" || exit $?
+echo "DEPLOY_REFUSED: the registry requires a human release process. This legacy runner will not deploy."
+exit 78
+
 # shellcheck source=factory/config.sh
 . "$ROOT/factory/config.sh"
 

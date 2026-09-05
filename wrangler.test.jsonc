@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mhoo-dark-factory-control-plane-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "FACTORY_ENABLED": "false",
+    "FACTORY_AUTONOMY": "0",
+    "AUTO_MERGE": "false",
+    "MAX_GLOBAL_CONCURRENCY": "1",
+    "MAX_PAYLOAD_BYTES": "65536",
+    "MAX_FIX_ATTEMPTS": "0"
+  },
+  "d1_databases": [{ "binding": "DB", "database_name": "mhoo-dark-factory-test", "database_id": "00000000-0000-0000-0000-000000000000" }],
+  "queues": {
+    "producers": [{ "binding": "EXECUTION_QUEUE", "queue": "mhoo-dark-factory-execution-test" }],
+    "consumers": [{ "queue": "mhoo-dark-factory-execution-test" }]
+  }
+}

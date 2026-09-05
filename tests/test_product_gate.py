@@ -11,7 +11,7 @@ from factory.product_gate import (
 )
 
 ROOT = Path(__file__).parents[1]
-PROFILE_VALUE = json.loads((ROOT / "factory/profile_registry.json").read_text())["validation_profiles"][0]
+PROFILE_VALUE = json.loads((ROOT / "factory/factory_registry.json").read_text())["validation_profiles"][0]
 CASES = json.loads((ROOT / "tests/fixtures/product_gate_cases.json").read_text())
 PROFILE = declare_profile(PROFILE_VALUE)
 

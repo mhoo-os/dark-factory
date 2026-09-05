@@ -15,10 +15,14 @@ from pathlib import Path
 from typing import Any
 
 from factory.admission import AdmissionDecision, admit_linear_issue
+from factory.factory_registry import REGISTRY, active_intake_mappings
 
 ROOT = Path(__file__).resolve().parents[1]
-TEAM_ID = os.environ.get("LINEAR_FACTORY_TEAM_ID", "085d25a0-104f-4e80-82fb-b0ea7c476b0b")
-PROJECT_ID = os.environ.get("LINEAR_FACTORY_PROJECT_ID", "2dab9206-cb92-49a4-aeef-95ec45280098")
+# Compatibility aliases for offline fixtures. Live intake enumerates every active
+# registry mapping below and does not select a named foundation project.
+_DEFAULT_MAPPING = active_intake_mappings()[0]
+TEAM_ID = _DEFAULT_MAPPING[2]
+PROJECT_ID = _DEFAULT_MAPPING[1]
 ORG = "mhoo-os"
 MARKER = "mhoo-dark-factory:v1"
 
@@ -88,7 +92,7 @@ def remote_stop_requested(repositories: set[str]) -> None:
 
 
 def admission_for(issue: dict[str, Any]) -> AdmissionDecision:
-    return admit_linear_issue(issue, expected_project_id=PROJECT_ID)
+    return admit_linear_issue(issue)
 
 
 def candidate_from(issue: dict[str, Any]) -> Candidate:
@@ -149,13 +153,27 @@ def update_linear(candidate: Candidate, github_url: str) -> None:
         raise TriageError("Linear did not confirm the intake return")
 
 
-def eligible_issues() -> list[dict[str, Any]]:
+def eligible_issues_for(team_id: str, project_id: str) -> list[dict[str, Any]]:
     query = """query($teamId: ID!, $projectId: ID!) {
       issues(first: 50, filter: { team: { id: { eq: $teamId } }, project: { id: { eq: $projectId } } }) {
-        nodes { id identifier title description url priority project { id } state { id name type } labels { nodes { name } } }
+        nodes { id identifier title description url priority project { id } team { id } state { id name type } labels { nodes { name } } }
       }
     }"""
-    return graphql(query, {"teamId": TEAM_ID, "projectId": PROJECT_ID})["issues"]["nodes"]
+    return graphql(query, {"teamId": team_id, "projectId": project_id})["issues"]["nodes"]
+
+
+def eligible_issues() -> list[dict[str, Any]]:
+    """Enumerate all active registry mappings rather than one historical pilot."""
+    seen: set[str] = set()
+    issues: list[dict[str, Any]] = []
+    for _factory_id, project_id, team_id in active_intake_mappings():
+        for item in eligible_issues_for(team_id, project_id):
+            issue_id = item.get("id")
+            if not isinstance(issue_id, str) or issue_id in seen:
+                continue
+            seen.add(issue_id)
+            issues.append(item)
+    return issues
 
 
 def admission_report(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:

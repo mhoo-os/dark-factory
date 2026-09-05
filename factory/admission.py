@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import json
 from typing import Any, Iterable, Mapping
 
-from factory.dispatch_contract import DispatchContract, validate_dispatch_contract
+from factory.dispatch_contract import DispatchContract, bind_registry_identity, validate_dispatch_contract
+from factory.factory_registry import REGISTRY, RegistryError, resolve_factory, validate_current_binding
 from factory.profile_registry import UnknownProfileError, resolve_profiles
 
 
@@ -54,6 +55,8 @@ def _declared_contract(description: Any) -> tuple[Mapping[str, Any] | None, tupl
         return None, ("contract_json_invalid",)
     if not isinstance(value, dict):
         return None, ("contract_json_not_object",)
+    if "factory_id" in value or "registry" in value:
+        return None, ("issue_factory_identity_forbidden",)
     return value, ()
 
 
@@ -73,7 +76,7 @@ def _reject(*reasons: str) -> AdmissionDecision:
 def admit_linear_issue(
     issue: Mapping[str, Any],
     *,
-    expected_project_id: str,
+    registry: Mapping[str, Any] = REGISTRY,
     current_planning_revision: str | None = None,
     current_planning_fingerprint: str | None = None,
     current_base_sha: str | None = None,
@@ -81,17 +84,13 @@ def admit_linear_issue(
     existing_issue_dispatches: Mapping[str, Iterable[tuple[str, str]]] | None = None,
     seen_event_ids: Iterable[str] = (),
     event_id: str | None = None,
+    admitted_registry_identity: Mapping[str, Any] | None = None,
 ) -> AdmissionDecision:
     """Return a deterministic decision without network, model, or provider writes."""
     if not isinstance(issue, Mapping):
         return _reject("issue_not_an_object")
     if event_id is not None and event_id in set(seen_event_ids):
         return _reject("replayed_event")
-    if _project_id(issue) != expected_project_id:
-        return _reject("issue_not_in_expected_project")
-    state = issue.get("state")
-    if not isinstance(state, Mapping) or state.get("type") not in ELIGIBLE_STATE_TYPES:
-        return _reject("issue_not_eligible_state")
     issue_id = issue.get("id")
     identifier = issue.get("identifier")
     if not isinstance(issue_id, str) or not isinstance(identifier, str):
@@ -104,7 +103,7 @@ def admit_linear_issue(
     linear = value.get("linear")
     if isinstance(linear, Mapping):
         identity_errors = []
-        if linear.get("project_id") != expected_project_id:
+        if linear.get("project_id") != _project_id(issue):
             identity_errors.append("contract_project_mismatch")
         if linear.get("issue_id") != issue_id:
             identity_errors.append("contract_issue_mismatch")
@@ -123,10 +122,18 @@ def admit_linear_issue(
     if validation.outcome != "admitted":
         return AdmissionDecision(validation.outcome, validation.reasons, validation.contract)
     assert validation.contract is not None
-    contract_value = validation.contract.to_dict()
+    try:
+        binding = resolve_factory(issue, validation.contract.to_dict(), registry=registry)
+        if admitted_registry_identity is not None:
+            validate_current_binding(admitted_registry_identity, registry=registry)
+    except RegistryError as error:
+        outcome = "needs-replan" if str(error) == "registry_stale_re_admission_required" else "not-admitted"
+        return AdmissionDecision(outcome, (str(error),), validation.contract)
+    bound_contract = bind_registry_identity(validation.contract, binding)
+    contract_value = bound_contract.to_dict()
     revision = contract_value["linear"]["planning_revision"]
-    if validation.contract.dispatch_id != f"{identifier}@{revision}":
-        return AdmissionDecision("not-admitted", ("dispatch_id_not_bound_to_issue_revision",), validation.contract)
+    if bound_contract.dispatch_id != f"{identifier}@{revision}":
+        return AdmissionDecision("not-admitted", ("dispatch_id_not_bound_to_issue_revision",), bound_contract)
 
     target = contract_value["target"]
     try:
@@ -134,18 +141,14 @@ def admit_linear_issue(
             target["repository"], target["execution_profile"], contract_value["validation_profile"]
         )
     except (KeyError, TypeError, UnknownProfileError):
-        return AdmissionDecision("not-admitted", ("unsupported_repository_or_profile",), validation.contract)
+        return AdmissionDecision("not-admitted", ("unsupported_repository_or_profile",), bound_contract)
     allowed_groups = {group["id"] for group in profiles.collision_groups}
     if target["collision_group"] not in allowed_groups:
-        return AdmissionDecision("not-admitted", ("unsupported_collision_group",), validation.contract)
+        return AdmissionDecision("not-admitted", ("unsupported_collision_group",), bound_contract)
 
     records = tuple((existing_issue_dispatches or {}).get(issue_id, ()))
     if records:
-        if any(dispatch_id == validation.contract.dispatch_id and digest == validation.contract.digest for dispatch_id, digest in records):
-            return AdmissionDecision("not-admitted", ("duplicate_admitted_dispatch",), validation.contract)
-        return AdmissionDecision("needs-human", ("conflicting_admitted_dispatch",), validation.contract)
-
-    risk = contract_value["risk"]
-    if risk["risk_class"] == "high" or risk["authority_class"] == "cross-system":
-        return AdmissionDecision("needs-human", ("high_risk_or_cross_system_contract",), validation.contract)
-    return AdmissionDecision("admitted", (), validation.contract)
+        if any(dispatch_id == bound_contract.dispatch_id and digest == bound_contract.digest for dispatch_id, digest in records):
+            return AdmissionDecision("not-admitted", ("duplicate_admitted_dispatch",), bound_contract)
+        return AdmissionDecision("needs-human", ("conflicting_admitted_dispatch",), bound_contract)
+    return AdmissionDecision("admitted", (), bound_contract)

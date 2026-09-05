@@ -25,6 +25,10 @@ class SchedulableRun:
     attempts: int = 0
     max_attempts: int = 2
     stop_requested: bool = False
+    factory_id: str | None = None
+    registry_version: str | None = None
+    registry_digest: str | None = None
+    registry_entry_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,8 +61,10 @@ def choose_eligible(
             reason = "stop_requested"
         elif run.risk_class == "high" or run.authority_class == "cross-system":
             reason = "human_authorization_required"
-        elif run.merge_policy == "auto-eligible" and autonomy_level < 3:
-            reason = "merge_policy_not_human_reviewed"
+        elif run.merge_policy != "human":
+            # Registry v1 is human-only. Retaining this check in the local
+            # scheduler prevents a legacy tick from treating level 3 as merge authority.
+            reason = "registry_human_merge_required"
         elif run.attempts >= run.max_attempts:
             reason = "attempt_cap_reached"
         elif any(state != "completed" for state in run.dependency_states.values()):
@@ -90,4 +96,10 @@ def acquire_run_lease(
     return coordinator.acquire(
         lease_keys(run.repository, run.collision_groups),
         owner=owner, dispatch_id=run.dispatch_id, now=now, ttl_seconds=ttl_seconds,
+        registry_identity={
+            "factory_id": run.factory_id,
+            "registry_version": run.registry_version,
+            "registry_digest": run.registry_digest,
+            "entry_version": run.registry_entry_version,
+        } if run.factory_id and run.registry_version and run.registry_digest and run.registry_entry_version else None,
     )

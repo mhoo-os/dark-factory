@@ -6,11 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "vars": {
-    "ALLOWED_REPOSITORY_PREFIX": "mhoo-os/",
     "AUTO_MERGE": "false",
     "FACTORY_AUTONOMY": "0",
     "FACTORY_ENABLED": "false",
-    "LINEAR_PROJECT_ID": "2dab9206-cb92-49a4-aeef-95ec45280098",
     "MAX_COST_USD": "8",
     "MAX_FIX_ATTEMPTS": "2",
     "MAX_GLOBAL_CONCURRENCY": "1",

@@ -1,0 +1,148 @@
+{
+  "schema_version": "v1",
+  "registry_version": "2026-09-03.1",
+  "governance": {
+    "owner": "Mhoo human operators",
+    "approval_record": "MHO-224",
+    "promotion_rule": "human-reviewed pull request",
+    "rollback_rule": "disable the entry in a human-reviewed registry revision"
+  },
+  "model_policies": [
+    {
+      "id": "static:execution-default-v1",
+      "provider": "openrouter",
+      "model": "z-ai/glm-5.3-flash",
+      "version": "2026-09-03",
+      "pricing": {"cost_usd_per_output_token": 0.001, "request_overhead_usd": 0.50}
+    }
+  ],
+  "execution_profiles": [
+    {
+      "id": "python-tests-v1",
+      "runtime": "python:3.12-slim",
+      "checkout_steps": ["checkout_repository_at_declared_base", "install_declared_dependencies"],
+      "allowed_tools": ["bash", "git", "python3"],
+      "model_policy": "static:execution-default-v1",
+      "limits": {"timeout_seconds": 900, "max_changed_lines": 500, "max_files": 12, "cost_usd": 8},
+      "provider_budget": {"max_output_tokens": 4096},
+      "artifacts": ["diff", "test-log", "run-receipt"]
+    }
+  ],
+  "validation_profiles": [
+    {
+      "id": "python-tests-v1",
+      "quick_checks": ["python3 -m py_compile factory/*.py"],
+      "full_checks": ["python3 -m unittest discover -s tests -v"],
+      "required_markers": ["APP_STARTED", "E2E_PASSED", "PROTECTED_OK", "GATE_OK"],
+      "governance_checks": ["no-template-placeholders", "autonomy-default-disabled"],
+      "holdout_hooks": ["independent-checkout", "builder-reasoning-withheld"],
+      "merge_eligibility": "human-only-until-ratchet"
+    }
+  ],
+  "collision_groups": [
+    {"id": "dark-factory-governance", "paths": ["MISSION.md", "FACTORY.md", "FACTORY_RULES.md", "CLAUDE.md", "factory/config.sh"]},
+    {"id": "dark-factory-runtime", "paths": ["factory/**", "tests/**", "src/**", "migrations/**"]},
+    {"id": "dark-factory-reference", "paths": ["README.md", "docs/**"]}
+  ],
+  "factories": [
+    {
+      "factory_id": "foundation-pilot",
+      "display_name": "Mhoo Dark Factory foundation pilot",
+      "owner": "Mhoo human operators",
+      "entry_version": "1",
+      "state": "pilot",
+      "approval_record": "MHO-224",
+      "rollout_phase": "foundation-evidence",
+      "rollback_path": "set this entry state to disabled in a human-reviewed registry revision",
+      "linear": {
+        "project_ids": ["2dab9206-cb92-49a4-aeef-95ec45280098"],
+        "team_ids": ["085d25a0-104f-4e80-82fb-b0ea7c476b0b"],
+        "eligible_state_types": ["unstarted", "started"],
+        "required_contract_versions": ["v1"],
+        "required_labels": ["factory:accepted"]
+      },
+      "repositories": [
+        {
+          "repository": "mhoo-os/dark-factory",
+          "work_types": ["implementation", "test", "documentation"],
+          "execution_profiles": ["python-tests-v1"],
+          "validation_profiles": ["python-tests-v1"],
+          "collision_groups": ["dark-factory-governance", "dark-factory-runtime", "dark-factory-reference"],
+          "scope": {
+            "paths": ["factory/**", "tests/**", "src/**", "migrations/**", "docs/**", "README.md", "package.json", "tsconfig.json", "wrangler.jsonc"],
+            "max_files": 12,
+            "max_changed_lines": 500
+          }
+        }
+      ],
+      "model_policy_keys": ["static:execution-default-v1"],
+      "escalation_ceiling": "human",
+      "risk": {
+        "maximum_risk_class": "medium",
+        "maximum_authority_class": "repository-local",
+        "merge_ceiling": "human",
+        "permitted_work_effect_classes": ["repository-write", "provider-read"],
+        "forbidden_work_effect_classes": ["deployment", "secrets", "production-data", "provider-write", "customer-write", "cross-vertical-access"],
+        "autonomous_merge_exclusions": ["mhoo-os/dark-factory"]
+      },
+      "credentials": {
+        "boundary_id": "foundation-control-plane-v1",
+        "sandbox_secret_profiles": ["none", "github-linear-openrouter-v1"],
+        "tenant_boundary": "mhoo-internal",
+        "default_denials": ["provider", "customer", "production", "cross-vertical"]
+      },
+      "capacity": {
+        "per_factory_concurrency": 1,
+        "global_concurrency": 1,
+        "per_repository_concurrency": 1,
+        "collision_group_concurrency": 1,
+        "cost_usd": 8,
+        "timeout_seconds": 900,
+        "max_changed_lines": 500,
+        "max_files": 12
+      },
+      "evidence": {
+        "evaluator_ids": ["deterministic-validator-v1", "independent-review-v1"],
+        "policy_id": "factory-evidence-v1",
+        "rollout_status": "pilot",
+        "minimum_promotion_evidence": ["MHO-220", "MHO-221"]
+      }
+    },
+    {
+      "factory_id": "dark-connector",
+      "display_name": "Dark Connector Factory",
+      "owner": "Mhoo human operators",
+      "entry_version": "0",
+      "state": "disabled",
+      "approval_record": "not-approved",
+      "rollout_phase": "reserved",
+      "rollback_path": "remain disabled",
+      "linear": {"project_ids": [], "team_ids": [], "eligible_state_types": [], "required_contract_versions": ["v1"], "required_labels": ["factory:accepted"]},
+      "repositories": [],
+      "model_policy_keys": [],
+      "escalation_ceiling": "none",
+      "risk": {"maximum_risk_class": "low", "maximum_authority_class": "repository-local", "merge_ceiling": "human", "permitted_work_effect_classes": [], "forbidden_work_effect_classes": ["all"], "autonomous_merge_exclusions": []},
+      "credentials": {"boundary_id": "disabled", "sandbox_secret_profiles": ["none"], "tenant_boundary": "none", "default_denials": ["provider", "customer", "production", "cross-vertical"]},
+      "capacity": {"per_factory_concurrency": 0, "global_concurrency": 1, "per_repository_concurrency": 0, "collision_group_concurrency": 0, "cost_usd": 0, "timeout_seconds": 0, "max_changed_lines": 0, "max_files": 0},
+      "evidence": {"evaluator_ids": [], "policy_id": "factory-evidence-v1", "rollout_status": "disabled", "minimum_promotion_evidence": ["foundation-pilot-complete"]}
+    },
+    {
+      "factory_id": "finance",
+      "display_name": "Finance Factory",
+      "owner": "Mhoo human operators",
+      "entry_version": "0",
+      "state": "disabled",
+      "approval_record": "not-approved",
+      "rollout_phase": "reserved",
+      "rollback_path": "remain disabled",
+      "linear": {"project_ids": [], "team_ids": [], "eligible_state_types": [], "required_contract_versions": ["v1"], "required_labels": ["factory:accepted"]},
+      "repositories": [],
+      "model_policy_keys": [],
+      "escalation_ceiling": "none",
+      "risk": {"maximum_risk_class": "low", "maximum_authority_class": "repository-local", "merge_ceiling": "human", "permitted_work_effect_classes": [], "forbidden_work_effect_classes": ["all"], "autonomous_merge_exclusions": []},
+      "credentials": {"boundary_id": "disabled", "sandbox_secret_profiles": ["none"], "tenant_boundary": "none", "default_denials": ["provider", "customer", "production", "cross-vertical"]},
+      "capacity": {"per_factory_concurrency": 0, "global_concurrency": 1, "per_repository_concurrency": 0, "collision_group_concurrency": 0, "cost_usd": 0, "timeout_seconds": 0, "max_changed_lines": 0, "max_files": 0},
+      "evidence": {"evaluator_ids": [], "policy_id": "factory-evidence-v1", "rollout_status": "disabled", "minimum_promotion_evidence": ["separate-human-approval"]}
+    }
+  ]
+}

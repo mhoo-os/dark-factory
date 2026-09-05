@@ -17,6 +17,7 @@
     {"from":"blocked-by-dependency","to":"needs-human","actors":["reconciler","human-override"]},
     {"from":"queued","to":"blocked-by-dependency","actors":["scheduler","reconciler"]},
     {"from":"queued","to":"leased","actors":["scheduler"]},
+    {"from":"queued","to":"needs-replan","actors":["reconciler"]},
     {"from":"queued","to":"needs-human","actors":["scheduler","reconciler","human-override"]},
     {"from":"queued","to":"stopped","actors":["human-override"]},
     {"from":"leased","to":"running","actors":["workflow"]},

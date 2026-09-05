@@ -4,6 +4,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
+import registryArtifact from "../factory/factory_registry.json";
 
 export { Sandbox } from "@cloudflare/sandbox";
 
@@ -24,14 +25,11 @@ const GITHUB_API_VERSION = "2022-11-28";
 const MAX_PROVIDER_BODY_BYTES = 64 * 1024;
 const PROVIDER_TIMEOUT_MS = 30_000;
 const GITHUB_EVENT_TYPES = new Set(["pull_request", "workflow_run"]);
-const PROFILE_DIGEST = "sha256:e56a438c8feb33cd39b03aca75a3b8596d63de5c90662f87a16729b9d467acfb";
-const SUPPORTED_TARGETS = {
-  "mhoo-os/dark-factory": {
-    executionProfile: "python-tests-v1",
-    validationProfile: "python-tests-v1",
-    collisionGroups: ["dark-factory-governance", "dark-factory-runtime", "dark-factory-reference"],
-  },
-} as const;
+const FACTORY_REGISTRY = registryArtifact as unknown as ObjectValue;
+const ACTIVE_FACTORY_STATES = new Set(["pilot", "limited", "enabled"]);
+const RISK_ORDER: Readonly<Record<string, number>> = { low: 0, medium: 1, high: 2 };
+const AUTHORITY_ORDER: Readonly<Record<string, number>> = { "repository-local": 0, "cross-system": 1 };
+const MERGE_ORDER: Readonly<Record<string, number>> = { human: 0, "auto-eligible": 1 };
 
 type TransitionActor =
   | "admission"
@@ -60,6 +58,7 @@ const TRANSITION_ACTORS: Readonly<Record<string, readonly TransitionActor[]>> = 
   "blocked-by-dependency->needs-human": ["reconciler", "human-override"],
   "queued->blocked-by-dependency": ["scheduler", "reconciler"],
   "queued->leased": ["scheduler"],
+  "queued->needs-replan": ["reconciler"],
   "queued->needs-human": ["scheduler", "reconciler", "human-override"],
   "queued->stopped": ["human-override"],
   "leased->running": ["workflow"],
@@ -129,6 +128,25 @@ type Contract = {
   allowed_scope: { paths: string[]; max_files: number; max_changed_lines: number };
   merge_policy: "human" | "auto-eligible";
   stale_conditions: string[];
+  factory_request: {
+    credential_profile: string;
+    concurrency: number;
+    model_policy_key: string;
+    escalation_class: string;
+    effect_classes: string[];
+  };
+  registry: {
+    factory_id: string;
+    registry_version: string;
+    registry_digest: string;
+    entry_version: string;
+  };
+};
+
+type RegistryBinding = {
+  identity: Contract["registry"];
+  factory: ObjectValue;
+  repository: ObjectValue;
 };
 
 type DispatchJob = { kind: "dispatch"; dispatchId: string; runId: string; contractDigest: string; contract: Contract };
@@ -136,6 +154,7 @@ type GitHubReconciliationJob = {
   kind: "github-reconciliation";
   eventId: string;
   runId?: string;
+  dispatchId?: string;
   branch?: string;
   repository: string;
   prNumber?: number;
@@ -148,6 +167,10 @@ type Run = {
   run_id: string;
   contract_digest: string;
   profile_digest: string;
+  factory_id: string;
+  registry_version: string;
+  registry_digest: string;
+  registry_entry_version: string;
   contract_json: string;
   linear_issue_id: string;
   repository: string;
@@ -162,6 +185,7 @@ type Run = {
   head_sha: string | null;
   pr_number: number | null;
   pr_url: string | null;
+  created_at: string;
 };
 
 class AdmissionError extends Error {}
@@ -170,13 +194,18 @@ type IngressReceipt = { outcome: "inserted" | "duplicate" | "conflict"; handoffS
 type AgentResult = {
   status: "passed" | "failed" | "needs-replan" | "needs-human";
   reason: string;
+  cost_usd?: number;
+  provider_usage?: { provider: "openrouter"; model: string; generation_id: string; provider_created_at: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cost_usd: number };
   branch?: string;
   head_sha?: string;
   diff_digest?: string;
   validation_digest?: string;
   validation_bytes?: number;
   changed_files?: string[];
+  files?: Array<{ path: string; content: string }>;
+  source_digest?: string;
 };
+type TrustedSource = { repository: string; baseSha: string; archive: string; digest: string };
 type PullRequest = {
   number: number;
   html_url: string;
@@ -202,9 +231,81 @@ function secret(env: Env, name: string): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+type SandboxCredentials = { githubToken?: string; openRouterKey?: string };
+
+function sandboxCredentials(env: Env, contract: Contract): SandboxCredentials {
+  // The credential profile is an authorization boundary, not a label. In
+  // particular, the `none` profile is deliberately an empty environment.
+  if (contract.factory_request.credential_profile === "none") return {};
+  if (contract.factory_request.credential_profile !== "github-linear-openrouter-v1") throw new Error("credential_profile_runtime_unsupported");
+  const githubToken = secret(env, "GITHUB_TOKEN");
+  const openRouterKey = secret(env, "OPENROUTER_API_KEY");
+  if (!githubToken || !openRouterKey) throw new Error("execution_credentials_missing");
+  return { githubToken, openRouterKey };
+}
+
+function sandboxRemote(repository: string): string {
+  return `https://github.com/${repository}.git`;
+}
+
+function authenticatedSandboxRemote(repository: string, token: string): string {
+  if (!REPOSITORY.test(repository) || token.length === 0) throw new Error("trusted_source_identity_invalid");
+  return `https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`;
+}
+
+function base64(bytes: Uint8Array): string {
+  let value = "";
+  for (const byte of bytes) value += String.fromCharCode(byte);
+  return btoa(value);
+}
+
+async function archiveDigest(bytes: Uint8Array): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+  return `sha256:${[...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function trustedSource(env: Env, repository: string, baseSha: string): Promise<TrustedSource> {
+  const token = secret(env, "GITHUB_TOKEN");
+  if (!token || !REPOSITORY.test(repository) || !SHA40.test(baseSha)) throw new Error("trusted_source_identity_invalid");
+  const commit = await githubRequest(token, "GET", `/repos/${repositoryPath(repository)}/commits/${baseSha}`);
+  if (Array.isArray(commit) || commit.sha !== baseSha) throw new Error("trusted_source_sha_mismatch");
+  const response = await fetch(`https://api.github.com/repos/${repositoryPath(repository)}/tarball/${baseSha}`, {
+    headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": GITHUB_API_VERSION },
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+  });
+  const length = Number(response.headers.get("content-length"));
+  if (!response.ok || !Number.isSafeInteger(length) || length < 1 || length > 4 * 1024 * 1024) throw new Error("trusted_source_archive_invalid");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength !== length) throw new Error("trusted_source_archive_truncated");
+  return { repository, baseSha, archive: base64(bytes), digest: await archiveDigest(bytes) };
+}
+
+async function materializeInCandidateSandbox(sandbox: ReturnType<typeof getSandbox>, source: TrustedSource): Promise<boolean> {
+  await sandbox.writeFile("/tmp/factory-source.tar.gz", source.archive, { encoding: "base64" });
+  const extracted = await sandbox.exec("rm -rf /workspace/project && mkdir -p /workspace/project && tar -xzf /tmp/factory-source.tar.gz --strip-components=1 -C /workspace/project && rm -f /tmp/factory-source.tar.gz && test ! -e /workspace/project/.git", { timeout: 60_000 });
+  return extracted.success;
+}
+
+function pullRequestMarker(runId: string, dispatchId: string): string {
+  if (!RUN_ID.test(runId) || !/^[A-Za-z0-9._:@-]{1,192}$/.test(dispatchId)) throw new Error("pull_request_marker_invalid");
+  return `<!-- mhoo-dark-factory-run:v1 run=${runId} dispatch=${dispatchId} -->`;
+}
+
+function pullRequestMarkerBinding(body: string): { runId: string; dispatchId: string } | null {
+  const matches = body.match(/<!-- mhoo-dark-factory-run:v1 run=(run-v1-[0-9a-f]{32}) dispatch=([A-Za-z0-9._:@-]{1,192}) -->/g);
+  if (!matches || matches.length !== 1) return null;
+  const match = matches[0].match(/^<!-- mhoo-dark-factory-run:v1 run=(run-v1-[0-9a-f]{32}) dispatch=([A-Za-z0-9._:@-]{1,192}) -->$/);
+  return match ? { runId: match[1], dispatchId: match[2] } : null;
+}
+
 function configInteger(env: Env, name: string, minimum: number, maximum: number): number | null {
   const parsed = Number(Reflect.get(env, name));
   return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : null;
+}
+
+function configMoney(env: Env, name: string, minimum: number, maximum: number): number | null {
+  const parsed = Number(Reflect.get(env, name));
+  return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : null;
 }
 
 function stable(value: unknown): string {
@@ -224,6 +325,205 @@ async function digest(value: unknown): Promise<string> {
 async function textDigest(value: string): Promise<string> {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return `sha256:${Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function records(value: unknown, reason: string): ObjectValue[] {
+  if (!Array.isArray(value) || value.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+    throw new AdmissionError(reason);
+  }
+  return value as ObjectValue[];
+}
+
+function strings(value: unknown, reason: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new AdmissionError(reason);
+  }
+  return value as string[];
+}
+
+function providerId(issue: ObjectValue, field: "project" | "team"): string {
+  const nested = issue[field];
+  const direct = issue[`${field}_id`] ?? issue[`${field}Id`];
+  const value = nested && typeof nested === "object" && !Array.isArray(nested) ? (nested as ObjectValue).id : direct;
+  return text(value, `registry_${field}_identity_missing`);
+}
+
+function uniqueBy(items: ObjectValue[], key: string, reason: string): void {
+  const values = items.map((item) => text(item[key], reason));
+  if (new Set(values).size !== values.length) throw new AdmissionError(reason);
+}
+
+function nonNegativeNumber(value: unknown, reason: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new AdmissionError(reason);
+  return value;
+}
+
+function inherentEffectClasses(contract: Omit<Contract, "registry"> | Contract): string[] {
+  // A contract cannot omit the effects intrinsic to executing it. Repository
+  // mutation is inherent, a non-empty sandbox profile can read providers, and
+  // automatic merge would be an additional effect even if a caller hid it.
+  return [
+    "repository-write",
+    ...(contract.factory_request.credential_profile === "none" ? [] : ["provider-read"]),
+    ...(contract.merge_policy === "auto-eligible" ? ["merge"] : []),
+  ];
+}
+
+type RuntimeLimits = { timeoutSeconds: number; costUsd: number; maxOutputTokens: number; outputTokenUsd: number; requestOverheadUsd: number };
+type CanonicalModel = { policyKey: string; provider: "openrouter"; model: string; version: string; outputTokenUsd: number; requestOverheadUsd: number };
+
+function canonicalModel(contract: Contract): CanonicalModel {
+  const execution = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid").find((item) => item.id === contract.target.execution_profile);
+  const policyKey = text(execution?.model_policy, "registry_model_policy_invalid");
+  if (contract.factory_request.model_policy_key !== policyKey) throw new Error("registry_model_policy_not_canonical");
+  const policy = records(FACTORY_REGISTRY.model_policies, "registry_model_policies_invalid").find((item) => item.id === policyKey);
+  const pricing = policy?.pricing as ObjectValue | undefined;
+  const provider = text(policy?.provider, "registry_model_provider_invalid");
+  const model = text(policy?.model, "registry_model_invalid");
+  const version = text(policy?.version, "registry_model_version_invalid");
+  const outputTokenUsd = Number(pricing?.cost_usd_per_output_token);
+  const requestOverheadUsd = Number(pricing?.request_overhead_usd);
+  if (provider !== "openrouter" || !pricing || !Number.isFinite(outputTokenUsd) || outputTokenUsd <= 0 || !Number.isFinite(requestOverheadUsd) || requestOverheadUsd < 0) throw new Error("registry_model_policy_invalid");
+  return { policyKey, provider, model, version, outputTokenUsd, requestOverheadUsd };
+}
+
+function executionLimits(contract: Contract): RuntimeLimits {
+  const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
+  const execution = executions.find((item) => item.id === contract.target.execution_profile);
+  const factories = records(FACTORY_REGISTRY.factories, "registry_factories_invalid");
+  const factory = factories.find((item) => item.factory_id === contract.registry.factory_id);
+  const limits = execution?.limits as ObjectValue | undefined;
+  const providerBudget = execution?.provider_budget as ObjectValue | undefined;
+  const capacity = factory?.capacity as ObjectValue | undefined;
+  if (!limits || !providerBudget || !capacity || typeof limits !== "object" || typeof providerBudget !== "object" || typeof capacity !== "object") throw new Error("registry_runtime_limits_invalid");
+  const timeoutSeconds = Math.min(nonNegativeNumber(limits.timeout_seconds, "registry_timeout_invalid"), nonNegativeNumber(capacity.timeout_seconds, "registry_timeout_invalid"));
+  const costUsd = Math.min(nonNegativeNumber(limits.cost_usd, "registry_cost_invalid"), nonNegativeNumber(capacity.cost_usd, "registry_cost_invalid"));
+  const maxOutputTokens = Number(providerBudget.max_output_tokens);
+  const model = canonicalModel(contract);
+  const outputTokenUsd = model.outputTokenUsd;
+  const requestOverheadUsd = model.requestOverheadUsd;
+  if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 1 || costUsd < 0 || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1 || !Number.isFinite(outputTokenUsd) || outputTokenUsd <= 0 || !Number.isFinite(requestOverheadUsd) || requestOverheadUsd < 0 || requestOverheadUsd + outputTokenUsd > costUsd) throw new Error("registry_runtime_limits_invalid");
+  return { timeoutSeconds, costUsd, maxOutputTokens, outputTokenUsd, requestOverheadUsd };
+}
+
+function runtimeExecutionLimits(env: Env, contract: Contract): RuntimeLimits {
+  const registryLimits = executionLimits(contract);
+  const configuredCost = configMoney(env, "MAX_COST_USD", 0.01, registryLimits.costUsd);
+  if (configuredCost === null) throw new Error("cost_cap_config_invalid");
+  return { ...registryLimits, costUsd: configuredCost };
+}
+
+async function resolveFactory(issue: ObjectValue, contract: Omit<Contract, "registry">): Promise<RegistryBinding> {
+  if (FACTORY_REGISTRY.schema_version !== "v1") throw new AdmissionError("registry_schema_invalid");
+  const registryVersion = text(FACTORY_REGISTRY.registry_version, "registry_version_invalid");
+  const factories = records(FACTORY_REGISTRY.factories, "registry_factories_invalid");
+  if (factories.length === 0) throw new AdmissionError("registry_factories_invalid");
+  uniqueBy(factories, "factory_id", "registry_factory_id_ambiguous");
+  const projectId = providerId(issue, "project");
+  const teamId = providerId(issue, "team");
+  const matches = factories.filter((factory) => {
+    const linear = factory.linear;
+    return linear && typeof linear === "object" && !Array.isArray(linear)
+      && strings((linear as ObjectValue).project_ids, "registry_project_ids_invalid").includes(projectId);
+  });
+  if (matches.length === 0) throw new AdmissionError("registry_unknown_project");
+  if (matches.length !== 1) throw new AdmissionError("registry_ambiguous_project");
+  const factory = matches[0];
+  if (!ACTIVE_FACTORY_STATES.has(String(factory.state))) throw new AdmissionError("registry_factory_disabled");
+  const linear = factory.linear as ObjectValue;
+  if (!strings(linear.team_ids, "registry_team_ids_invalid").includes(teamId)) throw new AdmissionError("registry_team_not_allowed");
+  const state = issue.state;
+  const stateType = state && typeof state === "object" && !Array.isArray(state) ? (state as ObjectValue).type : undefined;
+  if (!strings(linear.eligible_state_types, "registry_state_types_invalid").includes(String(stateType))) throw new AdmissionError("registry_issue_state_not_allowed");
+  if (!strings(linear.required_contract_versions, "registry_contract_versions_invalid").includes(contract.contract_version)) throw new AdmissionError("registry_contract_version_not_allowed");
+  const requiredLabels = strings(linear.required_labels, "registry_required_labels_invalid");
+  if (requiredLabels.some((label) => !labels(issue).includes(label))) throw new AdmissionError("registry_required_label_missing");
+
+  const repositories = records(factory.repositories, "registry_repositories_invalid");
+  uniqueBy(repositories, "repository", "registry_repository_ambiguous");
+  const repositoryMatches = repositories.filter((item) => item.repository === contract.target.repository);
+  if (repositoryMatches.length === 0) throw new AdmissionError("registry_repository_not_allowed");
+  if (repositoryMatches.length !== 1) throw new AdmissionError("registry_repository_ambiguous");
+  const repository = repositoryMatches[0];
+  for (const [requested, allowed, reason] of [
+    [contract.target.work_type, repository.work_types, "registry_work_type_not_allowed"],
+    [contract.target.execution_profile, repository.execution_profiles, "registry_execution_profile_not_allowed"],
+    [contract.validation_profile, repository.validation_profiles, "registry_validation_profile_not_allowed"],
+    [contract.target.collision_group, repository.collision_groups, "registry_collision_group_not_allowed"],
+  ] as const) {
+    if (!strings(allowed, reason).includes(requested)) throw new AdmissionError(reason);
+  }
+  const scope = repository.scope as ObjectValue;
+  const capacity = factory.capacity as ObjectValue;
+  if (!scope || typeof scope !== "object" || !capacity || typeof capacity !== "object") throw new AdmissionError("registry_capacity_invalid");
+  if (contract.allowed_scope.max_files > Number(scope.max_files) || contract.allowed_scope.max_files > Number(capacity.max_files)) throw new AdmissionError("registry_scope_max_files_exceeded");
+  if (contract.allowed_scope.max_changed_lines > Number(scope.max_changed_lines) || contract.allowed_scope.max_changed_lines > Number(capacity.max_changed_lines)) throw new AdmissionError("registry_scope_max_changed_lines_exceeded");
+  const allowedPaths = strings(scope.paths, "registry_scope_paths_invalid");
+  if (contract.allowed_scope.paths.some((path) => !pathMatchesScope(path, allowedPaths))) throw new AdmissionError("registry_scope_path_not_allowed");
+  const risk = factory.risk as ObjectValue;
+  if ((RISK_ORDER[contract.risk.risk_class] ?? 99) > (RISK_ORDER[String(risk.maximum_risk_class)] ?? -1)) throw new AdmissionError("registry_risk_ceiling_exceeded");
+  if ((AUTHORITY_ORDER[contract.risk.authority_class] ?? 99) > (AUTHORITY_ORDER[String(risk.maximum_authority_class)] ?? -1)) throw new AdmissionError("registry_authority_ceiling_exceeded");
+  if ((MERGE_ORDER[contract.merge_policy] ?? 99) > (MERGE_ORDER[String(risk.merge_ceiling)] ?? -1)) throw new AdmissionError("registry_merge_ceiling_exceeded");
+  if (contract.merge_policy !== "human" || risk.merge_ceiling !== "human") throw new AdmissionError("registry_human_merge_required");
+  if (!strings(risk.autonomous_merge_exclusions, "registry_autonomous_merge_exclusions_invalid").includes(contract.target.repository)) throw new AdmissionError("registry_autonomous_merge_exclusion_missing");
+  const credentials = factory.credentials as ObjectValue;
+  if (!strings(credentials.sandbox_secret_profiles, "registry_credential_profiles_invalid").includes(contract.factory_request.credential_profile)) throw new AdmissionError("registry_credential_profile_not_allowed");
+  const capacityCeilings = ["per_factory_concurrency", "global_concurrency", "per_repository_concurrency", "collision_group_concurrency"].map((field) => Number(capacity[field]));
+  if (capacityCeilings.some((value) => !Number.isSafeInteger(value) || value < 1) || capacityCeilings.some((value) => contract.factory_request.concurrency > value)) throw new AdmissionError("registry_concurrency_ceiling_exceeded");
+  if (!strings(factory.model_policy_keys, "registry_model_policy_keys_invalid").includes(contract.factory_request.model_policy_key)) throw new AdmissionError("registry_model_policy_not_allowed");
+  if (contract.factory_request.escalation_class !== factory.escalation_ceiling) throw new AdmissionError("registry_escalation_ceiling_exceeded");
+  const permitted = strings(risk.permitted_work_effect_classes, "registry_permitted_effects_invalid");
+  const forbidden = strings(risk.forbidden_work_effect_classes, "registry_forbidden_effects_invalid");
+  const requestedAndInherentEffects = [...new Set([...contract.factory_request.effect_classes, ...inherentEffectClasses(contract)])];
+  if (requestedAndInherentEffects.some((item) => !permitted.includes(item))) throw new AdmissionError("registry_effect_class_not_permitted");
+  if ((forbidden.includes("all") && requestedAndInherentEffects.length > 0) || requestedAndInherentEffects.some((item) => forbidden.includes(item))) throw new AdmissionError("registry_effect_class_forbidden");
+  const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
+  const execution = executions.find((item) => item.id === contract.target.execution_profile);
+  if (!execution || contract.factory_request.model_policy_key !== execution.model_policy) throw new AdmissionError("registry_model_policy_not_canonical");
+  const limits = execution?.limits as ObjectValue | undefined;
+  const providerBudget = execution?.provider_budget as ObjectValue | undefined;
+  const canonical = records(FACTORY_REGISTRY.model_policies, "registry_model_policies_invalid").find((item) => item.id === execution?.model_policy);
+  const pricing = canonical?.pricing as ObjectValue | undefined;
+  if (!limits || !providerBudget || !pricing || ["cost_usd", "timeout_seconds", "max_changed_lines", "max_files"].some((field) => Number(limits[field]) > Number(capacity[field])) || ["cost_usd", "timeout_seconds"].some((field) => !Number.isFinite(Number(limits[field])) || Number(limits[field]) < 0) || !Number.isSafeInteger(Number(providerBudget.max_output_tokens)) || Number(providerBudget.max_output_tokens) < 1 || ["cost_usd_per_output_token", "request_overhead_usd"].some((field) => !Number.isFinite(Number(pricing[field])) || Number(pricing[field]) < 0) || Number(pricing.cost_usd_per_output_token) === 0) throw new AdmissionError("registry_profile_limit_exceeds_capacity");
+  return {
+    identity: {
+      factory_id: text(factory.factory_id, "registry_factory_id_invalid"),
+      registry_version: registryVersion,
+      registry_digest: await digest(FACTORY_REGISTRY),
+      entry_version: text(factory.entry_version, "registry_entry_version_invalid"),
+    },
+    factory,
+    repository,
+  };
+}
+
+async function assertCurrentRegistry(contract: Contract): Promise<RegistryBinding> {
+  const factories = records(FACTORY_REGISTRY.factories, "registry_factories_invalid");
+  const matches = factories.filter((item) => item.factory_id === contract.registry.factory_id);
+  if (matches.length !== 1) throw new Error("registry_factory_identity_missing");
+  if (!ACTIVE_FACTORY_STATES.has(String(matches[0].state))) throw new Error("registry_factory_disabled");
+  const binding = await resolveFactory(
+    {
+      project: { id: contract.linear.project_id },
+      team: { id: strings((matches[0].linear as ObjectValue).team_ids, "registry_team_ids_invalid")[0] },
+      state: { type: strings((matches[0].linear as ObjectValue).eligible_state_types, "registry_state_types_invalid")[0] },
+      labels: { nodes: strings((matches[0].linear as ObjectValue).required_labels, "registry_required_labels_invalid").map((name) => ({ name })) },
+    },
+    contract,
+  );
+  if (stable(binding.identity) !== stable(contract.registry)) throw new Error("registry_stale_re_admission_required");
+  return binding;
+}
+
+async function profileDigest(contract: Contract): Promise<string> {
+  const executions = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid");
+  const validations = records(FACTORY_REGISTRY.validation_profiles, "registry_validation_profiles_invalid");
+  const groups = records(FACTORY_REGISTRY.collision_groups, "registry_collision_groups_invalid");
+  const execution = executions.find((item) => item.id === contract.target.execution_profile);
+  const validation = validations.find((item) => item.id === contract.validation_profile);
+  const collision = groups.find((item) => item.id === contract.target.collision_group);
+  if (!execution || !validation || !collision) throw new Error("registry_profile_missing");
+  return await digest({ registry: contract.registry, execution, validation, collision });
 }
 
 function repositoryPath(repository: string): string {
@@ -274,7 +574,7 @@ function integer(value: unknown, label: string, max: number): number {
   return value;
 }
 
-function contractFromDescription(description: unknown, issue: ObjectValue, env: Env): Contract {
+async function contractFromDescription(description: unknown, issue: ObjectValue): Promise<Contract> {
   const source = descriptionValue(description, "description", 100_000);
   if (source.split(CONTRACT_OPEN).length - 1 !== 1 || source.split(CONTRACT_CLOSE).length - 1 !== 1) {
     throw new AdmissionError("contract_block_missing_or_ambiguous");
@@ -284,10 +584,12 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (end <= start) throw new AdmissionError("contract_block_order_invalid");
   let parsed: unknown;
   try { parsed = JSON.parse(source.slice(start, end).trim()); } catch { throw new AdmissionError("contract_json_invalid"); }
-  const root = object(parsed, ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions"], "contract");
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && ("factory_id" in parsed || "registry" in parsed)) throw new AdmissionError("issue_factory_identity_forbidden");
+  const parsedRoot = parsed as ObjectValue;
+  const rootKeys = ["contract_version", "dispatch_id", "linear", "target", "dependencies", "risk", "acceptance_criteria", "validation_profile", "allowed_scope", "merge_policy", "stale_conditions", ...(parsedRoot?.factory_request === undefined ? [] : ["factory_request"])];
+  const root = object(parsed, rootKeys, "contract");
   if (root.contract_version !== "v1") throw new AdmissionError("contract_version_unsupported");
-  if (env.ALLOWED_REPOSITORY_PREFIX !== "mhoo-os/") throw new AdmissionError("repository_prefix_invalid");
-  const projectId = text(env.LINEAR_PROJECT_ID, "linear_project_id");
+  const projectId = providerId(issue, "project");
   const linear = object(root.linear, ["project_id", "issue_id", "identifier", "planning_revision", "planning_fingerprint"], "linear");
   const issueId = text(issue.id, "issue_id");
   const identifier = text(issue.identifier, "identifier", 32);
@@ -298,15 +600,12 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   if (!/^sha256:[0-9a-f]{64}$/.test(text(linear.planning_fingerprint, "planning_fingerprint", 71))) throw new AdmissionError("planning_fingerprint_invalid");
   const target = object(root.target, ["repository", "work_type", "execution_profile", "collision_group", "base_sha"], "target");
   const repository = text(target.repository, "repository");
-  if (!REPOSITORY.test(repository) || !repository.startsWith(env.ALLOWED_REPOSITORY_PREFIX)) throw new AdmissionError("repository_not_allowed");
+  if (!REPOSITORY.test(repository)) throw new AdmissionError("repository_not_allowed");
   text(target.work_type, "work_type");
   const executionProfile = text(target.execution_profile, "execution_profile");
   const validationProfile = text(root.validation_profile, "validation_profile");
   if (executionProfile !== validationProfile) throw new AdmissionError("profile_mismatch");
-  const profile = SUPPORTED_TARGETS[repository as keyof typeof SUPPORTED_TARGETS];
-  if (!profile || profile.executionProfile !== executionProfile || profile.validationProfile !== validationProfile) throw new AdmissionError("unsupported_repository_or_profile");
   const collisionGroup = text(target.collision_group, "collision_group");
-  if (!(profile.collisionGroups as readonly string[]).includes(collisionGroup)) throw new AdmissionError("unsupported_collision_group");
   if (!SHA40.test(text(target.base_sha, "base_sha", 40))) throw new AdmissionError("base_sha_invalid");
   if (!Array.isArray(root.dependencies) || root.dependencies.length > 50) throw new AdmissionError("dependencies_invalid");
   const dependencyIds = new Set<string>();
@@ -326,7 +625,15 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   integer(scope.max_changed_lines, "max_changed_lines", 500);
   if (!["human", "auto-eligible"].includes(String(root.merge_policy))) throw new AdmissionError("merge_policy_invalid");
   if (!Array.isArray(root.stale_conditions) || root.stale_conditions.length === 0 || root.stale_conditions.length > STALE_CONDITIONS.size || root.stale_conditions.some((item) => typeof item !== "string" || !STALE_CONDITIONS.has(item)) || new Set(root.stale_conditions).size !== root.stale_conditions.length) throw new AdmissionError("stale_conditions_invalid");
-  const contract: Contract = {
+  const execution = records(FACTORY_REGISTRY.execution_profiles, "registry_execution_profiles_invalid").find((item) => item.id === executionProfile);
+  if (!execution) throw new AdmissionError("registry_execution_profile_not_allowed");
+  const rawRequest = root.factory_request === undefined ? {} : root.factory_request;
+  if (!rawRequest || typeof rawRequest !== "object" || Array.isArray(rawRequest)) throw new AdmissionError("factory_request_invalid");
+  const requestObject = rawRequest as ObjectValue;
+  const requestKeys = Object.keys(requestObject);
+  if (requestKeys.some((key) => !["credential_profile", "concurrency", "model_policy_key", "escalation_class", "effect_classes"].includes(key))) throw new AdmissionError("factory_request_fields_invalid");
+  const concurrency = requestObject.concurrency === undefined ? 1 : integer(requestObject.concurrency, "factory_request_concurrency", 32);
+  const contract: Omit<Contract, "registry"> = {
     contract_version: "v1",
     dispatch_id: text(root.dispatch_id, "dispatch_id", 192),
     linear: {
@@ -360,8 +667,16 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
     },
     merge_policy: root.merge_policy as Contract["merge_policy"],
     stale_conditions: root.stale_conditions as string[],
+    factory_request: {
+      credential_profile: requestObject.credential_profile === undefined ? "none" : text(requestObject.credential_profile, "factory_request_credential_profile", 128),
+      concurrency,
+      model_policy_key: requestObject.model_policy_key === undefined ? text(execution.model_policy, "registry_model_policy_invalid", 128) : text(requestObject.model_policy_key, "factory_request_model_policy", 128),
+      escalation_class: requestObject.escalation_class === undefined ? "human" : text(requestObject.escalation_class, "factory_request_escalation", 64),
+      effect_classes: requestObject.effect_classes === undefined ? [] : strings(requestObject.effect_classes, "factory_request_effect_classes_invalid"),
+    },
   };
-  return contract;
+  const binding = await resolveFactory(issue, contract);
+  return { ...contract, registry: binding.identity };
 }
 
 function issueFromPayload(payload: unknown): ObjectValue {
@@ -388,9 +703,7 @@ async function admit(raw: string, env: Env): Promise<Job> {
   const state = issue.state && typeof issue.state === "object" ? (issue.state as ObjectValue).type : undefined;
   if (typeof state !== "string" || !ISSUE_STATES.has(state)) throw new AdmissionError("issue_not_eligible");
   if (!labels(issue).includes("factory:accepted")) throw new AdmissionError("factory_acceptance_label_missing");
-  const contract = contractFromDescription(issue.description, issue, env);
-  const risk = contract.risk;
-  if (risk.risk_class === "high" || risk.authority_class === "cross-system") throw new AdmissionError("human_approval_required");
+  const contract = await contractFromDescription(issue.description, issue);
   const contractDigest = await digest(contract);
   const dispatchId = contract.dispatch_id;
   const runId = `run-v1-${(await digest({ dispatchId, contractDigest, baseSha: contract.target.base_sha })).slice(7, 39)}`;
@@ -421,11 +734,11 @@ async function ingress(db: D1Database, id: string, provider: string, type: strin
 }
 
 async function runById(db: D1Database, runId: string): Promise<Run | null> {
-  return await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE run_id=?").bind(runId).first<Run>();
+  return await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url,created_at FROM factory_runs WHERE run_id=?").bind(runId).first<Run>();
 }
 
 async function runByBranch(db: D1Database, repository: string, branch: string): Promise<Run | null> {
-  const rows = await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url FROM factory_runs WHERE repository=? AND branch=? ORDER BY updated_at DESC LIMIT 2").bind(repository, branch).all<Run>();
+  const rows = await db.prepare("SELECT dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_issue_id,repository,collision_group,base_sha,current_state,workflow_id,lease_owner,lease_fence,lease_expires_at,branch,head_sha,pr_number,pr_url,created_at FROM factory_runs WHERE repository=? AND branch=? ORDER BY updated_at DESC LIMIT 2").bind(repository, branch).all<Run>();
   if ((rows.results ?? []).length > 1) throw new Error("reconciliation_branch_ambiguous");
   return rows.results?.[0] ?? null;
 }
@@ -439,15 +752,16 @@ async function insertRun(db: D1Database, job: Job): Promise<"inserted" | "duplic
   if (existing) return existing.contract_digest === job.contractDigest && existing.linear_issue_id === c.linear.issue_id ? "duplicate" : "conflict";
   const timestamp = new Date().toISOString();
   const admissionEventId = `admission:${job.dispatchId}`;
+  const resolvedProfileDigest = await profileDigest(c);
   let results: D1Result<unknown>[];
   try {
     results = await db.batch([
-      db.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-        .bind(job.dispatchId, job.runId, job.contractDigest, PROFILE_DIGEST, stable(c), c.linear.project_id, c.linear.issue_id, c.linear.identifier, c.target.repository, c.target.collision_group, c.target.base_sha, "admitted", timestamp, timestamp),
-      db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,? FROM factory_runs WHERE dispatch_id=? AND current_state='admitted'")
-        .bind(admissionEventId, job.dispatchId, 1, "state:admitted", job.contractDigest, 1, "accepted", timestamp, job.dispatchId),
-      db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
-        .bind(job.dispatchId, 1, admissionEventId, "proposed", "admitted", "admission", timestamp, admissionEventId),
+      db.prepare("INSERT INTO factory_runs(dispatch_id,run_id,contract_digest,profile_digest,factory_id,registry_version,registry_digest,registry_entry_version,contract_json,linear_project_id,linear_issue_id,linear_identifier,repository,collision_group,base_sha,current_state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(job.dispatchId, job.runId, job.contractDigest, resolvedProfileDigest, c.registry.factory_id, c.registry.registry_version, c.registry.registry_digest, c.registry.entry_version, stable(c), c.linear.project_id, c.linear.issue_id, c.linear.identifier, c.target.repository, c.target.collision_group, c.target.base_sha, "admitted", timestamp, timestamp),
+      db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,factory_id,registry_version,registry_digest,registry_entry_version,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? FROM factory_runs WHERE dispatch_id=? AND current_state='admitted'")
+        .bind(admissionEventId, job.dispatchId, 1, "state:admitted", c.registry.factory_id, c.registry.registry_version, c.registry.registry_digest, c.registry.entry_version, job.contractDigest, 1, "accepted", timestamp, job.dispatchId),
+      db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
+        .bind(job.dispatchId, 1, admissionEventId, "proposed", "admitted", "admission", c.registry.factory_id, c.registry.registry_version, c.registry.registry_digest, c.registry.entry_version, timestamp, admissionEventId),
     ]);
   } catch (error) {
     const raced = await db.prepare("SELECT contract_digest,linear_issue_id FROM factory_runs WHERE dispatch_id=?")
@@ -466,8 +780,19 @@ async function insertRun(db: D1Database, job: Job): Promise<"inserted" | "duplic
 }
 
 async function recordStep(db: D1Database, runId: string, stepKey: string, status: string, result: ObjectValue = {}): Promise<void> {
-  await db.prepare("INSERT INTO factory_steps(run_id,step_key,status,result_json,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(run_id,step_key) DO UPDATE SET status=excluded.status,result_json=excluded.result_json,updated_at=excluded.updated_at")
-    .bind(runId, stepKey, status, stable(result), new Date().toISOString()).run();
+  await db.prepare("INSERT INTO factory_steps(run_id,step_key,status,result_json,factory_id,registry_version,registry_digest,registry_entry_version,updated_at) SELECT ?,?,?,?,factory_id,registry_version,registry_digest,registry_entry_version,? FROM factory_runs WHERE run_id=? ON CONFLICT(run_id,step_key) DO UPDATE SET status=excluded.status,result_json=excluded.result_json,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,updated_at=excluded.updated_at")
+    .bind(runId, stepKey, status, stable(result), new Date().toISOString(), runId).run();
+}
+
+async function recordPrReceipt(db: D1Database, runId: string, pull: PullRequest): Promise<void> {
+  const receiptId = `pr:${runId}:${pull.number}`;
+  await db.prepare("INSERT OR REPLACE INTO factory_pr_receipts(receipt_id,dispatch_id,run_id,pr_number,pr_url,head_sha,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,dispatch_id,run_id,?,?,?,factory_id,registry_version,registry_digest,registry_entry_version,? FROM factory_runs WHERE run_id=?")
+    .bind(receiptId, pull.number, pull.html_url, pull.head.sha, new Date().toISOString(), runId).run();
+}
+
+async function recordLinearReconciliation(db: D1Database, runId: string, reconciliationId: string, state: string, reason: string): Promise<void> {
+  await db.prepare("INSERT OR REPLACE INTO factory_linear_reconciliations(reconciliation_id,dispatch_id,run_id,state,reason,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,dispatch_id,run_id,?,?,factory_id,registry_version,registry_digest,registry_entry_version,? FROM factory_runs WHERE run_id=?")
+    .bind(reconciliationId, state, reason, new Date().toISOString(), runId).run();
 }
 
 type RunFields = {
@@ -565,10 +890,10 @@ async function transitionRun(
   const payloadDigest = patch.result ? await digest(patch.result) : null;
   const results = await db.batch([
     db.prepare(`UPDATE factory_runs SET ${set.join(",")} WHERE ${where.join(" AND ")}`).bind(...updateValues),
-    db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,? FROM factory_runs WHERE run_id=? AND current_state=? AND updated_at=?")
-      .bind(eventId, run.dispatch_id, sequence, `state:${toState}`, payloadDigest, 1, "accepted", now, runId, toState, now),
-    db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
-      .bind(run.dispatch_id, sequence, eventId, run.current_state, toState, actor, now, eventId),
+    db.prepare("INSERT INTO factory_events(event_id,dispatch_id,event_sequence,event_type,factory_id,registry_version,registry_digest,registry_entry_version,payload_digest,accepted,reason,received_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? FROM factory_runs WHERE run_id=? AND current_state=? AND updated_at=?")
+      .bind(eventId, run.dispatch_id, sequence, `state:${toState}`, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, payloadDigest, 1, "accepted", now, runId, toState, now),
+    db.prepare("INSERT INTO factory_transitions(dispatch_id,event_sequence,event_id,from_state,to_state,actor,factory_id,registry_version,registry_digest,registry_entry_version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM factory_events WHERE event_id=?)")
+      .bind(run.dispatch_id, sequence, eventId, run.current_state, toState, actor, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, now, eventId),
   ]);
   if (results[0].meta.changes !== 1 || results[1].meta.changes !== 1 || results[2].meta.changes !== 1) {
     throw new Error(patch.leaseFence === undefined ? "state_transition_raced" : "lease_fenced");
@@ -596,44 +921,109 @@ async function dependenciesReady(job: Job, env: Env): Promise<"ready" | "blocked
   }
 }
 
-async function acquireLease(db: D1Database, run: Run): Promise<number | null> {
-  const key = `${run.repository}#${run.collision_group}`;
-  const now = new Date();
-  const current = await db.prepare("SELECT owner,dispatch_id,fence,expires_at FROM factory_leases WHERE lease_key=?").bind(key).first<{ owner: string; dispatch_id: string; fence: number; expires_at: string }>();
-  if (current?.dispatch_id === run.run_id && new Date(current.expires_at) > now) return current.fence;
-  if (current && new Date(current.expires_at) > now) return null;
-  const expiry = new Date(now.getTime() + 30 * 60_000).toISOString();
-  const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,fence,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=?")
-    .bind(key, "workflow", run.run_id, current?.fence ?? 0, expiry, now.toISOString()).run();
-  if (result.meta.changes !== 1) return null;
-  const lease = await db.prepare("SELECT fence FROM factory_leases WHERE lease_key=? AND dispatch_id=?").bind(key, run.run_id).first<{ fence: number }>();
-  return lease?.fence ?? null;
+type ConcurrencyLimits = { global: number; factory: number; repository: number; collision: number };
+type LeaseReservation = { fence: number; expiresAt: string };
+
+function schedulerNow(env: Env): number {
+  // A clock is accepted only on an in-memory test Env. Production bindings
+  // cannot supply functions, so production always uses the platform clock.
+  const candidate = (env as Env & { __TEST_CLOCK_NOW?: unknown }).__TEST_CLOCK_NOW;
+  if (typeof candidate !== "function") return Date.now();
+  const value = Number(candidate());
+  if (!Number.isFinite(value)) throw new Error("scheduler_clock_invalid");
+  return value;
+}
+
+function runtimeConcurrencyLimits(env: Env, factory: ObjectValue): ConcurrencyLimits {
+  const capacity = factory.capacity as ObjectValue | undefined;
+  if (!capacity || typeof capacity !== "object") throw new Error("registry_capacity_invalid");
+  const values = {
+    global: Number(capacity.global_concurrency),
+    factory: Number(capacity.per_factory_concurrency),
+    repository: Number(capacity.per_repository_concurrency),
+    collision: Number(capacity.collision_group_concurrency),
+  };
+  if (Object.values(values).some((value) => !Number.isSafeInteger(value) || value < 1 || value > 32)) throw new Error("registry_concurrency_ceiling_invalid");
+  const configuredGlobal = configInteger(env, "MAX_GLOBAL_CONCURRENCY", 1, 32);
+  if (configuredGlobal === null || configuredGlobal > values.global) throw new Error("global_concurrency_config_invalid");
+  return { ...values, global: configuredGlobal };
+}
+
+function capacityLeaseScopes(run: Run, limits: ConcurrencyLimits): string[][] {
+  return [
+    Array.from({ length: limits.global }, (_, index) => `global:${index + 1}`),
+    Array.from({ length: limits.factory }, (_, index) => `factory:${run.factory_id}:${index + 1}`),
+    Array.from({ length: limits.repository }, (_, index) => `repository:${run.repository}:${index + 1}`),
+    Array.from({ length: limits.collision }, (_, index) => `collision:${run.collision_group}:${index + 1}`),
+  ];
+}
+
+async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits, expiresNoLaterThan?: number, nowAt = Date.now()): Promise<LeaseReservation | null> {
+  const now = new Date(nowAt);
+  if (expiresNoLaterThan !== undefined && (!Number.isFinite(expiresNoLaterThan) || expiresNoLaterThan <= now.getTime())) throw new Error("workflow_deadline_exceeded");
+  const expiry = new Date(Math.min(now.getTime() + 30 * 60_000, expiresNoLaterThan ?? Number.POSITIVE_INFINITY)).toISOString();
+  const reservation = await db.prepare("INSERT INTO factory_lease_reservations(run_id,created_at) VALUES(?,?)").bind(run.run_id, now.toISOString()).run();
+  const reservationId = Number(reservation.meta.last_row_id);
+  if (!Number.isSafeInteger(reservationId) || reservationId < 1) throw new Error("lease_reservation_failed");
+  const acquired: string[] = [];
+  let committed = false;
+  try {
+    for (const scope of capacityLeaseScopes(run, limits)) {
+      let selected: string | null = null;
+      for (const key of scope) {
+        const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=?")
+          .bind(key, "workflow", run.run_id, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, 0, expiry, now.toISOString()).run();
+        if (result.meta.changes === 1) { selected = key; break; }
+      }
+      if (!selected) return null;
+      acquired.push(selected);
+    }
+    await db.batch(acquired.map((key) => db.prepare("INSERT INTO factory_lease_members(reservation_id,lease_key) VALUES(?,?)").bind(reservationId, key)));
+    const persisted = await db.prepare("SELECT MIN(expires_at) AS earliest,MAX(expires_at) AS latest,COUNT(*) AS count FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?)").bind(run.run_id, reservationId).first<{ earliest: string | null; latest: string | null; count: number }>();
+    if (persisted?.count !== acquired.length || persisted.earliest !== expiry || persisted.latest !== expiry) throw new Error("lease_expiry_persistence_failed");
+    committed = true;
+    return { fence: reservationId, expiresAt: expiry };
+  } finally {
+    if (!committed) {
+      if (acquired.length > 0) await db.prepare(`DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (${acquired.map(() => "?").join(",")})`).bind(run.run_id, ...acquired).run();
+      await db.prepare("DELETE FROM factory_lease_reservations WHERE reservation_id=?").bind(reservationId).run();
+    }
+  }
 }
 
 async function releaseLease(db: D1Database, run: Run): Promise<void> {
-  const key = `${run.repository}#${run.collision_group}`;
-  const result = await db.prepare("DELETE FROM factory_leases WHERE lease_key=? AND dispatch_id=? AND fence=?").bind(key, run.run_id, run.lease_fence).run();
-  if (result.meta.changes !== 1) {
-    const current = await db.prepare("SELECT dispatch_id,fence FROM factory_leases WHERE lease_key=?").bind(key).first<{ dispatch_id: string; fence: number }>();
-    if (current && (current.dispatch_id !== run.run_id || current.fence !== run.lease_fence)) throw new Error("lease_fenced");
-  }
-  const cleared = await db.prepare("UPDATE factory_runs SET lease_owner=NULL,lease_fence=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=? AND lease_fence=?").bind(new Date().toISOString(), run.run_id, run.lease_fence).run();
-  if (cleared.meta.changes !== 1 && result.meta.changes !== 0) throw new Error("lease_release_state_failed");
+  if (run.lease_fence === null) throw new Error("lease_missing");
+  const members = await db.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence).first<{ count: number }>();
+  const result = await db.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?)").bind(run.run_id, run.lease_fence).run();
+  if ((members?.count ?? 0) !== result.meta.changes) throw new Error("lease_fenced");
+  await db.batch([
+    db.prepare("DELETE FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence),
+    db.prepare("UPDATE factory_runs SET lease_owner=NULL,lease_fence=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=? AND lease_fence=?").bind(new Date().toISOString(), run.run_id, run.lease_fence),
+  ]);
 }
 
-async function renewLease(db: D1Database, run: Run): Promise<void> {
+async function renewLease(db: D1Database, run: Run, expiresNoLaterThan?: number): Promise<void> {
   if (run.lease_fence === null) throw new Error("lease_missing");
   const now = new Date();
-  const expiry = new Date(now.getTime() + 30 * 60_000).toISOString();
-  const key = `${run.repository}#${run.collision_group}`;
-  const result = await db.prepare("UPDATE factory_leases SET expires_at=? WHERE lease_key=? AND dispatch_id=? AND fence=? AND expires_at>?").bind(expiry, key, run.run_id, run.lease_fence, now.toISOString()).run();
-  if (result.meta.changes !== 1) throw new Error("lease_fenced");
+  if (expiresNoLaterThan !== undefined && (!Number.isFinite(expiresNoLaterThan) || expiresNoLaterThan <= now.getTime())) throw new Error("workflow_deadline_exceeded");
+  const expiry = new Date(Math.min(now.getTime() + 30 * 60_000, expiresNoLaterThan ?? Number.POSITIVE_INFINITY)).toISOString();
+  const members = await db.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence).first<{ count: number }>();
+  const expected = members?.count ?? 0;
+  const result = await db.prepare("UPDATE factory_leases SET expires_at=? WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?) AND expires_at>?").bind(expiry, run.run_id, run.lease_fence, now.toISOString()).run();
+  if (expected !== 4 || result.meta.changes !== expected) throw new Error("lease_fenced");
   const recorded = await db.prepare("UPDATE factory_runs SET lease_expires_at=?,updated_at=? WHERE run_id=? AND lease_fence=?").bind(expiry, now.toISOString(), run.run_id, run.lease_fence).run();
   if (recorded.meta.changes !== 1) throw new Error("lease_fenced");
 }
 
 async function markIngress(db: D1Database, id: string, state: string): Promise<void> {
   await db.prepare("UPDATE factory_ingress_events SET handoff_state=?,updated_at=? WHERE event_id=?").bind(state, new Date().toISOString(), id).run();
+}
+
+async function bindIngressRegistry(db: D1Database, id: string, job: Job): Promise<void> {
+  const identity = job.contract.registry;
+  const result = await db.prepare("UPDATE factory_ingress_events SET factory_id=?,registry_version=?,registry_digest=?,registry_entry_version=?,updated_at=? WHERE event_id=? AND handoff_state='processing'")
+    .bind(identity.factory_id, identity.registry_version, identity.registry_digest, identity.entry_version, new Date().toISOString(), id).run();
+  if (result.meta.changes !== 1) throw new Error("ingress_registry_binding_failed");
 }
 
 async function claimIngress(db: D1Database, id: string): Promise<boolean> {
@@ -675,7 +1065,11 @@ function linearSelectors(payload: ObjectValue): ObjectValue {
 function githubSelectors(payload: ObjectValue, eventType: string): ObjectValue | null {
   const repository = payload.repository;
   const fullName = repository && typeof repository === "object" && !Array.isArray(repository) ? (repository as ObjectValue).full_name : undefined;
-  if (typeof fullName !== "string" || !REPOSITORY.test(fullName) || !fullName.startsWith(envRepositoryPrefix())) throw new AdmissionError("github_repository_invalid");
+  const registered = records(FACTORY_REGISTRY.factories, "registry_factories_invalid")
+    .filter((item) => ACTIVE_FACTORY_STATES.has(String(item.state)))
+    .flatMap((item) => records(item.repositories, "registry_repositories_invalid"))
+    .map((item) => item.repository);
+  if (typeof fullName !== "string" || !REPOSITORY.test(fullName) || !registered.includes(fullName)) throw new AdmissionError("github_repository_invalid");
   const action = payload.action;
   if (typeof action !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(action)) throw new AdmissionError("github_action_invalid");
   if (eventType === "pull_request") {
@@ -684,9 +1078,9 @@ function githubSelectors(payload: ObjectValue, eventType: string): ObjectValue |
     const number = (pull as ObjectValue).number;
     if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1 || number > 1_000_000_000) throw new AdmissionError("github_pr_number_invalid");
     const body = typeof (pull as ObjectValue).body === "string" ? boundedTextValue((pull as ObjectValue).body as string) : "";
-    const match = body.match(/<!-- mhoo-dark-factory-run:v1 run=(run-v1-[0-9a-f]{32}) -->/);
-    if (!match) return null;
-    return { kind: "github-pull-request", run_id: match[1], repository: fullName, pr_number: number, action };
+    const marker = pullRequestMarkerBinding(body);
+    if (!marker) return null;
+    return { kind: "github-pull-request", run_id: marker.runId, dispatch_id: marker.dispatchId, repository: fullName, pr_number: number, action };
   }
   const workflow = payload.workflow_run;
   if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) return null;
@@ -702,10 +1096,6 @@ function githubSelectors(payload: ObjectValue, eventType: string): ObjectValue |
     ...(typeof number === "number" && Number.isSafeInteger(number) && number > 0 ? { pr_number: number } : {}),
     action,
   };
-}
-
-function envRepositoryPrefix(): string {
-  return "mhoo-os/";
 }
 
 function dispatchJob(value: unknown): DispatchJob | null {
@@ -729,9 +1119,31 @@ async function recoverStaleLeases(env: Env): Promise<void> {
       leaseExpiredAt: now,
       lease: null,
     });
-    const leaseKey = `${row.repository}#${row.collision_group}`;
-    await env.DB.prepare("DELETE FROM factory_leases WHERE lease_key=? AND dispatch_id=? AND fence=?").bind(leaseKey, row.run_id, row.lease_fence).run();
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?)").bind(row.run_id, row.lease_fence),
+      env.DB.prepare("DELETE FROM factory_lease_members WHERE reservation_id=?").bind(row.lease_fence),
+    ]);
     await recordStep(env.DB, row.run_id, "recovery-stale-lease", targetState, { reason, previous_state: row.current_state, previous_fence: row.lease_fence });
+  }
+}
+
+async function abandonExpiredSchedulerLease(env: Env, run: Run, job: Job, lease: LeaseReservation): Promise<"needs-human" | "retryable" | "missing"> {
+  // Acquisition is a series of D1 writes. The deadline can elapse after its
+  // first check, so remove every member before changing state; this path never
+  // creates a Workflow or leaves capacity held by an expired run.
+  try {
+    await releaseLease(env.DB, { ...run, lease_fence: lease.fence });
+  } catch {
+    return "retryable";
+  }
+  try {
+    const latest = await runById(env.DB, job.runId);
+    if (!latest) return "missing";
+    const actor: TransitionActor = latest.current_state === "leased" ? "reconciler" : "scheduler";
+    await transitionRun(env.DB, job.runId, "needs-human", actor, `schedule:deadline:${job.runId}:${lease.fence}`, { result: { reason: "workflow_deadline_exceeded" } });
+    return "needs-human";
+  } catch {
+    return "retryable";
   }
 }
 
@@ -741,14 +1153,20 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
   let job = parsedJob;
   let run = await runById(env.DB, job.runId);
   if (!run) return "missing";
+  let registryBinding: RegistryBinding | null = null;
   try {
     const contract = storedContract(run);
-    if (run.profile_digest !== PROFILE_DIGEST || run.dispatch_id !== job.dispatchId || run.contract_digest !== job.contractDigest || await digest(contract) !== run.contract_digest) throw new Error("dispatch_identity_conflict");
+    registryBinding = await assertCurrentRegistry(contract);
+    const currentContract = await linearPlanningSnapshot(env, run);
+    if (stable(currentContract) !== stable(contract)) throw new Error("linear_authority_stale_re_admission_required");
+    if (run.factory_id !== contract.registry.factory_id || run.registry_version !== contract.registry.registry_version || run.registry_digest !== contract.registry.registry_digest || run.registry_entry_version !== contract.registry.entry_version || run.profile_digest !== await profileDigest(contract) || run.dispatch_id !== job.dispatchId || run.contract_digest !== job.contractDigest || await digest(contract) !== run.contract_digest) throw new Error("dispatch_identity_conflict");
     job = { ...job, dispatchId: run.dispatch_id, runId: run.run_id, contractDigest: run.contract_digest, contract };
   } catch (error) {
     try {
-      await transitionRun(env.DB, job.runId, "needs-human", "reconciler", `schedule:identity-conflict:${job.runId}`, { result: { reason: error instanceof Error ? error.message : "dispatch_identity_conflict" } });
-      return "needs-human";
+      const reason = error instanceof Error ? error.message : "dispatch_identity_conflict";
+      const stale = reason === "registry_stale_re_admission_required" || reason === "registry_factory_disabled" || reason === "linear_authority_stale_re_admission_required";
+      await transitionRun(env.DB, job.runId, stale ? "needs-replan" : "needs-human", "reconciler", `schedule:identity-conflict:${job.runId}`, { result: { reason } });
+      return stale ? "needs-replan" : "needs-human";
     } catch {
       return "retryable";
     }
@@ -763,6 +1181,22 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     return "stopped";
   }
   if (!["admitted", "queued", "blocked-by-dependency"].includes(run.current_state)) return "already-handled";
+  let schedulerLimits: RuntimeLimits;
+  let deadlineAt: number;
+  try {
+    schedulerLimits = runtimeExecutionLimits(env, job.contract);
+    deadlineAt = runDeadlineAt(run, schedulerLimits);
+    if (deadlineAt <= schedulerNow(env)) throw new Error("workflow_deadline_exceeded");
+  } catch (error) {
+    try {
+      const reason = error instanceof Error ? error.message : "workflow_deadline_exceeded";
+      const actor: TransitionActor = run.current_state === "queued" ? "scheduler" : "reconciler";
+      await transitionRun(env.DB, job.runId, "needs-human", actor, `schedule:deadline:${job.runId}`, { result: { reason } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
+  }
   const dependencyState = await dependenciesReady(job, env);
   if (dependencyState === "unavailable") return "retryable";
   if (dependencyState === "blocked") {
@@ -774,37 +1208,66 @@ async function schedule(env: Env, candidate: unknown): Promise<string> {
     run = await runById(env.DB, job.runId);
     if (!run) return "missing";
   }
-  const maxConcurrency = configInteger(env, "MAX_GLOBAL_CONCURRENCY", 1, 32);
-  if (maxConcurrency === null) {
+  // The dependency/queue callbacks above may have consumed the remaining run
+  // budget. Re-check immediately before touching any capacity lease row.
+  if (deadlineAt <= schedulerNow(env)) {
     try {
-      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:invalid-concurrency:${job.runId}`, { result: { reason: "global_concurrency_config_invalid" } });
+      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:deadline:${job.runId}`, { result: { reason: "workflow_deadline_exceeded" } });
       return "needs-human";
     } catch {
       return "retryable";
     }
   }
-  const active = await env.DB.prepare("SELECT COUNT(*) AS count FROM factory_runs WHERE current_state IN ('leased','running','validating')").first<{ count: number }>();
-  if ((active?.count ?? 0) >= maxConcurrency) return "global-busy";
-  const leaseFence = await acquireLease(env.DB, run);
-  if (leaseFence === null) return "repo-busy";
-  const leaseExpiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
+  let concurrencyLimits: ConcurrencyLimits;
   try {
-    await transitionRun(env.DB, job.runId, "leased", "scheduler", `schedule:lease:${job.runId}:${leaseFence}`, {
-      lease: { owner: "workflow", fence: leaseFence, expiresAt: leaseExpiresAt },
+    if (!registryBinding) throw new Error("registry_capacity_invalid");
+    concurrencyLimits = runtimeConcurrencyLimits(env, registryBinding.factory);
+    if (job.contract.factory_request.concurrency > concurrencyLimits.global || job.contract.factory_request.concurrency > concurrencyLimits.factory || job.contract.factory_request.concurrency > concurrencyLimits.repository || job.contract.factory_request.concurrency > concurrencyLimits.collision) throw new Error("registry_concurrency_ceiling_exceeded");
+  } catch (error) {
+    try {
+      const reason = error instanceof Error ? error.message : "global_concurrency_config_invalid";
+      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:invalid-concurrency:${job.runId}`, { result: { reason } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
+  }
+  let lease: LeaseReservation | null;
+  try {
+    lease = await acquireLease(env.DB, run, concurrencyLimits, deadlineAt, schedulerNow(env));
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "workflow_deadline_exceeded") return "retryable";
+    try {
+      await transitionRun(env.DB, job.runId, "needs-human", "scheduler", `schedule:deadline:${job.runId}`, { result: { reason: error.message } });
+      return "needs-human";
+    } catch {
+      return "retryable";
+    }
+  }
+  if (lease === null) return "repo-busy";
+  // `acquireLease` can span several D1 mutations. Check the absolute boundary
+  // again before we write any lease ownership onto the run.
+  if (deadlineAt <= schedulerNow(env)) return await abandonExpiredSchedulerLease(env, run, job, lease);
+  try {
+    await transitionRun(env.DB, job.runId, "leased", "scheduler", `schedule:lease:${job.runId}:${lease.fence}`, {
+      lease: { owner: "workflow", fence: lease.fence, expiresAt: lease.expiresAt },
     });
   } catch {
-    try { await releaseLease(env.DB, { ...run, lease_fence: leaseFence }); } catch { /* the competing state remains authoritative */ }
+    try { await releaseLease(env.DB, { ...run, lease_fence: lease.fence }); } catch { /* the competing state remains authoritative */ }
     return "already-handled";
   }
+  // State transition work itself may consume the final milliseconds. Do not
+  // create a Workflow once the run has crossed its authority deadline.
+  if (deadlineAt <= schedulerNow(env)) return await abandonExpiredSchedulerLease(env, run, job, lease);
   try {
     const instance = await env.EXECUTION_WORKFLOW.create({ id: job.runId, params: job });
-    await transitionRun(env.DB, job.runId, "running", "workflow", `schedule:running:${job.runId}:${leaseFence}`, { leaseFence, fields: { workflowId: instance.id } });
+    await transitionRun(env.DB, job.runId, "running", "workflow", `schedule:running:${job.runId}:${lease.fence}`, { leaseFence: lease.fence, fields: { workflowId: instance.id } });
     return "dispatched";
   } catch {
     try {
-      await transitionRun(env.DB, job.runId, "queued", "reconciler", `schedule:workflow-failed:${job.runId}:${leaseFence}`, { result: { reason: "workflow_create_failed" }, leaseFence, lease: null });
+      await transitionRun(env.DB, job.runId, "queued", "reconciler", `schedule:workflow-failed:${job.runId}:${lease.fence}`, { result: { reason: "workflow_create_failed" }, leaseFence: lease.fence, lease: null });
     } catch { /* the next recovery pass will surface any fenced write */ }
-    try { await releaseLease(env.DB, { ...run, lease_fence: leaseFence }); } catch { /* the next recovery pass will surface the stale lease */ }
+    try { await releaseLease(env.DB, { ...run, lease_fence: lease.fence }); } catch { /* the next recovery pass will surface the stale lease */ }
     return "retryable";
   }
 }
@@ -848,6 +1311,7 @@ async function acceptLinear(request: Request, env: Env): Promise<Response> {
       await markIngress(env.DB, id, "rejected:conflicting_dispatch");
       return response({ accepted: false, reason: "conflicting_dispatch" }, 202);
     }
+    await bindIngressRegistry(env.DB, id, job);
     await env.EXECUTION_QUEUE.send(job);
     await env.DB.prepare("UPDATE factory_ingress_events SET handoff_state='enqueued',enqueued_at=?,updated_at=? WHERE event_id=?").bind(new Date().toISOString(), new Date().toISOString(), id).run();
     return response({ accepted: true, executionId: job.runId, duplicate: runResult === "duplicate" }, 202);
@@ -921,10 +1385,29 @@ function agentResult(value: unknown): AgentResult {
   if (item.diff_digest !== undefined && (typeof item.diff_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(item.diff_digest))) throw new Error("agent_diff_digest_invalid");
   if (item.validation_digest !== undefined && (typeof item.validation_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(item.validation_digest))) throw new Error("agent_validation_digest_invalid");
   if (item.validation_bytes !== undefined && (typeof item.validation_bytes !== "number" || !Number.isSafeInteger(item.validation_bytes) || item.validation_bytes < 0 || item.validation_bytes > MAX_PROVIDER_BODY_BYTES)) throw new Error("agent_validation_bytes_invalid");
+  if (item.cost_usd !== undefined && (typeof item.cost_usd !== "number" || !Number.isFinite(item.cost_usd) || item.cost_usd < 0 || item.cost_usd > 1_000_000)) throw new Error("agent_cost_invalid");
+  const providerUsage = item.provider_usage;
+  if (providerUsage !== undefined) {
+    if (!providerUsage || typeof providerUsage !== "object" || Array.isArray(providerUsage)) throw new Error("agent_provider_usage_invalid");
+    const usage = providerUsage as ObjectValue;
+    for (const field of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
+      if (!Number.isSafeInteger(usage[field]) || Number(usage[field]) < 0) throw new Error("agent_provider_usage_invalid");
+    }
+    if (usage.provider !== "openrouter" || typeof usage.model !== "string" || usage.model.length === 0 || usage.model.length > 256 || typeof usage.generation_id !== "string" || usage.generation_id.length === 0 || usage.generation_id.length > 256 || !Number.isSafeInteger(usage.provider_created_at) || Number(usage.provider_created_at) < 1 || typeof usage.cost_usd !== "number" || !Number.isFinite(usage.cost_usd) || usage.cost_usd < 0 || usage.cost_usd > 1_000_000 || usage.total_tokens !== Number(usage.prompt_tokens) + Number(usage.completion_tokens)) throw new Error("agent_provider_usage_invalid");
+    if (item.cost_usd !== usage.cost_usd) throw new Error("agent_provider_cost_mismatch");
+  }
   if (item.changed_files !== undefined && (!Array.isArray(item.changed_files) || item.changed_files.length > 12 || item.changed_files.some((path) => typeof path !== "string" || path.length === 0 || path.length > 512 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")))) throw new Error("agent_changed_files_invalid");
-  if (result.status === "passed" && (!result.branch || !result.head_sha)) throw new Error("agent_success_identity_missing");
-  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
+  if (item.source_digest !== undefined && (typeof item.source_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(item.source_digest))) throw new Error("agent_source_digest_invalid");
+  if (item.files !== undefined && (!Array.isArray(item.files) || item.files.length === 0 || item.files.length > 12 || item.files.some((file) => !file || typeof file !== "object" || Array.isArray(file) || typeof (file as ObjectValue).path !== "string" || typeof (file as ObjectValue).content !== "string" || String((file as ObjectValue).content).length > MAX_PROVIDER_BODY_BYTES))) throw new Error("agent_files_invalid");
+  Object.assign(result, Object.fromEntries(["branch", "head_sha", "diff_digest", "validation_digest", "validation_bytes", "changed_files", "files", "source_digest", "cost_usd", "provider_usage"].filter((key) => item[key] !== undefined).map((key) => [key, item[key]])));
+  if (result.status === "passed" && !result.files && (!result.branch || !result.head_sha || item.cost_usd === undefined || providerUsage === undefined)) throw new Error("agent_success_identity_or_handoff_missing");
   return result;
+}
+
+function providerReceiptMatchesCanonical(usage: NonNullable<AgentResult["provider_usage"]>, model: CanonicalModel): boolean {
+  // `model`, generation id, and timestamp are provider-response evidence.
+  // The registry only supplies the expected model identity for comparison.
+  return usage.provider === model.provider && usage.model === model.model && usage.generation_id.length > 0 && usage.provider_created_at > 0;
 }
 
 function parseAgentResult(result: SandboxExecResult): AgentResult {
@@ -943,6 +1426,51 @@ function validationCommand(profile: string): string {
   throw new Error("unsupported_validation_profile");
 }
 
+function workflowTimeout(seconds: number): `${number} seconds` {
+  return `${Math.max(1, Math.floor(seconds))} seconds`;
+}
+
+function remainingRunSeconds(run: Run, limits: { timeoutSeconds: number }): number {
+  const started = Date.parse(run.created_at);
+  if (!Number.isFinite(started)) throw new Error("run_deadline_invalid");
+  const remaining = Math.floor((started + limits.timeoutSeconds * 1_000 - Date.now()) / 1_000);
+  if (remaining < 1) throw new Error("workflow_deadline_exceeded");
+  return remaining;
+}
+
+function runDeadlineAt(run: Run, limits: { timeoutSeconds: number }): number {
+  const started = Date.parse(run.created_at);
+  if (!Number.isFinite(started)) throw new Error("run_deadline_invalid");
+  return started + limits.timeoutSeconds * 1_000;
+}
+
+async function renewLeaseWithinRunDeadline(db: D1Database, run: Run, limits: { timeoutSeconds: number }): Promise<void> {
+  // Check immediately before the write; an overdue callback may only perform
+  // terminal cleanup, never extend authority by renewing a lease.
+  remainingRunSeconds(run, limits);
+  await renewLease(db, run, runDeadlineAt(run, limits));
+}
+
+async function activeWorkflowStep<T extends Rpc.Serializable<T>>(step: WorkflowStep, name: string, run: Run, limits: RuntimeLimits, callback: () => Promise<T>): Promise<T> {
+  const timeout = workflowTimeout(remainingRunSeconds(run, limits));
+  return await step.do<T>(name, { retries: { limit: 0, delay: "1 second" }, timeout }, async () => {
+    remainingRunSeconds(run, limits);
+    const value = await callback();
+    remainingRunSeconds(run, limits);
+    return value;
+  });
+}
+
+function terminalCleanupSeconds(run: Run, limits: { timeoutSeconds: number }): number {
+  const started = Date.parse(run.created_at);
+  if (!Number.isFinite(started)) throw new Error("run_deadline_invalid");
+  // Terminal persistence and lease cleanup are allowed one small, separately
+  // bounded window after the run deadline; they cannot invoke providers.
+  const remaining = Math.floor((started + (limits.timeoutSeconds + 30) * 1_000 - Date.now()) / 1_000);
+  if (remaining < 1) throw new Error("terminal_cleanup_deadline_exceeded");
+  return Math.min(30, remaining);
+}
+
 function pathMatchesScope(path: string, scopes: string[]): boolean {
   return scopes.some((scope) => scope === path || (scope.endsWith("/**") && path.startsWith(`${scope.slice(0, -3)}/`)) || (scope.endsWith("/*") && path.startsWith(`${scope.slice(0, -2)}/`) && !path.slice(scope.length - 1).includes("/")));
 }
@@ -955,45 +1483,62 @@ type GroundingResult = { status: "passed" | "failed"; reason: string; digest: st
 type ReviewResult = { status: "passed" | "failed"; reason: string; digest: string; bytes: number };
 
 async function groundInSandbox(env: Env, job: Job): Promise<GroundingResult> {
-  const token = secret(env, "GITHUB_TOKEN");
-  if (!token) return { status: "failed", reason: "grounding_credentials_missing", digest: await textDigest("grounding_credentials_missing"), bytes: 0, file_count: 0 };
-  const repository = job.contract.target.repository;
-  const baseSha = job.contract.target.base_sha;
-  const sandbox = getSandbox(env.Sandbox, `ground-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(`https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`, { depth: 1, targetDir: "/workspace/project" });
-    if (!checkout.success) return { status: "failed", reason: "grounding_checkout_failed", digest: await textDigest("grounding_checkout_failed"), bytes: 0, file_count: 0 };
-    const exactBase = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${baseSha} && git -C /workspace/project checkout --detach ${baseSha}`, { timeout: 60_000 });
-    if (!exactBase.success) return { status: "failed", reason: "grounding_base_unavailable", digest: await textDigest("grounding_base_unavailable"), bytes: 0, file_count: 0 };
-    const status = await sandbox.exec("git -C /workspace/project status --porcelain=v1 --untracked-files=all", { timeout: 30_000 });
-    const files = await sandbox.exec("git -C /workspace/project ls-files", { timeout: 30_000 });
-    const output = boundedTextValue(`${status.stdout}\n${status.stderr}\n${files.stdout}\n${files.stderr}`);
-    const fileCount = files.stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).length;
-    if (!status.success || !files.success || status.stdout.trim()) return { status: "failed", reason: "grounding_checkout_not_clean", digest: await textDigest(output), bytes: output.length, file_count: fileCount };
-    return { status: "passed", reason: "grounded_exact_base", digest: await textDigest(output), bytes: output.length, file_count: fileCount };
-  } catch {
-    return { status: "failed", reason: "grounding_unavailable", digest: await textDigest("grounding_unavailable"), bytes: 0, file_count: 0 };
-  } finally {
-    try { await sandbox.destroy(); } catch { /* the failed cleanup remains an operational signal */ }
+    const source = await trustedSource(env, job.contract.target.repository, job.contract.target.base_sha);
+    return { status: "passed", reason: "grounded_private_exact_base", digest: source.digest, bytes: Math.floor(source.archive.length * 3 / 4), file_count: 0 };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "grounding_unavailable";
+    return { status: "failed", reason, digest: await textDigest(reason), bytes: 0, file_count: 0 };
   }
 }
 
-async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: string[] = []): Promise<AgentResult> {
-  const token = secret(env, "GITHUB_TOKEN");
-  const modelKey = secret(env, "OPENROUTER_API_KEY");
-  if (!token || !modelKey) return { status: "needs-human", reason: "execution_credentials_missing" };
+async function trustedModelProposal(env: Env, job: Job, model: CanonicalModel, remainingCostUsd: number, findings: string[]): Promise<{ files: Array<{ path: string; content: string }>; usage: NonNullable<AgentResult["provider_usage"]> }> {
+  const key = secret(env, "OPENROUTER_API_KEY");
+  const limits = executionLimits(job.contract);
+  const requestMaxTokens = Math.min(limits.maxOutputTokens, Math.floor((remainingCostUsd - limits.requestOverheadUsd) / limits.outputTokenUsd));
+  if (!key || !Number.isSafeInteger(requestMaxTokens) || requestMaxTokens < 1) throw new Error("remaining_cost_exhausted");
+  const prompt = { repository: job.contract.target.repository, issue: job.contract.linear.identifier, acceptance_criteria: job.contract.acceptance_criteria, allowed_scope: job.contract.allowed_scope, fix_findings: findings.slice(0, 16), instruction: "Return JSON only: {files:[{path,content}]}." };
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: model.model, temperature: 0, max_tokens: requestMaxTokens, messages: [{ role: "system", content: "You are a bounded code editor." }, { role: "user", content: JSON.stringify(prompt) }] }), signal: AbortSignal.timeout(Math.min(PROVIDER_TIMEOUT_MS, limits.timeoutSeconds * 1000)) });
+  const text = await response.text();
+  if (!response.ok || text.length > MAX_PROVIDER_BODY_BYTES) throw new Error("model_request_failed");
+  let envelope: ObjectValue; try { envelope = JSON.parse(text) as ObjectValue; } catch { throw new Error("model_response_invalid"); }
+  const rawUsage = envelope.usage as ObjectValue | undefined;
+  const usage = rawUsage && typeof envelope.model === "string" && typeof envelope.id === "string" && Number.isSafeInteger(envelope.created) && Number.isSafeInteger(rawUsage.prompt_tokens) && Number.isSafeInteger(rawUsage.completion_tokens) && Number.isSafeInteger(rawUsage.total_tokens) && typeof rawUsage.cost === "number" && rawUsage.total_tokens === Number(rawUsage.prompt_tokens) + Number(rawUsage.completion_tokens)
+    ? { provider: "openrouter" as const, model: envelope.model, generation_id: envelope.id, provider_created_at: envelope.created as number, prompt_tokens: rawUsage.prompt_tokens as number, completion_tokens: rawUsage.completion_tokens as number, total_tokens: rawUsage.total_tokens as number, cost_usd: rawUsage.cost as number } : null;
+  if (!usage || usage.cost_usd < 0 || usage.cost_usd > remainingCostUsd || !providerReceiptMatchesCanonical(usage, model)) throw new Error("provider_usage_or_identity_invalid");
+  const content = (envelope.choices as Array<ObjectValue> | undefined)?.[0]?.message as ObjectValue | undefined;
+  let proposal: unknown; try { proposal = JSON.parse(String(content?.content ?? "")); } catch { throw new Error("model_files_invalid"); }
+  const files = (proposal as ObjectValue)?.files;
+  if (!Array.isArray(files) || files.length === 0 || files.length > job.contract.allowed_scope.max_files || files.some((file) => !file || typeof file !== "object" || typeof (file as ObjectValue).path !== "string" || typeof (file as ObjectValue).content !== "string")) throw new Error("model_file_scope_invalid");
+  return { files: files as Array<{ path: string; content: string }>, usage };
+}
+
+async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, remainingCostUsd: number, attempt = 0, findings: string[] = []): Promise<AgentResult> {
+  let credentials: SandboxCredentials;
+  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+    return { status: "needs-human", reason: error instanceof Error ? error.message : "execution_credentials_missing" };
+  }
+  if (!credentials.githubToken || !credentials.openRouterKey) return { status: "needs-human", reason: "execution_credentials_missing" };
+  const limits = executionLimits(job.contract);
+  const model = canonicalModel(job.contract);
+  const configuredModel = secret(env, "OPENROUTER_MODEL");
+  if (configuredModel !== model.model) return { status: "needs-human", reason: "openrouter_model_env_mismatch" };
   const repository = job.contract.target.repository;
   const baseSha = job.contract.target.base_sha;
-  const remote = `https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`;
+  let proposal: Awaited<ReturnType<typeof trustedModelProposal>>;
+  let source: TrustedSource;
+  try {
+    proposal = await trustedModelProposal(env, job, model, remainingCostUsd, findings);
+    source = await trustedSource(env, repository, baseSha);
+  } catch (error) {
+    return { status: "needs-human", reason: error instanceof Error ? error.message : "trusted_acquisition_failed" };
+  }
   const sandbox = getSandbox(env.Sandbox, `execution-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(remote, { depth: 1, targetDir: "/workspace/project" });
-    if (!checkout.success) return { status: "needs-human", reason: "repository_checkout_failed" };
-    const exactBase = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${baseSha} && git -C /workspace/project checkout --detach ${baseSha}`, { timeout: 60_000 });
-    if (!exactBase.success) return { status: "needs-replan", reason: "base_sha_unavailable" };
+    if (!await materializeInCandidateSandbox(sandbox, source)) return { status: "needs-human", reason: "trusted_source_materialization_failed" };
     const result = await sandbox.exec(env.SANDBOX_COMMAND, {
       cwd: "/workspace/project",
-      timeout: 15 * 60_000,
+      timeout: Math.min(limits.timeoutSeconds, remainingSeconds) * 1_000,
       env: {
         FACTORY_RUN_ID: job.runId,
         FACTORY_ISSUE: job.contract.linear.identifier,
@@ -1001,17 +1546,22 @@ async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: strin
         FACTORY_REPOSITORY: repository,
         FACTORY_BASE_SHA: baseSha,
         FACTORY_ATTEMPT: String(attempt),
-        FACTORY_FINDINGS_JSON: stable(findings.slice(0, 16)),
+        FACTORY_SOURCE_DIGEST: source.digest,
+        FACTORY_PROPOSAL_JSON: stable(proposal.files),
         FACTORY_VALIDATION_COMMAND: validationCommand(job.contract.validation_profile),
         FACTORY_MAX_ITERATIONS: "8",
         FACTORY_MAX_COMMANDS: "24",
         FACTORY_MAX_OUTPUT_BYTES: String(Math.min(Number(env.MAX_PAYLOAD_BYTES), MAX_PROVIDER_BODY_BYTES)),
-        GITHUB_TOKEN: token,
-        OPENROUTER_API_KEY: modelKey,
-        OPENROUTER_MODEL: secret(env, "OPENROUTER_MODEL"),
+        FACTORY_MAX_COST_USD: String(remainingCostUsd),
+        FACTORY_MAX_OUTPUT_TOKENS: String(limits.maxOutputTokens),
+        FACTORY_OUTPUT_TOKEN_USD: String(limits.outputTokenUsd),
+        FACTORY_REQUEST_OVERHEAD_USD: String(limits.requestOverheadUsd),
+        FACTORY_TIMEOUT_SECONDS: String(Math.min(limits.timeoutSeconds, remainingSeconds)),
       },
     }) as SandboxExecResult;
-    return parseAgentResult(result);
+    const agent = parseAgentResult(result);
+    if (agent.source_digest !== source.digest || !agent.files) return { status: "needs-human", reason: "candidate_handoff_invalid" };
+    return { ...agent, cost_usd: proposal.usage.cost_usd, provider_usage: proposal.usage };
   } catch {
     return { status: "needs-human", reason: "sandbox_execution_failed" };
   } finally {
@@ -1019,19 +1569,63 @@ async function executeInSandbox(env: Env, job: Job, attempt = 0, findings: strin
   }
 }
 
+async function trustedPublicationState(sandbox: ReturnType<typeof getSandbox>, repository: string): Promise<boolean> {
+  const target = sandboxRemote(repository);
+  const state = await sandbox.exec(`test "$(git -C /workspace/project remote get-url --push origin)" = "${target}" && test "$(git -C /workspace/project config --local --get-all credential.helper)" = "" && test "$(git -C /workspace/project config --local --get core.hooksPath)" = "/dev/null"`, { timeout: 30_000 });
+  return state.success;
+}
+
+async function trustedPublishCandidate(env: Env, job: Job, candidate: AgentResult, suppliedSandbox?: ReturnType<typeof getSandbox>): Promise<AgentResult> {
+  const token = secret(env, "GITHUB_TOKEN");
+  if (!token || !candidate.files || !candidate.source_digest) return { status: "needs-human", reason: "publication_handoff_missing" };
+  const branch = `factory/${job.contract.linear.identifier.toLowerCase()}-${job.runId.slice(-12)}`;
+  const target = sandboxRemote(job.contract.target.repository);
+  const sandbox = suppliedSandbox ?? getSandbox(env.Sandbox, `publication-${job.runId}`);
+  try {
+    if (candidate.files.some((file) => !validCandidateFile(file, job.contract))) return { status: "needs-human", reason: "publication_handoff_scope_invalid" };
+    const checkout = await sandbox.gitCheckout(authenticatedSandboxRemote(job.contract.target.repository, token), { depth: 1, targetDir: "/workspace/project" });
+    if (!checkout.success) return { status: "needs-human", reason: "trusted_private_checkout_failed" };
+    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project checkout --detach ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${target} && git -C /workspace/project config --local --replace-all credential.helper '' && git -C /workspace/project config --local --replace-all core.hooksPath /dev/null`, { timeout: 60_000 });
+    if (!base.success) return { status: "needs-replan", reason: "trusted_base_unavailable" };
+    for (const file of candidate.files) await sandbox.writeFile(`/workspace/project/${file.path}`, file.content);
+    await sandbox.writeFile("/tmp/factory-candidate-paths", candidate.files.map((file) => file.path).join("\0"));
+    const commit = await sandbox.exec(`git -C /workspace/project checkout -b ${branch} && git --literal-pathspecs -C /workspace/project -c core.hooksPath=/dev/null add --pathspec-from-file=/tmp/factory-candidate-paths --pathspec-file-nul && git -C /workspace/project -c core.hooksPath=/dev/null -c user.name='Mhoo Factory' -c user.email='factory@mhoo.invalid' commit -m 'factory(${job.contract.linear.identifier}): bounded implementation' && git -C /workspace/project rev-parse HEAD`, { timeout: 60_000 });
+    const head = commit.stdout.trim().split(/\r?\n/).at(-1) ?? "";
+    if (!commit.success || !SHA40.test(head)) return { status: "needs-human", reason: "trusted_commit_failed" };
+    if (!await trustedPublicationState(sandbox, job.contract.target.repository)) return { status: "needs-human", reason: "trusted_publication_state_invalid" };
+    const header = btoa(`x-access-token:${token}`);
+    const push = await sandbox.exec(`git -C /workspace/project -c core.hooksPath=/dev/null -c credential.helper= -c http.extraHeader='Authorization: Basic ${header}' push ${target} HEAD:refs/heads/${branch}`, { timeout: 120_000 });
+    if (!push.success) return { status: "needs-human", reason: "trusted_push_failed" };
+    return { ...candidate, branch, head_sha: head };
+  } catch {
+    return { status: "needs-human", reason: "trusted_publication_unavailable" };
+  } finally {
+    try { await sandbox.destroy(); } catch { /* candidate and publisher never share a sandbox */ }
+  }
+}
+
+function validCandidateFile(file: { path: string; content: string }, contract: Contract): boolean {
+  return typeof file.path === "string" && typeof file.content === "string" && file.path.length > 0 && file.path.length < 512 && !file.path.startsWith("/") && !file.path.includes("\0") && !file.path.split("/").some((part) => !part || part === "." || part === "..") && pathMatchesScope(file.path, contract.allowed_scope.paths) && !protectedPath(file.path);
+}
+
 async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ValidationResult> {
   if (!agent.branch || !agent.head_sha) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_identity_missing"), output_bytes: 0, reason: "validation_identity_missing", fixable: false };
-  const token = secret(env, "GITHUB_TOKEN");
-  if (!token) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_credentials_missing"), output_bytes: 0, reason: "validation_credentials_missing", fixable: false };
+  let credentials: SandboxCredentials;
+  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+    const reason = error instanceof Error ? error.message : "validation_credentials_missing";
+    return { status: "failed", exit_code: 78, output_digest: await textDigest(reason), output_bytes: 0, reason, fixable: false };
+  }
+  if (!credentials.githubToken) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_credentials_missing"), output_bytes: 0, reason: "validation_credentials_missing", fixable: false };
+  const limits = executionLimits(job.contract);
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `validation-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(`https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`, { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(authenticatedSandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_checkout_failed"), output_bytes: 0, reason: "validation_checkout_failed", fixable: false };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
     if (!head.success || head.stdout.trim() !== agent.head_sha) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_head_mismatch"), output_bytes: Math.min(MAX_PROVIDER_BODY_BYTES, head.stdout.length + head.stderr.length), reason: "validation_head_mismatch", fixable: false };
-    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project diff --check ${job.contract.target.base_sha} HEAD`, { timeout: 60_000 });
-    const checks = await sandbox.exec(`sh -lc ${JSON.stringify(validationCommand(job.contract.validation_profile))}`, { cwd: "/workspace/project", timeout: 15 * 60_000 }) as SandboxExecResult;
+    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${sandboxRemote(repository)} && git -C /workspace/project diff --check ${job.contract.target.base_sha} HEAD`, { timeout: 60_000 });
+    const checks = await sandbox.exec(`sh -lc ${JSON.stringify(validationCommand(job.contract.validation_profile))}`, { cwd: "/workspace/project", timeout: limits.timeoutSeconds * 1_000 }) as SandboxExecResult;
     const output = `${base.stdout}\n${base.stderr}\n${checks.stdout}\n${checks.stderr}`;
     const passed = base.success && checks.success;
     const boundedOutput = boundedTextValue(output);
@@ -1045,15 +1639,19 @@ async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): P
 
 async function reviewInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ReviewResult> {
   if (!agent.branch || !agent.head_sha) return { status: "failed", reason: "review_identity_missing", digest: await textDigest("review_identity_missing"), bytes: 0 };
-  const token = secret(env, "GITHUB_TOKEN");
-  if (!token) return { status: "failed", reason: "review_credentials_missing", digest: await textDigest("review_credentials_missing"), bytes: 0 };
+  let credentials: SandboxCredentials;
+  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+    const reason = error instanceof Error ? error.message : "review_credentials_missing";
+    return { status: "failed", reason, digest: await textDigest(reason), bytes: 0 };
+  }
+  if (!credentials.githubToken) return { status: "failed", reason: "review_credentials_missing", digest: await textDigest("review_credentials_missing"), bytes: 0 };
   const repository = job.contract.target.repository;
   const sandbox = getSandbox(env.Sandbox, `review-${job.runId}`);
   try {
-    const checkout = await sandbox.gitCheckout(`https://x-access-token:${encodeURIComponent(token)}@github.com/${repository}.git`, { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
+    const checkout = await sandbox.gitCheckout(authenticatedSandboxRemote(repository, credentials.githubToken), { branch: agent.branch, depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "failed", reason: "review_checkout_failed", digest: await textDigest("review_checkout_failed"), bytes: 0 };
     const head = await sandbox.exec("git -C /workspace/project rev-parse HEAD", { timeout: 30_000 });
-    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha}`, { timeout: 60_000 });
+    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${sandboxRemote(repository)}`, { timeout: 60_000 });
     const names = await sandbox.exec(`git -C /workspace/project diff --name-only ${job.contract.target.base_sha} HEAD`, { timeout: 30_000 });
     const stats = await sandbox.exec(`git -C /workspace/project diff --numstat ${job.contract.target.base_sha} HEAD`, { timeout: 30_000 });
     const whitespace = await sandbox.exec(`git -C /workspace/project diff --check ${job.contract.target.base_sha} HEAD`, { timeout: 30_000 });
@@ -1098,6 +1696,9 @@ function pullRequest(value: unknown, expectedRepository: string): PullRequest {
 }
 
 async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promise<PullRequest> {
+  const current = await assertCurrentRegistry(job.contract);
+  const risk = current.factory.risk as ObjectValue;
+  if (job.contract.merge_policy !== "human" || risk.merge_ceiling !== "human" || !strings(risk.autonomous_merge_exclusions, "registry_autonomous_merge_exclusions_invalid").includes(job.contract.target.repository)) throw new Error("registry_human_merge_required");
   const token = secret(env, "GITHUB_TOKEN");
   if (!token || !agent.branch || !agent.head_sha) throw new Error("publication_identity_missing");
   const repo = repositoryPath(job.contract.target.repository);
@@ -1118,12 +1719,12 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
     if (existing.base.ref !== defaultBranch || existing.base.sha !== job.contract.target.base_sha) throw new Error("publication_base_changed");
     return existing;
   }
-  const marker = `<!-- mhoo-dark-factory-run:v1 run=${job.runId} dispatch=${job.dispatchId} -->`;
+  const marker = pullRequestMarker(job.runId, job.dispatchId);
   const created = await githubRequest(token, "POST", `/repos/${repo}/pulls`, {
     title: `[Factory] ${job.contract.linear.identifier} bounded execution`,
     head: agent.branch,
     base: defaultBranch,
-    body: `${marker}\n\nFactory execution for ${job.contract.linear.identifier}.\n\n- Run: \`${job.runId}\`\n- Contract digest: \`${job.contractDigest}\`\n- Base: \`${job.contract.target.base_sha}\`\n- Head: \`${agent.head_sha}\`\n\nAutomatic merge is disabled; human review is required.`,
+    body: `${marker}\n\nFactory execution for ${job.contract.linear.identifier}.\n\n- Factory: \`${job.contract.registry.factory_id}\`\n- Registry: \`${job.contract.registry.registry_version}\` / \`${job.contract.registry.registry_digest}\`\n- Run: \`${job.runId}\`\n- Contract digest: \`${job.contractDigest}\`\n- Base: \`${job.contract.target.base_sha}\`\n- Head: \`${agent.head_sha}\`\n\nAutomatic merge is disabled; human review is required.`,
   });
   const pull = pullRequest(created, job.contract.target.repository);
   if (pull.head.sha !== agent.head_sha) throw new Error("created_pull_request_head_mismatch");
@@ -1157,7 +1758,7 @@ async function ensureLinearReceipt(env: Env, job: Job, pull: PullRequest, state 
     after = pageInfo.endCursor;
     if (page === 9) throw new Error("linear_receipts_pagination_limit");
   }
-  const body = `${marker}\n\nFactory execution for ${job.contract.linear.identifier}: ${state}.\n\n- Run: \`${job.runId}\`\n- Reason: \`${reason}\`\n- Contract digest: \`${job.contractDigest}\`\n- Repository: \`${job.contract.target.repository}\`\n- PR: ${pull.html_url}\n- PR head: \`${pull.head.sha}\`\n\nAutomatic merge is disabled; human review is required.`;
+  const body = `${marker}\n\nFactory execution for ${job.contract.linear.identifier}: ${state}.\n\n- Factory: \`${job.contract.registry.factory_id}\`\n- Registry: \`${job.contract.registry.registry_version}\` / \`${job.contract.registry.registry_digest}\`\n- Run: \`${job.runId}\`\n- Reason: \`${reason}\`\n- Contract digest: \`${job.contractDigest}\`\n- Repository: \`${job.contract.target.repository}\`\n- PR: ${pull.html_url}\n- PR head: \`${pull.head.sha}\`\n\nAutomatic merge is disabled; human review is required.`;
   const matches = nodes.filter((item) => {
     if (!item || typeof item !== "object") return false;
     const value = item as ObjectValue;
@@ -1192,23 +1793,24 @@ function storedContract(run: Run): Contract {
 }
 
 async function linearPlanningSnapshot(env: Env, run: Run): Promise<Contract> {
-  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description project{id} state{type}}}";
+  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description project{id} team{id} state{type} labels{nodes{name}}}}";
   const data = await linearGraphql(env, query, { issueId: run.linear_issue_id });
   const issue = data.issue;
   if (!issue || typeof issue !== "object" || Array.isArray(issue)) throw new Error("linear_issue_missing");
   const item = issue as ObjectValue;
   const project = item.project;
   if (!project || typeof project !== "object" || Array.isArray(project) || typeof (project as ObjectValue).id !== "string") throw new Error("linear_project_missing");
-  if ((project as ObjectValue).id !== secret(env, "LINEAR_PROJECT_ID")) throw new Error("linear_project_mismatch");
-  return contractFromDescription(item.description, item, env);
+  return await contractFromDescription(item.description, item);
 }
 
 async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Promise<"processed" | "ignored"> {
-  if ((!job.runId && !job.branch) || (job.runId !== undefined && !RUN_ID.test(job.runId)) || (job.branch !== undefined && !BRANCH.test(job.branch)) || !REPOSITORY.test(job.repository) || (job.prNumber !== undefined && (!Number.isSafeInteger(job.prNumber) || job.prNumber < 1)) || !/^[A-Za-z0-9._-]{1,64}$/.test(job.action)) throw new Error("reconciliation_job_invalid");
+  if ((!job.runId && !job.branch) || (job.runId !== undefined && !RUN_ID.test(job.runId)) || (job.dispatchId !== undefined && !/^[A-Za-z0-9._:@-]{1,192}$/.test(job.dispatchId)) || (job.branch !== undefined && !BRANCH.test(job.branch)) || !REPOSITORY.test(job.repository) || (job.prNumber !== undefined && (!Number.isSafeInteger(job.prNumber) || job.prNumber < 1)) || !/^[A-Za-z0-9._-]{1,64}$/.test(job.action)) throw new Error("reconciliation_job_invalid");
   const run = job.runId ? await runById(env.DB, job.runId) : await runByBranch(env.DB, job.repository, job.branch as string);
   if (!run) return "ignored";
-  if (run.repository !== job.repository || (run.branch !== null && job.branch !== undefined && run.branch !== job.branch) || (run.pr_number !== null && job.prNumber !== undefined && run.pr_number !== job.prNumber)) throw new Error("reconciliation_identity_conflict");
-  if (run.profile_digest !== PROFILE_DIGEST) throw new Error("reconciliation_profile_digest_conflict");
+  if (run.repository !== job.repository || (job.dispatchId !== undefined && run.dispatch_id !== job.dispatchId) || (run.branch !== null && job.branch !== undefined && run.branch !== job.branch) || (run.pr_number !== null && job.prNumber !== undefined && run.pr_number !== job.prNumber)) throw new Error("reconciliation_identity_conflict");
+  const stored = storedContract(run);
+  await assertCurrentRegistry(stored);
+  if (run.registry_digest !== stored.registry.registry_digest || run.profile_digest !== await profileDigest(stored)) throw new Error("reconciliation_registry_identity_conflict");
   const token = secret(env, "GITHUB_TOKEN");
   if (!token) throw new Error("github_credentials_missing");
   let prNumber = job.prNumber ?? run.pr_number ?? null;
@@ -1224,7 +1826,7 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
   const value = await githubRequest(token, "GET", `/repos/${repositoryPath(job.repository)}/pulls/${prNumber}`);
   const pull = pullRequest(value, job.repository);
   if (pull.number !== prNumber || pull.html_url !== `https://github.com/${job.repository}/pull/${prNumber}`) throw new Error("reconciliation_pr_identity_conflict");
-  const contract = storedContract(run);
+  const contract = stored;
   if (await digest(contract) !== run.contract_digest) throw new Error("reconciliation_contract_digest_conflict");
   const currentContract = await linearPlanningSnapshot(env, run);
   const expectedBranch = run.branch ?? `factory/${contract.linear.identifier.toLowerCase()}-${run.run_id.slice(-12)}`;
@@ -1264,6 +1866,7 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
   await recordStep(env.DB, run.run_id, "reconciliation", state, { reason, action: job.action, pr_number: pull.number, base_sha: pull.base.sha, head_sha: pull.head.sha });
   const dispatchJob: Job = { kind: "dispatch", dispatchId: run.dispatch_id, runId: run.run_id, contractDigest: run.contract_digest, contract };
   await ensureLinearReceipt(env, dispatchJob, pull, state, reason);
+  await recordLinearReconciliation(env.DB, run.run_id, `github:${job.eventId}`, state, reason);
   return "processed";
 }
 
@@ -1271,9 +1874,10 @@ function isGitHubReconciliationJob(value: unknown): value is GitHubReconciliatio
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const item = value as ObjectValue;
   const runIdValid = item.runId === undefined || (typeof item.runId === "string" && RUN_ID.test(item.runId));
+  const dispatchIdValid = item.dispatchId === undefined || (typeof item.dispatchId === "string" && /^[A-Za-z0-9._:@-]{1,192}$/.test(item.dispatchId));
   const branchValid = item.branch === undefined || (typeof item.branch === "string" && BRANCH.test(item.branch));
   const prNumberValid = item.prNumber === undefined || (typeof item.prNumber === "number" && Number.isSafeInteger(item.prNumber) && item.prNumber > 0);
-  return item.kind === "github-reconciliation" && typeof item.eventId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(item.eventId) && (item.runId !== undefined || item.branch !== undefined) && runIdValid && branchValid && prNumberValid && typeof item.repository === "string" && REPOSITORY.test(item.repository) && typeof item.action === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(item.action);
+  return item.kind === "github-reconciliation" && typeof item.eventId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(item.eventId) && (item.runId !== undefined || item.branch !== undefined) && runIdValid && dispatchIdValid && branchValid && prNumberValid && typeof item.repository === "string" && REPOSITORY.test(item.repository) && typeof item.action === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(item.action);
 }
 
 function reconciliationJob(eventId: string, selector: ObjectValue): GitHubReconciliationJob {
@@ -1281,6 +1885,7 @@ function reconciliationJob(eventId: string, selector: ObjectValue): GitHubReconc
     kind: "github-reconciliation",
     eventId,
     ...(typeof selector.run_id === "string" ? { runId: selector.run_id } : {}),
+    ...(typeof selector.dispatch_id === "string" ? { dispatchId: selector.dispatch_id } : {}),
     ...(typeof selector.branch === "string" ? { branch: selector.branch } : {}),
     repository: String(selector.repository),
     ...(typeof selector.pr_number === "number" ? { prNumber: selector.pr_number } : {}),
@@ -1298,7 +1903,7 @@ function workflowActor(fromState: string, toState: string): TransitionActor {
 
 async function rehydrateLinearJob(env: Env, selector: ObjectValue): Promise<Job> {
   if (selector.kind !== "linear-issue" || typeof selector.issue_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(selector.issue_id)) throw new Error("linear_selector_invalid");
-  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description state{type} labels{nodes{name}}}}";
+  const query = "query($issueId:ID!){issue(id:$issueId){id identifier description project{id} team{id} state{type} labels{nodes{name}}}}";
   const data = await linearGraphql(env, query, { issueId: selector.issue_id });
   const issue = data.issue;
   if (!issue || typeof issue !== "object" || Array.isArray(issue) || (issue as ObjectValue).id !== selector.issue_id) throw new Error("linear_issue_missing");
@@ -1327,6 +1932,7 @@ async function recoverIngress(env: Env): Promise<void> {
         const job = await rehydrateLinearJob(env, selector);
         const runResult = await insertRun(env.DB, job);
         if (runResult === "conflict") throw new Error("conflicting_dispatch");
+        await bindIngressRegistry(env.DB, row.event_id, job);
         await env.EXECUTION_QUEUE.send(job);
       } else {
         await markIngress(env.DB, row.event_id, "rejected:unsupported_provider");
@@ -1342,14 +1948,48 @@ async function recoverIngress(env: Env): Promise<void> {
   }
 }
 
+function scheduledRegistryProjectIds(): string[] {
+  const ids = records(FACTORY_REGISTRY.factories, "registry_factories_invalid")
+    .filter((factory) => ACTIVE_FACTORY_STATES.has(String(factory.state)))
+    .flatMap((factory) => strings((factory.linear as ObjectValue).project_ids, "registry_project_ids_invalid"));
+  if (new Set(ids).size !== ids.length) throw new Error("registry_project_ids_ambiguous");
+  return ids;
+}
+
+async function intakeScheduledRegistryProjects(env: Env): Promise<void> {
+  // Project authority is resolved from the signed-in issue and the canonical
+  // registry. This only discovers candidates; `admit` still verifies every
+  // project/team/label/contract boundary before a run is durable.
+  const query = "query($projectId:ID!){issues(first:50,filter:{project:{id:{eq:$projectId}}}){nodes{id identifier description project{id} team{id} state{type} labels{nodes{name}}}}}";
+  for (const projectId of scheduledRegistryProjectIds()) {
+    const data = await linearGraphql(env, query, { projectId });
+    const issues = (data.issues as ObjectValue | undefined)?.nodes;
+    if (!Array.isArray(issues)) throw new Error("linear_scheduled_intake_invalid");
+    for (const issue of issues.slice(0, 50)) {
+      try {
+        const job = await admit(JSON.stringify({ type: "Issue", data: issue }), env);
+        const outcome = await insertRun(env.DB, job);
+        if (outcome === "inserted") await env.EXECUTION_QUEUE.send(job);
+      } catch (error) {
+        // Most project issues are not opted in. Malformed or over-authority
+        // candidates fail closed without preventing other registered factories
+        // from being inspected on this scheduled pass.
+        if (!(error instanceof AdmissionError)) throw error;
+      }
+    }
+  }
+}
+
 export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
   async run(event: Readonly<WorkflowEvent<Job>>, step: WorkflowStep): Promise<ObjectValue> {
     const job = event.payload;
     let run: Run | null = null;
     let published: PullRequest | null = null;
     let leaseHeld = false;
+    let runtimeLimits: RuntimeLimits | null = null;
     const finish = async (state: string, reason: string, extra: ObjectValue = {}): Promise<ObjectValue> => {
-      await step.do("finalize", async () => {
+      const terminalTimeout = run && runtimeLimits ? workflowTimeout(terminalCleanupSeconds(run, runtimeLimits)) : "30 seconds";
+      await step.do("finalize", { retries: { limit: 0, delay: "1 second" }, timeout: terminalTimeout }, async () => {
         const latest = await runById(this.env.DB, job.runId);
         if (!latest) throw new Error("run_missing");
         const fence = latest.lease_fence === null ? undefined : latest.lease_fence;
@@ -1362,14 +2002,18 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
     try {
       run = await runById(this.env.DB, job.runId);
       if (!run || run.lease_fence === null) return { status: "needs-human", runId: job.runId, reason: "lease_missing" };
+      const resolvedRuntimeLimits = runtimeExecutionLimits(this.env, job.contract);
+      runtimeLimits = resolvedRuntimeLimits;
+      const assertActive = () => remainingRunSeconds(run as Run, resolvedRuntimeLimits);
       leaseHeld = true;
       if (await stopped(this.env.DB)) {
         return await finish("stopped", "stop_requested_before_execution");
       }
-      await renewLease(this.env.DB, run);
+      await renewLeaseWithinRunDeadline(this.env.DB, run, resolvedRuntimeLimits);
 
-      const grounding = await step.do<GroundingResult>("ground", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<GroundingResult> => {
+      const grounding = await activeWorkflowStep<GroundingResult>(step, "ground", run, resolvedRuntimeLimits, async (): Promise<GroundingResult> => {
         const result = await groundInSandbox(this.env, job);
+        assertActive();
         await recordStep(this.env.DB, job.runId, "ground", result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes, file_count: result.file_count });
         return result;
       });
@@ -1382,30 +2026,49 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       let execution: AgentResult | null = null;
       let validation: ValidationResult | null = null;
       let review: ReviewResult | null = null;
+      let cumulativeCostUsd = 0;
       for (let attempt = 0; attempt <= maxFixAttempts; attempt += 1) {
+        const remainingCostUsd = runtimeLimits.costUsd - cumulativeCostUsd;
+        if (!Number.isFinite(remainingCostUsd) || remainingCostUsd <= 0) return await finish("needs-human", "cost_cap_exhausted", { cost_usd: cumulativeCostUsd, cost_cap_usd: runtimeLimits.costUsd });
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_execution");
-        await renewLease(this.env.DB, run);
+        await renewLeaseWithinRunDeadline(this.env.DB, run, resolvedRuntimeLimits);
         const findings = validation?.status === "failed" ? [validation.reason] : [];
-        execution = await step.do<AgentResult>(`sandbox-execution-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: "16 minutes" }, async (): Promise<AgentResult> => {
-          const result = await executeInSandbox(this.env, job, attempt, findings);
-          await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes });
+        execution = await activeWorkflowStep<AgentResult>(step, `sandbox-execution-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<AgentResult> => {
+          // The provider request receives only the remaining authoritative budget;
+          // it cannot start after previous attempts consumed the cap.
+          const result = await executeInSandbox(this.env, job, remainingRunSeconds(run as Run, resolvedRuntimeLimits), remainingCostUsd, attempt, findings);
+          assertActive();
+          await recordStep(this.env.DB, job.runId, `sandbox-execution-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, diff_digest: result.diff_digest, validation_digest: result.validation_digest, validation_bytes: result.validation_bytes, provider_usage: result.provider_usage });
           return result;
         });
-        if (execution.status === "needs-replan" || execution.status === "needs-human" || !execution.branch || !execution.head_sha || (execution.status === "failed" && execution.reason !== "validation_failed")) {
+        if (execution.status === "needs-replan" || execution.status === "needs-human" || !execution.files || (execution.status === "failed" && execution.reason !== "validation_failed")) {
           const state = execution.status === "needs-replan" ? "needs-replan" : execution.status === "failed" ? "failed" : "needs-human";
           return await finish(state, execution.reason, { head_sha: execution.head_sha ?? null, branch: execution.branch ?? null });
         }
+        cumulativeCostUsd += execution.cost_usd ?? Number.POSITIVE_INFINITY;
+        if (!Number.isFinite(cumulativeCostUsd) || cumulativeCostUsd > runtimeLimits.costUsd) return await finish("needs-human", "cost_cap_exceeded", { cost_usd: cumulativeCostUsd, cost_cap_usd: runtimeLimits.costUsd });
+        execution = await activeWorkflowStep<AgentResult>(step, `trusted-publication-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<AgentResult> => {
+          const result = await trustedPublishCandidate(this.env, job, execution as AgentResult);
+          assertActive();
+          await recordStep(this.env.DB, job.runId, `trusted-publication-${attempt}`, result.status, { reason: result.reason, branch: result.branch, head_sha: result.head_sha, source_digest: result.source_digest });
+          return result;
+        });
+        if (execution.status !== "passed" || !execution.branch || !execution.head_sha) return await finish(execution.status === "needs-replan" ? "needs-replan" : "needs-human", execution.reason);
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_validation", { head_sha: execution.head_sha, branch: execution.branch });
+        assertActive();
         await transitionRun(this.env.DB, job.runId, "validating", "workflow", `workflow:validating:${job.runId}:${attempt}`, { leaseFence: run.lease_fence ?? undefined });
 
-        validation = await step.do<ValidationResult>(`independent-validation-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: "16 minutes" }, async (): Promise<ValidationResult> => {
+        validation = await activeWorkflowStep<ValidationResult>(step, `independent-validation-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<ValidationResult> => {
           const result = await validateInFreshSandbox(this.env, job, execution as AgentResult);
+          assertActive();
           await recordStep(this.env.DB, job.runId, `independent-validation-${attempt}`, result.status, { reason: result.reason, fixable: result.fixable, exit_code: result.exit_code, output_digest: result.output_digest, output_bytes: result.output_bytes });
           return result;
         });
         if (validation.status !== "passed") {
           if (validation.fixable && attempt < maxFixAttempts) {
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "fixable-failure", "validator", `workflow:validation-fixable:${job.runId}:${attempt}`, { result: { reason: validation.reason, validation_digest: validation.output_digest, validation_bytes: validation.output_bytes }, leaseFence: run.lease_fence ?? undefined });
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "running", "workflow", `workflow:validation-retry:${job.runId}:${attempt}`, { result: { reason: "bounded_fix_attempt", attempt: attempt + 1 }, leaseFence: run.lease_fence ?? undefined });
             continue;
           }
@@ -1413,15 +2076,18 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
         }
         if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_review", { head_sha: execution.head_sha, branch: execution.branch });
 
-        review = await step.do<ReviewResult>(`independent-review-${attempt}`, { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<ReviewResult> => {
+        review = await activeWorkflowStep<ReviewResult>(step, `independent-review-${attempt}`, run, resolvedRuntimeLimits, async (): Promise<ReviewResult> => {
           const result = await reviewInFreshSandbox(this.env, job, execution as AgentResult);
+          assertActive();
           await recordStep(this.env.DB, job.runId, `independent-review-${attempt}`, result.status, { reason: result.reason, digest: result.digest, bytes: result.bytes });
           return result;
         });
         if (review.status !== "passed") {
           if (attempt < maxFixAttempts) {
             validation = { status: "failed", exit_code: 78, output_digest: review.digest, output_bytes: review.bytes, reason: review.reason, fixable: true };
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "fixable-failure", "validator", `workflow:review-fixable:${job.runId}:${attempt}`, { result: { reason: review.reason, review_digest: review.digest, review_bytes: review.bytes }, leaseFence: run.lease_fence ?? undefined });
+            assertActive();
             await transitionRun(this.env.DB, job.runId, "running", "workflow", `workflow:review-retry:${job.runId}:${attempt}`, { result: { reason: "bounded_fix_attempt", attempt: attempt + 1 }, leaseFence: run.lease_fence ?? undefined });
             continue;
           }
@@ -1431,35 +2097,43 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
       }
       if (!execution || !validation || validation.status !== "passed" || !review || review.status !== "passed") return await finish("needs-human", "workflow_evaluation_incomplete");
       if (await stopped(this.env.DB)) return await finish("stopped", "stop_requested_before_publication", { head_sha: execution.head_sha });
-      await renewLease(this.env.DB, run);
+      await renewLeaseWithinRunDeadline(this.env.DB, run, resolvedRuntimeLimits);
 
-      published = await step.do<PullRequest>("publish-pr", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<PullRequest> => {
+      published = await activeWorkflowStep<PullRequest>(step, "publish-pr", run, resolvedRuntimeLimits, async (): Promise<PullRequest> => {
         const pull = await publishPullRequest(this.env, job, execution);
+        assertActive();
         await recordStep(this.env.DB, job.runId, "publish-pr", "passed", { number: pull.number, url: pull.html_url, head_sha: pull.head.sha, base: pull.base.ref, base_sha: pull.base.sha });
+        assertActive();
+        await recordPrReceipt(this.env.DB, job.runId, pull);
         return pull;
       });
-      const receipt = await step.do<"created" | "existing">("linear-receipt", { retries: { limit: 1, delay: "30 seconds" }, timeout: "3 minutes" }, async (): Promise<"created" | "existing"> => {
+      const receipt = await activeWorkflowStep<"created" | "existing">(step, "linear-receipt", run, resolvedRuntimeLimits, async (): Promise<"created" | "existing"> => {
         const result = await ensureLinearReceipt(this.env, job, published as PullRequest);
+        assertActive();
         await recordStep(this.env.DB, job.runId, "linear-receipt", "passed", { outcome: result, pr_number: (published as PullRequest).number });
+        assertActive();
+        await recordLinearReconciliation(this.env.DB, job.runId, `linear:${job.runId}:${(published as PullRequest).number}`, "pr-open", "pr_published");
         return result;
       });
-      await step.do("finalize-pr", async () => {
+      await activeWorkflowStep(step, "finalize-pr", run, resolvedRuntimeLimits, async () => {
         const pull = published as PullRequest;
+        assertActive();
         await transitionRun(this.env.DB, job.runId, "pr-open", "workflow", `workflow:publish:${job.runId}`, {
           result: { reason: "pr_published", validation_digest: validation.output_digest, validation_bytes: validation.output_bytes, review_digest: review?.digest, review_bytes: review?.bytes, linear_receipt: receipt },
           leaseFence: run?.lease_fence ?? undefined,
           fields: { branch: execution?.branch ?? null, headSha: pull.head.sha, prNumber: pull.number, prUrl: pull.html_url },
         });
+        assertActive();
         await recordStep(this.env.DB, job.runId, "final", "pr-open", { pr_number: pull.number, pr_url: pull.html_url, head_sha: pull.head.sha });
         return { recorded: true };
       });
       return { status: "pr-open", runId: job.runId, prUrl: (published as PullRequest).html_url };
     } catch (error) {
-      const reason = error instanceof Error && ["publication_base_changed", "grounding_base_unavailable", "base_sha_unavailable", "fix_branch_base_changed"].includes(error.message) ? error.message : "workflow_step_failed";
+      const reason = error instanceof Error && ["publication_base_changed", "grounding_base_unavailable", "base_sha_unavailable", "fix_branch_base_changed", "workflow_deadline_exceeded"].includes(error.message) ? error.message : "workflow_step_failed";
       const state = reason === "publication_base_changed" || reason === "grounding_base_unavailable" || reason === "base_sha_unavailable" || reason === "fix_branch_base_changed" ? "needs-replan" : "needs-human";
       return await finish(state, reason, { pr_url: published?.html_url ?? null, pr_number: published?.number ?? null });
     } finally {
-      if (leaseHeld) await step.do("release-lease", async () => {
+      if (leaseHeld) await step.do("release-lease", { retries: { limit: 0, delay: "1 second" }, timeout: run && runtimeLimits ? workflowTimeout(terminalCleanupSeconds(run, runtimeLimits)) : "30 seconds" }, async () => {
         const latest = await runById(this.env.DB, job.runId);
         if (latest?.lease_fence !== null && latest?.lease_fence !== undefined) await releaseLease(this.env.DB, latest);
         await recordStep(this.env.DB, job.runId, "lease-release", "passed", { released: latest?.lease_fence !== null && latest?.lease_fence !== undefined });
@@ -1469,11 +2143,59 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
   }
 }
 
+// These pure boundaries are exported only for local Worker-runtime tests. They
+// are not attached to the public fetch surface.
+export const __TEST_ONLY__ = {
+  sandboxCredentials,
+  sandboxRemote,
+  trustedSource,
+  authenticatedSandboxRemote,
+  trustedPublishCandidate,
+  validCandidateFile,
+  inherentEffectClasses,
+  capacityLeaseScopes,
+  runtimeConcurrencyLimits,
+  schedule,
+  digest,
+  profileDigest,
+  acquireLease,
+  renewLease,
+  renewLeaseWithinRunDeadline,
+  releaseLease,
+  remainingRunSeconds,
+  runDeadlineAt,
+  activeWorkflowStep,
+  terminalCleanupSeconds,
+  runtimeExecutionLimits,
+  canonicalModel,
+  providerReceiptMatchesCanonical,
+  agentResult,
+  resolveFactory,
+  pullRequestMarker,
+  pullRequestMarkerBinding,
+  acceptGithub,
+  reconcileGithubEvent,
+  publishPullRequest,
+  protectedPath,
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
-      if (url.pathname === "/health") return response({ ok: true, stopped: await stopped(env.DB), automaticMerge: false, source: "github-reviewable" });
+      if (url.pathname === "/health") return response({ ok: true });
+      if (url.pathname === "/ops/status") {
+        const admin = secret(env, "FACTORY_ADMIN_SECRET");
+        if (request.method !== "GET" || !admin || request.headers.get("Authorization") !== `Bearer ${admin}`) return response({ error: "forbidden" }, 403);
+        return response({
+          ok: true,
+          stopped: await stopped(env.DB),
+          automaticMerge: false,
+          registryVersion: text(FACTORY_REGISTRY.registry_version, "registry_version_invalid"),
+          registryDigest: await digest(FACTORY_REGISTRY),
+          enabledFactories: records(FACTORY_REGISTRY.factories, "registry_factories_invalid").filter((item) => ACTIVE_FACTORY_STATES.has(String(item.state))).map((item) => item.factory_id),
+        });
+      }
       if (url.pathname === "/webhooks/linear" && request.method === "POST") return await acceptLinear(request, env);
       if (url.pathname === "/webhooks/github" && request.method === "POST") return await acceptGithub(request, env);
       if (url.pathname === "/controls/stop" || url.pathname === "/controls/resume") {
@@ -1501,7 +2223,7 @@ export default {
         continue;
       }
       const result = await schedule(env, message.body as Job);
-      if (["dispatched", "stopped", "blocked-by-dependency", "already-handled", "needs-human"].includes(result)) message.ack();
+      if (["dispatched", "stopped", "blocked-by-dependency", "needs-replan", "already-handled", "needs-human"].includes(result)) message.ack();
       else message.retry();
     }
   },
@@ -1510,6 +2232,7 @@ export default {
     if (await stopped(env.DB)) return;
     await recoverIngress(env);
     if (String(env.FACTORY_ENABLED) !== "true") return;
+    if (String(env.FACTORY_AUTONOMY) === "1") await intakeScheduledRegistryProjects(env);
     const row = await env.DB.prepare("SELECT run_id,contract_json FROM factory_runs WHERE current_state IN ('admitted','queued','blocked-by-dependency') ORDER BY created_at LIMIT 1").first<{ run_id: string; contract_json: string }>();
     if (row) { const contract = JSON.parse(row.contract_json) as Contract; await schedule(env, { kind: "dispatch", dispatchId: contract.dispatch_id, runId: row.run_id, contractDigest: await digest(contract), contract }); }
   },
