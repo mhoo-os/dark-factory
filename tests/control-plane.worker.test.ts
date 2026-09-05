@@ -1,12 +1,20 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import migration001 from "../migrations/0001_factory.sql?raw";
 import migration002 from "../migrations/0002_ingress-retry-state.sql?raw";
 import migration003 from "../migrations/0003-state-history-and-active-issue.sql?raw";
 import migration004 from "../migrations/0004-trusted-factory-registry.sql?raw";
 import migration005 from "../migrations/0005-runtime-capacity-leases.sql?raw";
 import worker, { __TEST_ONLY__, ExecutionWorkflow } from "../src/index";
+
+// Provider authentication is exercised with real signing in github-app-auth.test.mjs.
+vi.mock("../src/github-app-auth", () => ({
+  githubInstallationToken: async (config: Record<string, unknown>) => {
+    if (typeof config.GITHUB_TOKEN !== "string") throw new Error("github_app_config_missing_GITHUB_APP_REPOSITORY");
+    return config.GITHUB_TOKEN;
+  },
+}));
 
 const registry = {
   factory_id: "foundation-pilot",
@@ -91,8 +99,8 @@ describe("local Worker control-plane behavior", () => {
     await expect(env.DB.prepare("SELECT from_state,to_state,actor FROM factory_transitions WHERE dispatch_id=?").bind(dispatchId).first()).resolves.toMatchObject({ from_state: "queued", to_state: "needs-replan", actor: "reconciler" });
   });
 
-  it("keeps the none credential profile empty", () => {
-    expect(__TEST_ONLY__.sandboxCredentials({ GITHUB_TOKEN: "must-not-leak", OPENROUTER_API_KEY: "must-not-leak" } as never, contract)).toEqual({});
+  it("keeps the none credential profile empty", async () => {
+    expect(await __TEST_ONLY__.sandboxCredentials({ GITHUB_TOKEN: "must-not-leak", OPENROUTER_API_KEY: "must-not-leak" } as never, contract)).toEqual({});
     expect(__TEST_ONLY__.sandboxRemote(contract.target.repository)).toBe("https://github.com/mhoo-os/dark-factory.git");
     expect(__TEST_ONLY__.inherentEffectClasses(contract)).toEqual(["repository-write"]);
   });
@@ -326,7 +334,7 @@ describe("local Worker control-plane behavior", () => {
     const step = { do: async (name: string, _options: unknown, callback: () => Promise<unknown>) => { steps.push(name); return await callback(); } };
     const instance = Object.create(ExecutionWorkflow.prototype) as ExecutionWorkflow;
     Object.defineProperty(instance, "env", { value: Object.assign(Object.create(env), { MAX_COST_USD: "8", MAX_FIX_ATTEMPTS: "0", OPENROUTER_MODEL: "z-ai/glm-5.3-flash" }) });
-    await expect(instance.run({ payload: { kind: "dispatch", dispatchId: workflowContract.dispatch_id, runId: workflowRunId, contractDigest: digest, contract: workflowContract } } as never, step as never)).resolves.toMatchObject({ status: "needs-human", reason: "trusted_source_identity_invalid" });
+    await expect(instance.run({ payload: { kind: "dispatch", dispatchId: workflowContract.dispatch_id, runId: workflowRunId, contractDigest: digest, contract: workflowContract } } as never, step as never)).resolves.toMatchObject({ status: "needs-human", reason: "github_app_config_missing_GITHUB_APP_REPOSITORY" });
     expect(steps).toEqual(expect.arrayContaining(["ground", "finalize", "release-lease"]));
     await expect(env.DB.prepare("SELECT current_state,lease_fence FROM factory_runs WHERE run_id=?").bind(workflowRunId).first()).resolves.toMatchObject({ current_state: "needs-human", lease_fence: null });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_leases WHERE dispatch_id=?").bind(workflowRunId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });

@@ -1,3 +1,4 @@
+import { githubInstallationToken } from './github-app-auth';
 import { getSandbox } from "@cloudflare/sandbox";
 import {
   WorkflowEntrypoint,
@@ -250,12 +251,12 @@ function secret(env: Env, name: string): string | undefined {
 
 type SandboxCredentials = { githubToken?: string; openRouterKey?: string };
 
-function sandboxCredentials(env: Env, contract: Contract): SandboxCredentials {
+async function sandboxCredentials(env: Env, contract: Contract): Promise<SandboxCredentials> {
   // The credential profile is an authorization boundary, not a label. In
   // particular, the `none` profile is deliberately an empty environment.
   if (contract.factory_request.credential_profile === "none") return {};
   if (contract.factory_request.credential_profile !== "github-linear-openrouter-v1") throw new Error("credential_profile_runtime_unsupported");
-  const githubToken = secret(env, "GITHUB_TOKEN");
+  const githubToken = await githubInstallationToken(env, contract.target.repository);
   const openRouterKey = secret(env, "OPENROUTER_API_KEY");
   if (!githubToken || !openRouterKey) throw new Error("execution_credentials_missing");
   return { githubToken, openRouterKey };
@@ -282,7 +283,7 @@ async function archiveDigest(bytes: Uint8Array): Promise<string> {
 }
 
 async function trustedSource(env: Env, repository: string, baseSha: string): Promise<TrustedSource> {
-  const token = secret(env, "GITHUB_TOKEN");
+  const token = await githubInstallationToken(env, repository);
   if (!token || !REPOSITORY.test(repository) || !SHA40.test(baseSha)) throw new Error("trusted_source_identity_invalid");
   const commit = await githubRequest(token, "GET", `/repos/${repositoryPath(repository)}/commits/${baseSha}`);
   if (Array.isArray(commit) || commit.sha !== baseSha) throw new Error("trusted_source_sha_mismatch");
@@ -1599,7 +1600,7 @@ async function trustedModelProposal(env: Env, job: Job, model: CanonicalModel, r
 
 async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, remainingCostUsd: number, attempt = 0, findings: string[] = []): Promise<AgentResult> {
   let credentials: SandboxCredentials;
-  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+  try { credentials = await sandboxCredentials(env, job.contract); } catch (error) {
     return { status: "needs-human", reason: error instanceof Error ? error.message : "execution_credentials_missing" };
   }
   if (!credentials.githubToken || !credentials.openRouterKey) return { status: "needs-human", reason: "execution_credentials_missing" };
@@ -1660,7 +1661,7 @@ async function trustedPublicationState(sandbox: ReturnType<typeof getSandbox>, r
 }
 
 async function trustedPublishCandidate(env: Env, job: Job, candidate: AgentResult, suppliedSandbox?: ReturnType<typeof getSandbox>): Promise<AgentResult> {
-  const token = secret(env, "GITHUB_TOKEN");
+  const token = await githubInstallationToken(env, job.contract.target.repository);
   if (!token || !candidate.files || !candidate.source_digest) return { status: "needs-human", reason: "publication_handoff_missing" };
   const branch = `factory/${job.contract.linear.identifier.toLowerCase()}-${job.runId.slice(-12)}`;
   const target = sandboxRemote(job.contract.target.repository);
@@ -1695,7 +1696,7 @@ function validCandidateFile(file: { path: string; content: string }, contract: C
 async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ValidationResult> {
   if (!agent.branch || !agent.head_sha) return { status: "failed", exit_code: 78, output_digest: await textDigest("validation_identity_missing"), output_bytes: 0, reason: "validation_identity_missing", fixable: false };
   let credentials: SandboxCredentials;
-  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+  try { credentials = await sandboxCredentials(env, job.contract); } catch (error) {
     const reason = error instanceof Error ? error.message : "validation_credentials_missing";
     return { status: "failed", exit_code: 78, output_digest: await textDigest(reason), output_bytes: 0, reason, fixable: false };
   }
@@ -1724,7 +1725,7 @@ async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): P
 async function reviewInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ReviewResult> {
   if (!agent.branch || !agent.head_sha) return { status: "failed", reason: "review_identity_missing", digest: await textDigest("review_identity_missing"), bytes: 0 };
   let credentials: SandboxCredentials;
-  try { credentials = sandboxCredentials(env, job.contract); } catch (error) {
+  try { credentials = await sandboxCredentials(env, job.contract); } catch (error) {
     const reason = error instanceof Error ? error.message : "review_credentials_missing";
     return { status: "failed", reason, digest: await textDigest(reason), bytes: 0 };
   }
@@ -1783,7 +1784,7 @@ async function publishPullRequest(env: Env, job: Job, agent: AgentResult): Promi
   const current = await assertCurrentRegistry(job.contract);
   const risk = current.factory.risk as ObjectValue;
   if (job.contract.merge_policy !== "human" || risk.merge_ceiling !== "human" || !strings(risk.autonomous_merge_exclusions, "registry_autonomous_merge_exclusions_invalid").includes(job.contract.target.repository)) throw new Error("registry_human_merge_required");
-  const token = secret(env, "GITHUB_TOKEN");
+  const token = await githubInstallationToken(env, job.contract.target.repository);
   if (!token || !agent.branch || !agent.head_sha) throw new Error("publication_identity_missing");
   const repo = repositoryPath(job.contract.target.repository);
   const repositoryInfo = await githubRequest(token, "GET", `/repos/${repo}`);
@@ -1895,7 +1896,7 @@ async function reconcileGithubEvent(env: Env, job: GitHubReconciliationJob): Pro
   const stored = storedContract(run);
   await assertCurrentRegistry(stored);
   if (run.registry_digest !== stored.registry.registry_digest || run.profile_digest !== await profileDigest(stored)) throw new Error("reconciliation_registry_identity_conflict");
-  const token = secret(env, "GITHUB_TOKEN");
+  const token = await githubInstallationToken(env, job.repository);
   if (!token) throw new Error("github_credentials_missing");
   let prNumber = job.prNumber ?? run.pr_number ?? null;
   if (prNumber === null) {
