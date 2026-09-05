@@ -4,6 +4,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
+import { handleChatLaneRequest, recoverExpiredChatLanes } from "./chat-lane-registry";
 
 export { Sandbox } from "@cloudflare/sandbox";
 
@@ -1474,6 +1475,11 @@ export default {
     try {
       const url = new URL(request.url);
       if (url.pathname === "/health") return response({ ok: true, stopped: await stopped(env.DB), automaticMerge: false, source: "github-reviewable" });
+      if (url.pathname.startsWith("/chat-lane")) {
+        const admin = secret(env, "FACTORY_ADMIN_SECRET");
+        if (!admin || request.headers.get("Authorization") !== `Bearer ${admin}`) return response({ error: "forbidden" }, 403);
+        return (await handleChatLaneRequest(request, env.DB)) ?? response({ error: "not_found" }, 404);
+      }
       if (url.pathname === "/webhooks/linear" && request.method === "POST") return await acceptLinear(request, env);
       if (url.pathname === "/webhooks/github" && request.method === "POST") return await acceptGithub(request, env);
       if (url.pathname === "/controls/stop" || url.pathname === "/controls/resume") {
@@ -1506,6 +1512,7 @@ export default {
     }
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await recoverExpiredChatLanes(env.DB);
     await recoverStaleLeases(env);
     if (await stopped(env.DB)) return;
     await recoverIngress(env);
