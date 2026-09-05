@@ -97,6 +97,47 @@ describe("local Worker control-plane behavior", () => {
     expect(__TEST_ONLY__.inherentEffectClasses(contract)).toEqual(["repository-write"]);
   });
 
+  it("treats adversarial candidate filenames as data and binds the trusted push target", async () => {
+    const payloads = ["tests/shell;touch /tmp/factory-payload", "tests/newline\n$(touch /tmp/factory-payload)", "tests/$(touch /tmp/factory-payload)"];
+    const commands: string[] = [];
+    const writes: Array<{ path: string; content: string }> = [];
+    const sandbox = {
+      gitCheckout: async () => ({ success: true }),
+      writeFile: async (path: string, content: string) => { writes.push({ path, content }); },
+      exec: async (command: string) => {
+        commands.push(command);
+        if (command.includes("rev-parse HEAD")) return { success: true, stdout: `${"b".repeat(40)}\n`, stderr: "" };
+        return { success: true, stdout: "", stderr: "" };
+      },
+      destroy: async () => undefined,
+    };
+    const publicationContract = { ...contract, allowed_scope: { paths: ["tests/**"], max_files: payloads.length, max_changed_lines: 10 } };
+    const job = { kind: "dispatch", dispatchId: publicationContract.dispatch_id, runId, contractDigest: "digest", contract: publicationContract };
+    const candidate = { status: "passed", reason: "candidate_validated", source_digest: `sha256:${"f".repeat(64)}`, files: payloads.map((path) => ({ path, content: "export const bounded = true;\n" })) };
+    await expect(__TEST_ONLY__.trustedPublishCandidate({ GITHUB_TOKEN: "dummy-publish-token" } as never, job as never, candidate as never, sandbox as never)).resolves.toMatchObject({ status: "passed", head_sha: "b".repeat(40) });
+    expect(writes).toContainEqual({ path: "/tmp/factory-candidate-paths", content: payloads.join("\0") });
+    const commandText = commands.join("\n");
+    for (const payload of payloads) expect(commandText).not.toContain(payload);
+    expect(commandText).toContain("--literal-pathspecs");
+    expect(commandText).toContain("--pathspec-from-file=/tmp/factory-candidate-paths");
+    expect(commandText).toContain("--pathspec-file-nul");
+    expect(commandText).toContain("push https://github.com/mhoo-os/dark-factory.git HEAD:refs/heads/");
+    expect(commandText).toContain("remote get-url --push origin");
+
+    const rejectedCommands: string[] = [];
+    const tamperedSandbox = {
+      ...sandbox,
+      exec: async (command: string) => {
+        rejectedCommands.push(command);
+        if (command.includes("remote get-url --push origin")) return { success: false, stdout: "https://github.com/mhoo-os/other.git", stderr: "" };
+        if (command.includes("rev-parse HEAD")) return { success: true, stdout: `${"b".repeat(40)}\n`, stderr: "" };
+        return { success: true, stdout: "", stderr: "" };
+      },
+    };
+    await expect(__TEST_ONLY__.trustedPublishCandidate({ GITHUB_TOKEN: "dummy-publish-token" } as never, job as never, candidate as never, tamperedSandbox as never)).resolves.toMatchObject({ status: "needs-human", reason: "trusted_publication_state_invalid" });
+    expect(rejectedCommands.some((command) => command.includes(" push https://github.com/"))).toBe(false);
+  });
+
   it("binds a private exact-SHA archive before the credential-free candidate handoff", async () => {
     const originalFetch = globalThis.fetch;
     const bytes = new TextEncoder().encode("dummy-private-source");
