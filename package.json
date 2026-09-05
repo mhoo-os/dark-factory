@@ -7,7 +7,7 @@
     "build": "wrangler deploy --dry-run --containers-rollout=none",
     "test:python": "python3 -m unittest discover -s tests -v",
     "test:sandbox": "node --test tests/sandbox-agent.test.mjs",
-    "test:contract": "node --test tests/chat-lane-registry.test.mjs tests/worker-contract.test.mjs tests/worker-dry-run-execution.test.mjs",
+    "test:contract": "node --test tests/d1-migration-sequence.test.mjs tests/chat-lane-registry.test.mjs tests/worker-contract.test.mjs tests/worker-dry-run-execution.test.mjs",
     "test:worker": "vitest run",
     "test": "npm run test:python && npm run test:sandbox && npm run test:contract && npm run test:worker",
     "test:coverage": "npm run test:contract && vitest run --coverage"
