@@ -4,7 +4,7 @@ import {
   type WorkflowEvent,
   type WorkflowStep,
 } from "cloudflare:workers";
-import { handleChatLaneRequest, recoverExpiredChatLanes } from "./chat-lane-registry";
+import { handleChatLaneRequest, isChatLaneAdmin, recoverExpiredChatLanes } from "./chat-lane-registry";
 
 export { Sandbox } from "@cloudflare/sandbox";
 
@@ -1477,7 +1477,7 @@ export default {
       if (url.pathname === "/health") return response({ ok: true, stopped: await stopped(env.DB), automaticMerge: false, source: "github-reviewable" });
       if (url.pathname.startsWith("/chat-lane")) {
         const admin = secret(env, "FACTORY_ADMIN_SECRET");
-        if (!admin || request.headers.get("Authorization") !== `Bearer ${admin}`) return response({ error: "forbidden" }, 403);
+        if (!isChatLaneAdmin(request, admin ?? null)) return response({ error: "forbidden" }, 403);
         return (await handleChatLaneRequest(request, env.DB)) ?? response({ error: "not_found" }, 404);
       }
       if (url.pathname === "/webhooks/linear" && request.method === "POST") return await acceptLinear(request, env);
@@ -1512,7 +1512,14 @@ export default {
     }
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    await recoverExpiredChatLanes(env.DB);
+    // The registry is additive and may not yet be migrated on an older
+    // installation. Preserve the existing reconciliation path while making
+    // registry access itself fail closed and observable.
+    try {
+      await recoverExpiredChatLanes(env.DB);
+    } catch (error) {
+      console.error("chat_lane_registry_recovery_failed", error);
+    }
     await recoverStaleLeases(env);
     if (await stopped(env.DB)) return;
     await recoverIngress(env);

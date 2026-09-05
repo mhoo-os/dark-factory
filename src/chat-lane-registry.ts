@@ -6,6 +6,10 @@ const SHA40 = /^[0-9a-f]{40}$/i;
 const REPOSITORY = /^mhoo-os\/[a-z0-9][a-z0-9._-]{0,99}$/;
 const ISSUE = /^MHO-[1-9][0-9]*$/;
 const SAFE_ID = /^[A-Za-z0-9._:@/-]{1,256}$/;
+const REVIEW_ID = /^MHOO-[A-Za-z0-9._-]{8,200}$/;
+const VERDICT = /^(PASS|REQUEST CHANGES)$/;
+const OPERATOR = /^[A-Za-z0-9._:@/-]{1,128}$/;
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 
 function json(body: Json, status = 200): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
@@ -33,6 +37,73 @@ function optionalText(value: unknown, label: string, pattern: RegExp, maximum = 
   return value;
 }
 
+function requiredObject(value: unknown, label: string): Json {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}_invalid`);
+  return value as Json;
+}
+
+function exactGithubCommentUrl(value: unknown, repository: string, prNumber: number): string {
+  const url = optionalText(value, "github_output_url", /^https:\/\/github\.com\//, 2_048);
+  if (!url) throw new Error("github_output_url_invalid");
+  const match = url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)#issuecomment-(\d+)$/);
+  if (!match || match[1] !== repository || Number(match[2]) !== prNumber) throw new Error("github_output_binding_invalid");
+  return url;
+}
+
+function exactLinearCommentUrl(value: unknown, issueId: string): string {
+  const url = optionalText(value, "linear_output_url", /^https:\/\/linear\.app\//, 2_048);
+  if (!url) throw new Error("linear_output_url_invalid");
+  const escaped = issueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!new RegExp(`/issue/${escaped}/[^#]+#comment-[0-9a-f-]{36}$`, "i").test(url)) throw new Error("linear_output_binding_invalid");
+  return url;
+}
+
+function assignmentIdentity(laneType: string, metadata: Json): { repository: string | null; prNumber: number | null; linearIssueId: string | null; targetHeadSha: string | null } {
+  const repository = optionalText(metadata.repository, "repository", REPOSITORY);
+  const prNumber = metadata.pr_number === undefined || metadata.pr_number === null ? null : Number(metadata.pr_number);
+  if (prNumber !== null && (!Number.isSafeInteger(prNumber) || prNumber < 1)) throw new Error("pr_number_invalid");
+  const linearIssueId = optionalText(metadata.linear_issue_id, "linear_issue_id", ISSUE);
+  const targetHeadSha = optionalText(metadata.target_head_sha, "target_head_sha", SHA40);
+  if (laneType === "review") {
+    requiredText(metadata.review_id, "review_id", REVIEW_ID);
+    requiredText(metadata.verdict, "verdict", VERDICT);
+    if (!repository || !prNumber || !targetHeadSha || !linearIssueId) throw new Error("review_identity_incomplete");
+  } else if (!linearIssueId && !optionalText(metadata.objective, "objective", SAFE_ID)) {
+    throw new Error("planning_identity_incomplete");
+  }
+  return { repository, prNumber, linearIssueId, targetHeadSha };
+}
+
+function completionEvidence(laneType: string, assignment: Json, payload: Json): { linearUrl: string | null; githubUrl: string | null; outputDigest: string; attestedBy: string; attestedAt: string } {
+  const manifest = requiredObject(payload.completion_manifest, "completion_manifest");
+  const verification = requiredObject(manifest.verification, "verification");
+  const attestedBy = requiredText(verification.attested_by, "attested_by", OPERATOR);
+  const attestedAt = requiredText(verification.attested_at, "attested_at", ISO_TIME);
+  if (verification.method !== "authenticated_operator_v1") throw new Error("verification_method_invalid");
+  const outputDigest = requiredText(payload.output_digest, "output_digest", /^sha256:[0-9a-f]{64}$/i);
+  if (laneType === "review") {
+    const repository = requiredText(assignment.repository, "repository", REPOSITORY);
+    const prNumber = Number(assignment.pr_number);
+    const linearIssueId = requiredText(assignment.linear_issue_id, "linear_issue_id", ISSUE);
+    const targetHeadSha = requiredText(assignment.target_head_sha, "target_head_sha", SHA40);
+    if (!Number.isSafeInteger(prNumber) || prNumber < 1 ||
+        manifest.repository !== repository || Number(manifest.pr_number) !== prNumber ||
+        manifest.linear_issue_id !== linearIssueId || manifest.target_head_sha !== targetHeadSha ||
+        manifest.review_id !== assignment.review_id || manifest.verdict !== assignment.verdict) throw new Error("completion_binding_invalid");
+    return {
+      linearUrl: exactLinearCommentUrl(payload.linear_output_url, linearIssueId),
+      githubUrl: exactGithubCommentUrl(payload.github_output_url, repository, prNumber),
+      outputDigest, attestedBy, attestedAt,
+    };
+  }
+  if ((assignment.linear_issue_id && manifest.linear_issue_id !== assignment.linear_issue_id) ||
+      (assignment.objective && manifest.objective !== assignment.objective)) throw new Error("completion_binding_invalid");
+  const linearUrl = assignment.linear_issue_id ? exactLinearCommentUrl(payload.linear_output_url, String(assignment.linear_issue_id)) : null;
+  const githubUrl = payload.github_output_url === undefined ? null : optionalText(payload.github_output_url, "github_output_url", /^https:\/\/github\.com\//, 2_048);
+  if (!linearUrl && !githubUrl) throw new Error("completion_evidence_required");
+  return { linearUrl, githubUrl, outputDigest, attestedBy, attestedAt };
+}
+
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
   if (value && typeof value === "object") {
@@ -54,6 +125,10 @@ async function list(db: D1Database): Promise<Response> {
   return json({ lanes: lanes.results ?? [] });
 }
 
+export function isChatLaneAdmin(request: Request, adminSecret: string | null): boolean {
+  return Boolean(adminSecret) && request.headers.get("Authorization") === `Bearer ${adminSecret}`;
+}
+
 async function register(request: Request, db: D1Database, laneId: string): Promise<Response> {
   const payload = await body(request);
   const chatId = requiredText(payload.chat_id, "chat_id", /^[A-Za-z0-9_-]{8,128}$/);
@@ -73,12 +148,7 @@ async function lease(request: Request, db: D1Database): Promise<Response> {
   const assignment = payload.assignment;
   if (!assignment || typeof assignment !== "object" || Array.isArray(assignment)) throw new Error("assignment_invalid");
   const metadata = assignment as Json;
-  const repository = optionalText(metadata.repository, "repository", REPOSITORY);
-  const prNumber = metadata.pr_number === undefined || metadata.pr_number === null ? null : Number(metadata.pr_number);
-  if (prNumber !== null && (!Number.isSafeInteger(prNumber) || prNumber < 1)) throw new Error("pr_number_invalid");
-  const linearIssueId = optionalText(metadata.linear_issue_id, "linear_issue_id", ISSUE);
-  const targetHeadSha = optionalText(metadata.target_head_sha, "target_head_sha", SHA40);
-  if (laneType === "review" && (!repository || !prNumber || !targetHeadSha)) throw new Error("review_identity_incomplete");
+  const { repository, prNumber, linearIssueId, targetHeadSha } = assignmentIdentity(laneType, metadata);
 
   const requestDigest = await digest({ lane_type: laneType, assignment: metadata });
   const existing = await db.prepare(
@@ -123,33 +193,33 @@ async function transition(request: Request, db: D1Database, assignmentId: string
   const requested = requiredText(payload.status, "status", /^[A-Z]+$/);
   if (!["PUBLISHING", "COMPLETED", "BLOCKED", "REPLACE"].includes(requested)) throw new Error("status_invalid");
   const current = await db.prepare(
-    "SELECT lane_id,status,lease_fence FROM chat_lane_assignments WHERE assignment_id=? AND lease_token=?",
-  ).bind(assignmentId, leaseToken).first<{ lane_id: string; status: string; lease_fence: number }>();
+    "SELECT lane_id,lane_type,status,lease_fence,lease_expires_at,assignment_json FROM chat_lane_assignments WHERE assignment_id=? AND lease_token=?",
+  ).bind(assignmentId, leaseToken).first<{ lane_id: string; lane_type: string; status: string; lease_fence: number; lease_expires_at: string; assignment_json: string }>();
   if (!current || !ACTIVE_STATUSES.has(current.status)) return json({ error: "lease_fenced" }, 409);
-  if (requested === "PUBLISHING" && current.status !== "RUNNING") return json({ error: "transition_denied" }, 409);
+  if ((requested === "PUBLISHING" && current.status !== "RUNNING") ||
+      (requested === "COMPLETED" && current.status !== "PUBLISHING")) return json({ error: "transition_denied" }, 409);
 
-  const linearUrl = optionalText(payload.linear_output_url, "linear_output_url", /^https:\/\/linear\.app\//, 2_048);
-  const githubUrl = optionalText(payload.github_output_url, "github_output_url", /^https:\/\/github\.com\//, 2_048);
-  const outputDigest = optionalText(payload.output_digest, "output_digest", /^sha256:[0-9a-f]{64}$/i, 71);
+  let assignment: Json;
+  try { assignment = JSON.parse(current.assignment_json) as Json; } catch { throw new Error("assignment_manifest_invalid"); }
   const now = new Date().toISOString();
-  if (requested === "COMPLETED" && (!outputDigest || (!linearUrl && !githubUrl))) return json({ error: "completion_evidence_required" }, 422);
-  const laneStatus = requested === "COMPLETED" ? "IDLE" : requested;
+  let evidence: { linearUrl: string | null; githubUrl: string | null; outputDigest: string | null; attestedBy: string | null; attestedAt: string | null };
+  try {
+    evidence = requested === "COMPLETED"
+      ? completionEvidence(current.lane_type, assignment, payload)
+      : { linearUrl: null, githubUrl: null, outputDigest: null, attestedBy: null, attestedAt: null };
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : "completion_evidence_required" }, 422);
+  }
   const assignmentStatus = requested === "REPLACE" ? "BLOCKED" : requested;
-  const release = requested !== "PUBLISHING";
-  const eventDigest = await digest(payload);
-  const results = await db.batch([
-    db.prepare(
-      release
-        ? "UPDATE chat_lanes SET status=?,chat_id=CASE WHEN ?='REPLACE' THEN NULL ELSE chat_id END,lease_token=NULL,lease_expires_at=NULL,current_assignment_id=NULL,updated_at=? WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=?"
-        : "UPDATE chat_lanes SET status='PUBLISHING',updated_at=? WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=?",
-    ).bind(...(release ? [laneStatus, requested, now, current.lane_id, assignmentId, leaseToken, current.lease_fence] : [now, current.lane_id, assignmentId, leaseToken, current.lease_fence])),
-    db.prepare(
-      "UPDATE chat_lane_assignments SET status=?,linear_output_url=COALESCE(?,linear_output_url),github_output_url=COALESCE(?,github_output_url),output_digest=COALESCE(?,output_digest),verified_at=CASE WHEN ?='COMPLETED' THEN ? ELSE verified_at END,completed_at=CASE WHEN ?='COMPLETED' THEN ? ELSE completed_at END,updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status=?",
-    ).bind(assignmentStatus, linearUrl, githubUrl, outputDigest, requested, now, requested, now, now, assignmentId, leaseToken, current.lease_fence, current.status),
-    db.prepare("INSERT INTO chat_lane_events(event_id,assignment_id,event_type,payload_digest,created_at) VALUES(?,?,?,?,?)")
-      .bind(`transition:${assignmentId}:${current.lease_fence}:${requested}`, assignmentId, requested, eventDigest, now),
-  ]);
-  if (results[0].meta.changes !== 1 || results[1].meta.changes !== 1) throw new Error("lane_transition_raced");
+  const reason = requested === "REPLACE" ? "replace" : "operator_transition";
+  // The migration trigger owns lane state and event insertion. Its guard raises
+  // inside SQLite if the assignment/lane/token/fence/expiry snapshot no longer
+  // agrees, which rolls this assignment update back instead of committing a split state.
+  const result = await db.prepare(
+    "UPDATE chat_lane_assignments SET status=?,transition_reason=?,linear_output_url=COALESCE(?,linear_output_url),github_output_url=COALESCE(?,github_output_url),output_digest=COALESCE(?,output_digest),verified_at=CASE WHEN ?='COMPLETED' THEN ? ELSE verified_at END,completed_at=CASE WHEN ?='COMPLETED' THEN ? ELSE completed_at END,attested_by=COALESCE(?,attested_by),attested_at=COALESCE(?,attested_at),updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status=? AND lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND EXISTS (SELECT 1 FROM chat_lanes WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND status=?)",
+  ).bind(assignmentStatus, reason, evidence.linearUrl, evidence.githubUrl, evidence.outputDigest, requested, now, requested, now, evidence.attestedBy, evidence.attestedAt, now, assignmentId, leaseToken, current.lease_fence, current.status, current.lane_id, assignmentId, leaseToken, current.lease_fence, current.status).run();
+  if (result.meta.changes !== 1) return json({ error: "lease_fenced_or_expired" }, 409);
+  const laneStatus = requested === "COMPLETED" ? "IDLE" : assignmentStatus;
   return json({ assignment_id: assignmentId, lane_id: current.lane_id, status: assignmentStatus, lane_status: laneStatus });
 }
 
@@ -160,16 +230,10 @@ export async function recoverExpiredChatLanes(db: D1Database, now = new Date()):
   ).bind(timestamp).all<{ lane_id: string; current_assignment_id: string; lease_token: string; lease_fence: number }>();
   let recovered = 0;
   for (const lane of expired.results ?? []) {
-    const eventDigest = await digest({ reason: "lease_expired", lease_fence: lane.lease_fence });
-    const results = await db.batch([
-      db.prepare("UPDATE chat_lanes SET status='BLOCKED',lease_token=NULL,lease_expires_at=NULL,current_assignment_id=NULL,updated_at=? WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND lease_expires_at<=?")
-        .bind(timestamp, lane.lane_id, lane.current_assignment_id, lane.lease_token, lane.lease_fence, timestamp),
-      db.prepare("UPDATE chat_lane_assignments SET status='BLOCKED',updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status IN ('RUNNING','PUBLISHING')")
-        .bind(timestamp, lane.current_assignment_id, lane.lease_token, lane.lease_fence),
-      db.prepare("INSERT OR IGNORE INTO chat_lane_events(event_id,assignment_id,event_type,payload_digest,created_at) VALUES(?,?,?,?,?)")
-        .bind(`expiry:${lane.current_assignment_id}:${lane.lease_fence}`, lane.current_assignment_id, "LEASE_EXPIRED", eventDigest, timestamp),
-    ]);
-    if (results[0].meta.changes === 1 && results[1].meta.changes === 1) recovered += 1;
+    const result = await db.prepare(
+      "UPDATE chat_lane_assignments SET status='BLOCKED',transition_reason='lease_expired',updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status IN ('RUNNING','PUBLISHING') AND EXISTS (SELECT 1 FROM chat_lanes WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND lease_expires_at<=?)",
+    ).bind(timestamp, lane.current_assignment_id, lane.lease_token, lane.lease_fence, lane.lane_id, lane.current_assignment_id, lane.lease_token, lane.lease_fence, timestamp).run();
+    if (result.meta.changes === 1) recovered += 1;
   }
   return recovered;
 }
