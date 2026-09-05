@@ -1569,25 +1569,32 @@ async function executeInSandbox(env: Env, job: Job, remainingSeconds: number, re
   }
 }
 
-async function trustedPublishCandidate(env: Env, job: Job, candidate: AgentResult): Promise<AgentResult> {
+async function trustedPublicationState(sandbox: ReturnType<typeof getSandbox>, repository: string): Promise<boolean> {
+  const target = sandboxRemote(repository);
+  const state = await sandbox.exec(`test "$(git -C /workspace/project remote get-url --push origin)" = "${target}" && test "$(git -C /workspace/project config --local --get-all credential.helper)" = "" && test "$(git -C /workspace/project config --local --get core.hooksPath)" = "/dev/null"`, { timeout: 30_000 });
+  return state.success;
+}
+
+async function trustedPublishCandidate(env: Env, job: Job, candidate: AgentResult, suppliedSandbox?: ReturnType<typeof getSandbox>): Promise<AgentResult> {
   const token = secret(env, "GITHUB_TOKEN");
   if (!token || !candidate.files || !candidate.source_digest) return { status: "needs-human", reason: "publication_handoff_missing" };
   const branch = `factory/${job.contract.linear.identifier.toLowerCase()}-${job.runId.slice(-12)}`;
-  const sandbox = getSandbox(env.Sandbox, `publication-${job.runId}`);
+  const target = sandboxRemote(job.contract.target.repository);
+  const sandbox = suppliedSandbox ?? getSandbox(env.Sandbox, `publication-${job.runId}`);
   try {
+    if (candidate.files.some((file) => !validCandidateFile(file, job.contract))) return { status: "needs-human", reason: "publication_handoff_scope_invalid" };
     const checkout = await sandbox.gitCheckout(authenticatedSandboxRemote(job.contract.target.repository, token), { depth: 1, targetDir: "/workspace/project" });
     if (!checkout.success) return { status: "needs-human", reason: "trusted_private_checkout_failed" };
-    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project checkout --detach ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${sandboxRemote(job.contract.target.repository)} && git -C /workspace/project config --unset-all credential.helper || true`, { timeout: 60_000 });
+    const base = await sandbox.exec(`git -C /workspace/project fetch --depth=1 origin ${job.contract.target.base_sha} && git -C /workspace/project checkout --detach ${job.contract.target.base_sha} && git -C /workspace/project remote set-url origin ${target} && git -C /workspace/project config --local --replace-all credential.helper '' && git -C /workspace/project config --local --replace-all core.hooksPath /dev/null`, { timeout: 60_000 });
     if (!base.success) return { status: "needs-replan", reason: "trusted_base_unavailable" };
-    for (const file of candidate.files) {
-      if (!validCandidateFile(file, job.contract)) return { status: "needs-human", reason: "publication_handoff_scope_invalid" };
-      await sandbox.writeFile(`/workspace/project/${file.path}`, file.content);
-    }
-    const commit = await sandbox.exec(`git -C /workspace/project -c core.hooksPath=/dev/null -c user.name='Mhoo Factory' -c user.email='factory@mhoo.invalid' checkout -b ${branch} && git -C /workspace/project -c core.hooksPath=/dev/null add -- ${candidate.files.map((file) => file.path).join(" ")} && git -C /workspace/project -c core.hooksPath=/dev/null commit -m 'factory(${job.contract.linear.identifier}): bounded implementation' && git -C /workspace/project rev-parse HEAD`, { timeout: 60_000 });
+    for (const file of candidate.files) await sandbox.writeFile(`/workspace/project/${file.path}`, file.content);
+    await sandbox.writeFile("/tmp/factory-candidate-paths", candidate.files.map((file) => file.path).join("\0"));
+    const commit = await sandbox.exec(`git -C /workspace/project checkout -b ${branch} && git --literal-pathspecs -C /workspace/project -c core.hooksPath=/dev/null add --pathspec-from-file=/tmp/factory-candidate-paths --pathspec-file-nul && git -C /workspace/project -c core.hooksPath=/dev/null -c user.name='Mhoo Factory' -c user.email='factory@mhoo.invalid' commit -m 'factory(${job.contract.linear.identifier}): bounded implementation' && git -C /workspace/project rev-parse HEAD`, { timeout: 60_000 });
     const head = commit.stdout.trim().split(/\r?\n/).at(-1) ?? "";
     if (!commit.success || !SHA40.test(head)) return { status: "needs-human", reason: "trusted_commit_failed" };
+    if (!await trustedPublicationState(sandbox, job.contract.target.repository)) return { status: "needs-human", reason: "trusted_publication_state_invalid" };
     const header = btoa(`x-access-token:${token}`);
-    const push = await sandbox.exec(`git -C /workspace/project -c core.hooksPath=/dev/null -c credential.helper= -c http.extraHeader='Authorization: Basic ${header}' push origin HEAD:refs/heads/${branch}`, { timeout: 120_000 });
+    const push = await sandbox.exec(`git -C /workspace/project -c core.hooksPath=/dev/null -c credential.helper= -c http.extraHeader='Authorization: Basic ${header}' push ${target} HEAD:refs/heads/${branch}`, { timeout: 120_000 });
     if (!push.success) return { status: "needs-human", reason: "trusted_push_failed" };
     return { ...candidate, branch, head_sha: head };
   } catch {
@@ -1598,7 +1605,7 @@ async function trustedPublishCandidate(env: Env, job: Job, candidate: AgentResul
 }
 
 function validCandidateFile(file: { path: string; content: string }, contract: Contract): boolean {
-  return typeof file.path === "string" && typeof file.content === "string" && file.path.length > 0 && file.path.length < 512 && !file.path.startsWith("/") && !file.path.split("/").some((part) => !part || part === "." || part === "..") && pathMatchesScope(file.path, contract.allowed_scope.paths) && !protectedPath(file.path);
+  return typeof file.path === "string" && typeof file.content === "string" && file.path.length > 0 && file.path.length < 512 && !file.path.startsWith("/") && !file.path.includes("\0") && !file.path.split("/").some((part) => !part || part === "." || part === "..") && pathMatchesScope(file.path, contract.allowed_scope.paths) && !protectedPath(file.path);
 }
 
 async function validateInFreshSandbox(env: Env, job: Job, agent: AgentResult): Promise<ValidationResult> {
@@ -2143,6 +2150,7 @@ export const __TEST_ONLY__ = {
   sandboxRemote,
   trustedSource,
   authenticatedSandboxRemote,
+  trustedPublishCandidate,
   validCandidateFile,
   inherentEffectClasses,
   capacityLeaseScopes,
