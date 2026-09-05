@@ -108,7 +108,7 @@ def _dry_run_authorization_errors(value: Any, errors: list[str]) -> None:
         return
     _keys(
         authorization,
-        {"authorization_id", "mode", "non_executable", "expires_at", "checkout_head_sha"},
+        {"authorization_id", "mode", "non_executable", "expires_at", "repository", "pr_number", "linear_issue", "review_id", "checkout_head_sha"},
         "dry_run_authorization",
         errors,
     )
@@ -126,6 +126,12 @@ def _dry_run_authorization_errors(value: Any, errors: list[str]) -> None:
         except ValueError:
             errors.append("dry_run_authorization.expires_at.format")
     _string(authorization.get("checkout_head_sha"), "dry_run_authorization.checkout_head_sha", errors, BASE_SHA_PATTERN, 40)
+    _string(authorization.get("repository"), "dry_run_authorization.repository", errors, REPOSITORY_PATTERN, 128)
+    pr_number = authorization.get("pr_number")
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or not 1 <= pr_number <= 1_000_000_000:
+        errors.append("dry_run_authorization.pr_number.integer")
+    _string(authorization.get("linear_issue"), "dry_run_authorization.linear_issue", errors, ISSUE_PATTERN, 32)
+    _string(authorization.get("review_id"), "dry_run_authorization.review_id", errors, ID_PATTERN, 192)
 
 
 def _canonical_linear_issue_links(text: str) -> str:
@@ -278,6 +284,10 @@ def validate_dispatch_contract(
     document = contract.to_dict()
     authorization = contract.dry_run_authorization
     if authorization is not None:
+        if authorization["repository"] != document["target"]["repository"]:
+            return ContractValidation("not-admitted", ("dry_run_authorization_repository_mismatch",), contract)
+        if authorization["linear_issue"] != document["linear"]["identifier"]:
+            return ContractValidation("not-admitted", ("dry_run_authorization_linear_issue_mismatch",), contract)
         expires_at = datetime.strptime(authorization["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         current_time = now or datetime.now(timezone.utc)
         if current_time.tzinfo is None:

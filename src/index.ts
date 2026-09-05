@@ -115,6 +115,10 @@ type DryRunAuthorization = {
   mode: "approved-intake";
   non_executable: true;
   expires_at: string;
+  repository: string;
+  pr_number: number;
+  linear_issue: string;
+  review_id: string;
   checkout_head_sha: string;
 };
 type Contract = {
@@ -288,7 +292,7 @@ function integer(value: unknown, label: string, max: number): number {
 }
 
 function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorization {
-  const authorization = object(value, ["authorization_id", "mode", "non_executable", "expires_at", "checkout_head_sha"], "dry_run_authorization");
+  const authorization = object(value, ["authorization_id", "mode", "non_executable", "expires_at", "repository", "pr_number", "linear_issue", "review_id", "checkout_head_sha"], "dry_run_authorization");
   const authorizationId = canonicalLinearIssueLinks(authorization.authorization_id, "dry_run_authorization_id", 192);
   if (authorization.mode !== "approved-intake") throw new AdmissionError("dry_run_authorization_mode_invalid");
   if (authorization.non_executable !== true) throw new AdmissionError("dry_run_authorization_non_executable_required");
@@ -297,9 +301,15 @@ function dryRunAuthorization(value: unknown, now = Date.now()): DryRunAuthorizat
   if (!UTC_TIMESTAMP.test(expiresAt) || Number.isNaN(expiresAtMillis)) throw new AdmissionError("dry_run_authorization_expires_at_invalid");
   if (expiresAtMillis <= now) throw new AdmissionError("dry_run_authorization_expired");
   if (expiresAtMillis - now > DRY_RUN_AUTHORIZATION_TTL_MS) throw new AdmissionError("dry_run_authorization_ttl_exceeds_limit");
+  const repository = text(authorization.repository, "dry_run_authorization_repository", 128);
+  if (!REPOSITORY.test(repository)) throw new AdmissionError("dry_run_authorization_repository_invalid");
+  const prNumber = integer(authorization.pr_number, "dry_run_authorization_pr_number", 1_000_000_000);
+  const linearIssue = text(authorization.linear_issue, "dry_run_authorization_linear_issue", 32);
+  if (!ISSUE_IDENTIFIER.test(linearIssue)) throw new AdmissionError("dry_run_authorization_linear_issue_invalid");
+  const reviewId = text(authorization.review_id, "dry_run_authorization_review_id", 192);
   const checkoutHead = text(authorization.checkout_head_sha, "dry_run_authorization_checkout_head_sha", 40);
   if (!SHA40.test(checkoutHead)) throw new AdmissionError("dry_run_authorization_checkout_head_sha_invalid");
-  return { authorization_id: authorizationId, mode: "approved-intake", non_executable: true, expires_at: expiresAt, checkout_head_sha: checkoutHead };
+  return { authorization_id: authorizationId, mode: "approved-intake", non_executable: true, expires_at: expiresAt, repository, pr_number: prNumber, linear_issue: linearIssue, review_id: reviewId, checkout_head_sha: checkoutHead };
 }
 
 function canonicalLinearIssueLinks(value: unknown, label: string, max: number): string {
@@ -341,6 +351,9 @@ function contractFromDescription(description: unknown, issue: ObjectValue, env: 
   const authorization = hasDryRunAuthorization ? dryRunAuthorization(root.dry_run_authorization) : undefined;
   const repository = text(target.repository, "repository");
   if (!REPOSITORY.test(repository) || !repository.startsWith(env.ALLOWED_REPOSITORY_PREFIX)) throw new AdmissionError("repository_not_allowed");
+  if (authorization && (authorization.repository !== repository || authorization.linear_issue !== identifier)) {
+    throw new AdmissionError("dry_run_authorization_identity_mismatch");
+  }
   text(target.work_type, "work_type");
   const executionProfile = text(target.execution_profile, "execution_profile");
   const validationProfile = text(root.validation_profile, "validation_profile");

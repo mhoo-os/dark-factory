@@ -23,6 +23,10 @@ def dry_run_contract() -> dict[str, object]:
         "mode": "approved-intake",
         "non_executable": True,
         "expires_at": "2026-09-05T06:10:00Z",
+        "repository": "mhoo-os/dark-factory",
+        "pr_number": 29,
+        "linear_issue": "MHO-199",
+        "review_id": "MHOO-RX5-MHO-199-PR29-FINAL",
         "checkout_head_sha": "fedcba9876543210fedcba9876543210fedcba98",
     }
     return contract
@@ -83,6 +87,15 @@ class DispatchContractTests(unittest.TestCase):
         executable_scope = dry_run_contract()
         executable_scope["allowed_scope"]["max_files"] = 1
         self.assertIn("dry_run_authorization.allowed_scope.max_files.must_be_zero", validate_dispatch_contract(executable_scope, now=NOW).reasons)
+
+    def test_dry_run_authorization_is_bound_to_contract_identity(self) -> None:
+        wrong_repository = dry_run_contract()
+        wrong_repository["dry_run_authorization"]["repository"] = "mhoo-os/other"
+        self.assertEqual(validate_dispatch_contract(wrong_repository, now=NOW).reasons, ("dry_run_authorization_repository_mismatch",))
+
+        wrong_issue = dry_run_contract()
+        wrong_issue["dry_run_authorization"]["linear_issue"] = "MHO-200"
+        self.assertEqual(validate_dispatch_contract(wrong_issue, now=NOW).reasons, ("dry_run_authorization_linear_issue_mismatch",))
 
 
 if __name__ == "__main__":

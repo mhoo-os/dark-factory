@@ -83,6 +83,10 @@ class CandidateTests(unittest.TestCase):
             "mode": "approved-intake",
             "non_executable": True,
             "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "repository": "mhoo-os/dark-factory",
+            "pr_number": 29,
+            "linear_issue": "MHO-1",
+            "review_id": "MHOO-RX5-MHO-1-PR29-FINAL",
             "checkout_head_sha": CHECKOUT_HEAD,
         }
         candidate = triage.candidate_from(issue(dry_run_authorization=authorization), dry_run=True, checkout_head=CHECKOUT_HEAD)
@@ -95,6 +99,9 @@ class CandidateTests(unittest.TestCase):
             triage.existing_issue = original_existing
         self.assertEqual(first, replay)
         self.assertEqual(first["action"], "approved-intake-dry-run")
+        self.assertEqual(first["pr_number"], 29)
+        self.assertEqual(first["review_id"], "MHOO-RX5-MHO-1-PR29-FINAL")
+        self.assertEqual(first["checkout_head_sha"], CHECKOUT_HEAD)
         self.assertFalse(first["normal_dispatch"])
         self.assertFalse(first["provider_mutations"])
         with self.assertRaises(triage.TriageError):
@@ -106,6 +113,10 @@ class CandidateTests(unittest.TestCase):
             "mode": "approved-intake",
             "non_executable": True,
             "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "repository": "mhoo-os/dark-factory",
+            "pr_number": 29,
+            "linear_issue": "MHO-1",
+            "review_id": "MHOO-RX5-MHO-1-PR29-FINAL",
             "checkout_head_sha": CHECKOUT_HEAD,
         }
         original = {
@@ -145,9 +156,13 @@ class CandidateTests(unittest.TestCase):
             "mode": "approved-intake",
             "non_executable": True,
             "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "repository": "mhoo-os/dark-factory",
+            "pr_number": 29,
+            "linear_issue": "MHO-1",
+            "review_id": "MHOO-RX5-MHO-1-PR29-FINAL",
             "checkout_head_sha": CHECKOUT_HEAD,
         }
-        second = {**first, "authorization_id": "MHO-2-b5-second"}
+        second = {**first, "authorization_id": "MHO-2-b5-second", "linear_issue": "MHO-2", "review_id": "MHOO-RX5-MHO-2-PR29-FINAL"}
         with self.assertRaisesRegex(triage.TriageError, "dry_run_authorization_ambiguous"):
             triage.pending_candidate(
                 [issue(dry_run_authorization=first), issue(identifier="MHO-2", dry_run_authorization=second)],

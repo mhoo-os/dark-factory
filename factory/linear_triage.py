@@ -44,7 +44,7 @@ class Candidate:
     repository: str
     dispatch_id: str
     contract_digest: str
-    dry_run_authorization_id: str | None
+    dry_run_authorization: dict[str, Any] | None
 
     @property
     def bridge_key(self) -> str:
@@ -119,7 +119,7 @@ def candidate_from(
         state_name=issue["state"]["name"], labels=labels,
         candidate_key=admission.contract.dispatch_id, repository=target["repository"],
         dispatch_id=admission.contract.dispatch_id, contract_digest=admission.contract.digest,
-        dry_run_authorization_id=authorization["authorization_id"] if authorization else None,
+        dry_run_authorization=dict(authorization) if authorization else None,
     )
 
 
@@ -209,7 +209,7 @@ def pending_candidate(
         except TriageError:
             continue
     candidates.sort(key=lambda item: (item.priority, item.identifier))
-    dry_run_candidates = [candidate for candidate in candidates if candidate.dry_run_authorization_id is not None]
+    dry_run_candidates = [candidate for candidate in candidates if candidate.dry_run_authorization is not None]
     if dry_run_candidates:
         if len(dry_run_candidates) != 1:
             raise TriageError("dry_run_authorization_ambiguous")
@@ -235,16 +235,20 @@ def clean_checkout_head() -> str:
 
 def plan_candidate(candidate: Candidate, *, dry_run: bool) -> dict[str, Any]:
     """Return the only plan allowed for a temporary B5 authorization before any writes."""
-    if candidate.dry_run_authorization_id is not None:
+    if candidate.dry_run_authorization is not None:
         if not dry_run:
             raise TriageError("dry_run_authorization_requires_dry_run")
         return {
             "action": "approved-intake-dry-run",
             "candidate": candidate.identifier,
-            "repository": candidate.repository,
             "dispatch_id": candidate.dispatch_id,
             "contract_digest": candidate.contract_digest,
-            "authorization_id": candidate.dry_run_authorization_id,
+            "authorization_id": candidate.dry_run_authorization["authorization_id"],
+            "repository": candidate.dry_run_authorization["repository"],
+            "pr_number": candidate.dry_run_authorization["pr_number"],
+            "linear_issue": candidate.dry_run_authorization["linear_issue"],
+            "review_id": candidate.dry_run_authorization["review_id"],
+            "checkout_head_sha": candidate.dry_run_authorization["checkout_head_sha"],
             "normal_dispatch": False,
             "provider_mutations": False,
         }
@@ -283,7 +287,7 @@ def main() -> int:
         if args.dry_run:
             print(json.dumps(plan, sort_keys=True))
             return 0
-        if candidate.dry_run_authorization_id is not None:
+        if candidate.dry_run_authorization is not None:
             raise TriageError("dry_run_authorization_requires_dry_run")
         assert existing is not None or plan["action"] == "create"
         github_url = create_issue(candidate)

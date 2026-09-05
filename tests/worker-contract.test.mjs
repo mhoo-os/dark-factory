@@ -28,7 +28,7 @@ test("multiline Linear descriptions remain valid contract input", () => {
 
 test("temporary dry-run authorization is sealed and rejected before durable ingress", () => {
   const authorization = dispatchContractSchema.properties.dry_run_authorization;
-  assert.deepEqual(authorization.required, ["authorization_id", "mode", "non_executable", "expires_at", "checkout_head_sha"]);
+  assert.deepEqual(authorization.required, ["authorization_id", "mode", "non_executable", "expires_at", "repository", "pr_number", "linear_issue", "review_id", "checkout_head_sha"]);
   assert.equal(authorization.properties.mode.const, "approved-intake");
   assert.equal(authorization.properties.non_executable.const, true);
   assert.match(source, /const DRY_RUN_AUTHORIZATION_TTL_MS = 15 \* 60_000/);
@@ -37,6 +37,7 @@ test("temporary dry-run authorization is sealed and rejected before durable ingr
   assert.match(source, /const LINEAR_MARKDOWN_ISSUE_LINK/);
   assert.match(source, /const LINEAR_RICH_ISSUE_LINK/);
   assert.match(source, /dry_run_authorization_non_executable/);
+  assert.match(source, /dry_run_authorization_identity_mismatch/);
   const acceptLinear = source.slice(source.indexOf("async function acceptLinear"), source.indexOf("async function acceptGithub"));
   assert.ok(acceptLinear.indexOf("const dryRunReason = dryRunContractReason") < acceptLinear.indexOf("const receipt = await ingress"));
   assert.ok(acceptLinear.indexOf("const dryRunReason = dryRunContractReason") < acceptLinear.indexOf("env.EXECUTION_QUEUE.send(job)"));

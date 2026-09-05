@@ -30,6 +30,10 @@ def dry_run_issue() -> dict[str, object]:
         "mode": "approved-intake",
         "non_executable": True,
         "expires_at": "2026-09-05T06:10:00Z",
+        "repository": CASE["contract"]["target"]["repository"],
+        "pr_number": 29,
+        "linear_issue": CASE["issue"]["identifier"],
+        "review_id": "MHOO-RX5-MHO-900-PR29-FINAL",
         "checkout_head_sha": CHECKOUT_HEAD,
     }
     issue = copy.deepcopy(CASE["issue"])
