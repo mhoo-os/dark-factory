@@ -5,6 +5,7 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 import { handleChatLaneRequest, isChatLaneAdmin, recoverExpiredChatLanes } from "./chat-lane-registry";
+import { reserveSyntheticRepairPlan, runSyntheticRepairLoop, type RepairLimits, type SyntheticRepairAdapters } from "./repair-continuation";
 import { readNativeAttempt, deliverMockAttempt } from "./native-candidate";
 import registryArtifact from "../factory/factory_registry.json";
 
@@ -1042,7 +1043,7 @@ function capacityLeaseScopes(run: Run, limits: ConcurrencyLimits): string[][] {
 }
 
 async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits, expiresNoLaterThan?: number, nowAt = Date.now()): Promise<LeaseReservation | null> {
-  if (await db.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key='native-candidate:v1:launch'").bind(run.run_id).first()) return null;
+  if (await db.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND (step_key='native-candidate:v1:launch' OR step_key GLOB 'review-repair:v1:claim:*')").bind(run.run_id).first()) return null;
   const now = new Date(nowAt);
   if (expiresNoLaterThan !== undefined && (!Number.isFinite(expiresNoLaterThan) || expiresNoLaterThan <= now.getTime())) throw new Error("workflow_deadline_exceeded");
   const expiry = new Date(Math.min(now.getTime() + 30 * 60_000, expiresNoLaterThan ?? Number.POSITIVE_INFINITY)).toISOString();
@@ -1055,7 +1056,7 @@ async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits,
     for (const scope of capacityLeaseScopes(run, limits)) {
       let selected: string | null = null;
       for (const key of scope) {
-        const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=? AND n.step_key='native-candidate:v1:launch') ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=? AND NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=factory_leases.dispatch_id AND n.step_key='native-candidate:v1:launch')")
+        const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=? AND (n.step_key='native-candidate:v1:launch' OR n.step_key GLOB 'review-repair:v1:claim:*')) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=? AND NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=factory_leases.dispatch_id AND (n.step_key='native-candidate:v1:launch' OR n.step_key GLOB 'review-repair:v1:claim:*'))")
           .bind(key, "workflow", run.run_id, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, 0, expiry, run.run_id, now.toISOString()).run();
         if (result.meta.changes === 1) { selected = key; break; }
       }
@@ -1077,9 +1078,9 @@ async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits,
 
 async function releaseLease(db: D1Database, run: Run): Promise<void> {
   if (run.lease_fence === null) throw new Error("lease_missing");
-  if (await db.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key='native-candidate:v1:launch'").bind(run.run_id).first()) throw new Error("native_capacity_held");
+  if (await db.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND (step_key='native-candidate:v1:launch' OR step_key GLOB 'review-repair:v1:claim:*')").bind(run.run_id).first()) throw new Error("native_capacity_held");
   const members = await db.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence).first<{ count: number }>();
-  const result = await db.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?) AND NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=factory_leases.dispatch_id AND n.step_key='native-candidate:v1:launch')").bind(run.run_id, run.lease_fence).run();
+  const result = await db.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?) AND NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=factory_leases.dispatch_id AND (n.step_key='native-candidate:v1:launch' OR n.step_key GLOB 'review-repair:v1:claim:*'))").bind(run.run_id, run.lease_fence).run();
   if ((members?.count ?? 0) !== result.meta.changes) throw new Error("lease_fenced");
   await db.batch([
     db.prepare("DELETE FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence),
@@ -1191,6 +1192,28 @@ function dispatchJob(value: unknown): DispatchJob | null {
   return { kind: "dispatch", dispatchId: item.dispatchId, runId: item.runId, contractDigest: item.contractDigest, contract: item.contract as Contract };
 }
 
+/** Synthetic-only Workflow seam: derive the original caps, never accept new
+ * budget authority from the paired review or an adapter's candidate output.
+ */
+async function continueSyntheticReviewRepairs(env: Env, job: Job, assignmentId: string,
+  policy: Omit<RepairLimits,"mode"|"costCapMicros"|"deadlineMs"|"maxRounds"|"initialSpentMicros">, adapters: SyntheticRepairAdapters) {
+  const run=await runById(env.DB,job.runId);
+  if(!run || run.contract_digest!==job.contractDigest || stable(JSON.parse(run.contract_json))!==stable(job.contract)) throw Error("repair_contract_conflict");
+  const limits=runtimeExecutionLimits(env,job.contract), cap=Number(env.MAX_FIX_ATTEMPTS);
+  if(!Number.isSafeInteger(cap)||cap<0||cap>2)throw Error("repair_original_round_cap_invalid");
+  const usage=await env.DB.prepare("SELECT step_key,result_json FROM factory_steps WHERE run_id=? AND step_key GLOB 'sandbox-execution-*'").bind(job.runId).all<{step_key:string;result_json:string}>();
+  let spent=0;
+  if(!usage.results.length || await env.DB.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key='native-candidate:v1:launch'").bind(job.runId).first())throw Error("repair_original_accounting_unknown");
+  for(const row of usage.results){const cost=JSON.parse(row.result_json).provider_usage?.cost_usd;if(typeof cost!=="number"||!Number.isFinite(cost)||cost<0)throw Error("repair_original_accounting_unknown");spent+=Math.ceil(cost*1e6);}
+  await reserveSyntheticRepairPlan(env.DB,job.runId,assignmentId,{...policy,mode:"synthetic-only",initialSpentMicros:spent,
+    costCapMicros:Math.floor(limits.costUsd*1e6),deadlineMs:Date.parse(run.created_at)+limits.timeoutSeconds*1000,
+    maxRounds:Math.min(3,cap)-Math.max(0,usage.results.length-1)});
+  const hold=async(reason:string)=>{await transitionRun(env.DB,job.runId,"needs-human","reconciler",`repair:hold:${job.runId}:${run.lease_fence}`,{leaseFence:run.lease_fence??undefined,result:{reason,publication_allowed:false}});};
+  const result=await runSyntheticRepairLoop(env.DB,job.runId,adapters,hold);
+  if(result.outcome==="human-review-ready")await hold("repair_ready_for_human");
+  return result;
+}
+
 /** Trusted reconciler seam; observations cannot publish, retry or release capacity. */
 async function reconcileNativeAttempt(db: D1Database, runId: string): Promise<string> {
   const observation = await readNativeAttempt(db, runId);
@@ -1223,6 +1246,10 @@ async function recoverStaleLeases(env: Env): Promise<void> {
   const now = new Date().toISOString();
   const rows = await env.DB.prepare("SELECT run_id,repository,collision_group,lease_fence,current_state,workflow_id FROM factory_runs WHERE current_state IN ('leased','running','validating') AND lease_fence IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY updated_at,run_id LIMIT 16").bind(now).all<{ run_id: string; repository: string; collision_group: string; lease_fence: number; current_state: string; workflow_id: string | null }>();
   for (const row of rows.results ?? []) {
+    if(await env.DB.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key GLOB 'review-repair:v1:claim:*'").bind(row.run_id).first()) {
+      await transitionRun(env.DB,row.run_id,"needs-human",row.current_state==="validating"?"validator":"reconciler",`repair:hold:${row.run_id}:${row.lease_fence}`,{leaseFence:row.lease_fence,result:{reason:"repair_recovery_held",publication_allowed:false}});
+      continue;
+    }
     // Native claims are not stopped-state proof. Retain expired capacity even
     // when the result is missing or malformed; the adapter cannot release it.
     if (await env.DB.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key='native-candidate:v1:launch'").bind(row.run_id).first()) {
@@ -2267,6 +2294,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
 // These pure boundaries are exported only for local Worker-runtime tests. They
 // are not attached to the public fetch surface.
 export const __TEST_ONLY__ = {
+  continueSyntheticReviewRepairs,
   reconcileNativeAttempt,
   deliverAndReconcileNativeMock,
   sandboxCredentials,
