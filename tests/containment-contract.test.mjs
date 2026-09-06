@@ -30,3 +30,18 @@ for(const bad of [null,{},[],{...evidence()[0],stdout:'fake canary'},{...evidenc
 test('missing field does not become successful attestation',()=>{
   const rows=evidence();delete rows[0].evidenceDigest;assert.equal(assessContainmentContract(rows,binding()).invalidEvidence,true);
 });
+
+for (const field of ['environmentId', 'intentDigest', 'profileDigest']) {
+  test('JSON round-trip rejects array binding identity: '+field, () => {
+    const value=binding(); value[field]=[value[field]];
+    const hydrated=JSON.parse(JSON.stringify(value));
+    assert.throws(()=>assessContainmentContract([],hydrated),/containment_binding_invalid/);
+  });
+}
+for (const bad of [['c'.repeat(64)], 1e63]) {
+  test('JSON round-trip rejects coerced evidence digest: '+JSON.stringify(bad), () => {
+    const rows=evidence(); rows[0].evidenceDigest=bad;
+    const result=assessContainmentContract(JSON.parse(JSON.stringify(rows)),binding());
+    assert.equal(result.invalidEvidence,true); assert.equal(result.syntheticContract,'incomplete'); unproved(result);
+  });
+}

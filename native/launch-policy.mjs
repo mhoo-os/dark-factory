@@ -10,6 +10,8 @@ const WORKSPACE = '/work/candidate';
 const AUTH = '/var/lib/mhoo-controller';
 const DIGEST = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{40}$/;
+// JSON arrays and numbers must never stand in for evidence identifiers.
+const matches = (pattern, value) => typeof value === 'string' && pattern.test(value);
 const digest = text => createHash('sha256').update(text).digest('hex');
 const fail = () => { throw new Error('native_launch_policy_refused'); };
 function keys(value, names) {
@@ -42,21 +44,21 @@ export function buildNativeLaunchPlan(input, now) {
   const r = intent.run;
   keys(r, ['run_id','dispatch_id','contract_digest','linear_issue_id','linear_identifier','repository','collision_group',
     'base_sha','head_sha','branch','pr_number','lease_fence','factory_id','registry_version','registry_digest','registry_entry_version']);
-  if (intent.mode !== 'mock-only' || intent.attempt !== 0 || !DIGEST.test(intent.attemptId)
+  if (intent.mode !== 'mock-only' || intent.attempt !== 0 || !matches(DIGEST, intent.attemptId)
     || intent.attemptId !== digest(r.run_id+':native-candidate:v1:0')
-    || !DIGEST.test(intent.requestDigest) || !DIGEST.test(intent.mockPin)
+    || !matches(DIGEST, intent.requestDigest) || !matches(DIGEST, intent.mockPin)
     || !Number.isSafeInteger(now) || !Number.isSafeInteger(intent.deadlineMs)
     || intent.deadlineMs <= now || intent.deadlineMs > now+30_000
-    || !DIGEST.test(input.expectedIntentDigest) || digest(JSON.stringify(intent)) !== input.expectedIntentDigest) fail();
+    || !matches(DIGEST, input.expectedIntentDigest) || digest(JSON.stringify(intent)) !== input.expectedIntentDigest) fail();
   if (!Object.entries(r).filter(([k]) => !['head_sha','pr_number','lease_fence'].includes(k)).every(([,v]) => text(v))
-    || !SHA.test(r.base_sha) || (r.head_sha !== null && !SHA.test(r.head_sha))
+    || !matches(SHA, r.base_sha) || (r.head_sha !== null && !matches(SHA, r.head_sha))
     || !/^sha256:[a-f0-9]{64}$/.test(r.contract_digest) || !/^sha256:[a-f0-9]{64}$/.test(r.registry_digest)
     || !/^mhoo-os\/[a-z0-9._-]+$/.test(r.repository) || !/^factory\/[a-z0-9-]+$/.test(r.branch)
     || !Number.isSafeInteger(r.lease_fence) || r.lease_fence < 1
     || (r.pr_number !== null && (!Number.isSafeInteger(r.pr_number) || r.pr_number < 1))) fail();
   // Exact policy bytes are intentionally conservative: no merge of caller rules.
-  if (JSON.stringify(profile) !== JSON.stringify(PROFILE) || !/^gpt-[a-z0-9.-]{1,64}$/.test(input.model)
-    || !/^disposable-[a-z0-9-]{1,80}$/.test(input.environmentId)) fail();
+  if (JSON.stringify(profile) !== JSON.stringify(PROFILE) || !matches(/^gpt-[a-z0-9.-]{1,64}$/, input.model)
+    || !matches(/^disposable-[a-z0-9-]{1,80}$/, input.environmentId)) fail();
   keys(input.inheritedEnvironment, []);
   keys(observation, ['version','platform','sha256','executablePath','isSymlink','profileDigest','profileWritable']);
   const executablePath = `${ROOT}/${CLI_PIN.version}/${CLI_PIN.platform}/${CLI_PIN.sha256}/codex`;
