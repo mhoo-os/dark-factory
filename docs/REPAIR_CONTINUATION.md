@@ -41,3 +41,8 @@ runtime dependencies are an approved isolated executor, verified stop/custody,
 supported subscription accounting, authenticated provider/CI/publisher readers,
 and explicit runtime/pilot approval. The running Workflow must select this bounded
 continuation with its existing lease; no live PR-to-Workflow dispatch is enabled.
+
+Rollback requires the matching claim-aware recovery/release source while any repair
+claim exists. Stopping dispatch alone does not stop scheduled lease recovery in
+older source. Retain this recovery behavior until human reconciliation resolves
+all claimed capacity; retaining only the receipt migration is insufficient.
