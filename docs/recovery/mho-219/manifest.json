@@ -1,0 +1,77 @@
+{
+  "artifact": "MHO-219 remote recovery preparation",
+  "status": "NOT_EXECUTED",
+  "source_sha": "cd1a439d44017cbde1733f4334dc747577557aa7",
+  "wrangler_version": "4.128.0",
+  "account_id": "faca04363f6ba617faedaae7d3493769",
+  "proposed_destination_name": "mhoo-dark-factory-recovery-mho219",
+  "destination_uuid": null,
+  "forbidden_destination_uuids": [
+    "e76d5f65-a33c-41cf-9f82-622c1d53cf43"
+  ],
+  "backup": {
+    "bucket": "mhoo-dark-factory-backups",
+    "key": "mho-219/2026-09-05T11-20Z/pre-v7-62d72e3c4a2ae741b214a174077edbeb47472bf8eabcc7a158025fe13a97465a.sql",
+    "sha256": "62d72e3c4a2ae741b214a174077edbeb47472bf8eabcc7a158025fe13a97465a",
+    "bytes": 22104,
+    "evidence_comment": "4ef187d9-3917-46a5-afa3-3dea1d92cce1",
+    "retrieved_in_this_increment": false
+  },
+  "migrations": [
+    {
+      "path": "migrations/0001_factory.sql",
+      "sha256": "35875c270bb786677bd78c20f77a22f0aaf2371612c826d9833ceca702d9561c",
+      "phase": "already_recorded_in_backup"
+    },
+    {
+      "path": "migrations/0002_ingress-retry-state.sql",
+      "sha256": "3b677e38afb0891cc5f0cf642cbcd7136a030f5f90f59044f305ee06a4827714",
+      "phase": "already_recorded_in_backup"
+    },
+    {
+      "path": "migrations/0003-state-history-and-active-issue.sql",
+      "sha256": "38f1762f18a72a058dc70234d0b135df19daa221fe4b83158e3933d49acc7150",
+      "phase": "already_recorded_in_backup"
+    },
+    {
+      "path": "migrations/0004-trusted-factory-registry.sql",
+      "sha256": "e8617569c6ea94dfd91ce7b9ddc715cf87ece2f7e7e79dc3ff6595dc6c1ed8af",
+      "phase": "already_recorded_in_backup"
+    },
+    {
+      "path": "migrations/0004_chat_lane_registry.sql",
+      "sha256": "228f5dcd0f7c5037bf98c9ccd086c7592ec98d47b2329752864b2d752afd6d47",
+      "phase": "pending_after_import"
+    },
+    {
+      "path": "migrations/0005-runtime-capacity-leases.sql",
+      "sha256": "2cee3d2fda1658e4512f39436da794c7eaa6a230a4125bc8952e96da7a147e70",
+      "phase": "pending_after_import"
+    },
+    {
+      "path": "migrations/0005_chat_lane_transition_guards.sql",
+      "sha256": "f04880296709674721effbde8c5b6a87ef2ac6cb4a0f0d3c0ea8728379414671",
+      "phase": "pending_after_import"
+    },
+    {
+      "path": "migrations/0006_chat_lane_activation_guard.sql",
+      "sha256": "dc10ffddc09cdf49012c5fb16a5da4030331c157ca31620bb91f40aa3edeefe3",
+      "phase": "pending_after_import"
+    },
+    {
+      "path": "migrations/0007_chat_lane_rollback_compatibility.sql",
+      "sha256": "65761ded66172dd17805391a3ac32be09ad4295b3ba2939d71754b2a4d0311bd",
+      "phase": "pending_after_import"
+    }
+  ],
+  "required_authorization": [
+    "exact resource and cost scope",
+    "exact retained backup data classification and copy scope",
+    "remote import and migration into new empty unbound destination"
+  ],
+  "proof_limits": [
+    "Manifest is not authorization or remote observation.",
+    "No executable provisioning or restore script is supplied.",
+    "Local source verification cannot close runtime readiness."
+  ]
+}
