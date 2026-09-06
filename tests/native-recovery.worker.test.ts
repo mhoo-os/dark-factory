@@ -100,3 +100,13 @@ it('composed failure readback binds the original run despite caller mutation',as
   expect(JSON.parse(row!.result_json as string).reason).toBe('native_stop_unconfirmed');
   expect(row!.result_json).not.toContain('private runner error');
 });
+it('repair claims retain shared capacity through release and scheduled expiry',async()=>{
+  const f=await fixture();
+  await env.DB.prepare("INSERT INTO factory_steps(run_id,step_key,status,result_json,updated_at) VALUES(?,'review-repair:v1:claim:1','synthetic','{}',?)").bind(f.id,new Date().toISOString()).run();
+  await expect(control.releaseLease(env.DB,f.held as never)).rejects.toThrow('native_capacity_held');
+  await f.expire();expect(await control.acquireLease(env.DB,f.held as never,limits)).toBeNull();
+  await env.DB.prepare("UPDATE control_flags SET value='true' WHERE key='stop'").run();
+  await worker.scheduled({} as never,env);
+  expect(await env.DB.prepare('SELECT current_state,lease_fence FROM factory_runs WHERE run_id=?').bind(f.id).first()).toMatchObject({current_state:'needs-human',lease_fence:f.held.lease_fence});
+  expect(await env.DB.prepare('SELECT count(*) AS n FROM factory_leases WHERE dispatch_id=?').bind(f.id).first()).toMatchObject({n:4});
+});

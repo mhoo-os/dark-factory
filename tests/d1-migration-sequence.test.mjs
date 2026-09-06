@@ -20,6 +20,7 @@ const migrationNames = [
   "0007_chat_lane_rollback_compatibility.sql",
   "0008_native_candidate_receipts.sql",
   "0009_review_result_receipts.sql",
+  "0010_repair_attempt_receipts.sql",
 ];
 const observedPartialLedger = migrationNames.slice(0, 4);
 const triggerMigrations = [

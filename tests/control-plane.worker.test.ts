@@ -510,3 +510,10 @@ describe("local Worker control-plane behavior", () => {
       await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id IN (SELECT reservation_id FROM factory_lease_reservations WHERE run_id=?)").bind(raceRunId).first<{ count: number }>()).resolves.toMatchObject({ count: 0 });
   });
 });
+it('repair Workflow wrapper refuses changed contract or unverified original accounting',async()=>{
+  const job={kind:'dispatch',dispatchId,runId,contractDigest:`sha256:${'2'.repeat(64)}`,contract};
+  const policy={roundCostMicros:1,requiredChecks:[{name:'test',producerId:1}],trustedAuthors:{linear:'l',github:'g'},authorizedBlockerIds:[]};
+  const adapters={} as never;
+  await expect(__TEST_ONLY__.continueSyntheticReviewRepairs(env,{...job,contractDigest:'wrong'} as never,'assignment',policy,adapters)).rejects.toThrow('repair_contract_conflict');
+  await expect(__TEST_ONLY__.continueSyntheticReviewRepairs(env,job as never,'assignment',policy,adapters)).rejects.toThrow('repair_original_accounting_unknown');
+});
