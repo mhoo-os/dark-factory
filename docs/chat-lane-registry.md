@@ -72,3 +72,39 @@ migrations as part of this Phase 0 procedure.
 - No ChatGPT credential, token, or browser session is stored.
 - No automatic merge, deploy, production configuration, or planning mutation.
 - A blocked or expired lane needs an operator decision before it can be reused.
+
+## MHO-253 request/result interface (source only)
+
+Migration `0009_review_result_receipts.sql` adds an immutable completion manifest
+column to existing assignments and a separate `chat-review-receipts` capability
+marker. Existing Phase 0 requests keep their original behavior. The new
+`review_request_version: mho253-v1` requires canonical run, contract and fence,
+prior review ID (or null), and the existing repository/issue/PR/head/review binding.
+It forbids a requested verdict. Without the new capability it fails closed.
+
+Completion independently supplies PASS or REQUEST CHANGES, the exact request
+digest, unchanged canonical/prior-review binding, both output digests and links,
+and the existing authenticated operator attestation. The winning lane transition
+stores that result separately from the request and writes the existing completion
+event in the same transaction. Request/result rewrite, deletion and replacement
+are refused. Legacy source cannot complete new requests without a preselected
+verdict: on rollback keep new assignments held and retain migration/evidence.
+
+`readReviewPair` is a read-only adapter interface tested with synthetic providers.
+The trusted reader must obtain author IDs, URLs and byte digests from authenticated
+provider readback, never from review prose. Canonical context must come from
+Cloudflare. No real reader, model, dispatch or publication implementation is wired.
+The interface snapshots context before awaiting its reader; it requires matching
+request/head/review/issue/PR, trusted authors, reciprocal concrete artifact links,
+matching verdicts and bounded finding lists. A repair proposal requires an in-scope
+Critical/High blocker, unchanged canonical run/contract/fence/head, an unexpired
+budget, positive known remaining cost and fewer than the original maximum of at
+most three completed repair rounds. PASS, Medium/Low-only, exhausted, unknown or
+stale context cannot propose repair. Every output denies execution, publication
+and merge. This predicate does not consume/reset counters or authorize an attempt;
+a later canonical repair claim must re-read and atomically enforce those budgets.
+
+Synthetic end-to-end tests drive readback through lane completion and immutable
+result readback for both verdicts. This is not Pro acceptance or runtime proof.
+Remaining integration includes authenticated provider readers, canonical required-CI
+readback and atomic repair-attempt admission/publication under the original run.

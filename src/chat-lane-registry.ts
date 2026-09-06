@@ -74,6 +74,7 @@ function concreteGithubOutputUrl(value: unknown): string {
 }
 
 function assignmentIdentity(laneType: string, metadata: Json): { repository: string | null; prNumber: number | null; linearIssueId: string | null; targetHeadSha: string | null } {
+  if (laneType !== "review" && metadata.review_request_version !== undefined) throw new Error("review_lane_required");
   const repository = optionalText(metadata.repository, "repository", REPOSITORY);
   const prNumber = metadata.pr_number === undefined || metadata.pr_number === null ? null : Number(metadata.pr_number);
   if (prNumber !== null && (!Number.isSafeInteger(prNumber) || prNumber < 1)) throw new Error("pr_number_invalid");
@@ -81,7 +82,17 @@ function assignmentIdentity(laneType: string, metadata: Json): { repository: str
   const targetHeadSha = optionalText(metadata.target_head_sha, "target_head_sha", SHA40);
   if (laneType === "review") {
     requiredText(metadata.review_id, "review_id", REVIEW_ID);
-    requiredText(metadata.verdict, "verdict", VERDICT);
+    if (metadata.review_request_version === "mho253-v1") {
+      if ("verdict" in metadata) throw new Error("review_request_verdict_forbidden");
+      requiredText(metadata.canonical_run_id, "canonical_run_id", SAFE_ID);
+      requiredText(metadata.contract_digest, "contract_digest", /^sha256:[0-9a-f]{64}$/);
+      if (!Number.isSafeInteger(metadata.canonical_fence) || Number(metadata.canonical_fence)<1) throw new Error("canonical_fence_invalid");
+      if (metadata.prior_review_id !== null) requiredText(metadata.prior_review_id,"prior_review_id",REVIEW_ID);
+      if (metadata.prior_review_id === metadata.review_id) throw new Error("prior_review_must_differ");
+    } else {
+      if (metadata.review_request_version !== undefined) throw new Error("review_request_version_invalid");
+      requiredText(metadata.verdict, "verdict", VERDICT);
+    }
     if (!repository || !prNumber || !targetHeadSha || !linearIssueId) throw new Error("review_identity_incomplete");
   } else if (!linearIssueId && !optionalText(metadata.objective, "objective", SAFE_ID)) {
     throw new Error("planning_identity_incomplete");
@@ -102,7 +113,7 @@ function completionEvidence(laneType: string, assignment: Json, payload: Json): 
     const linearIssueId = requiredText(assignment.linear_issue_id, "linear_issue_id", ISSUE);
     const targetHeadSha = requiredText(assignment.target_head_sha, "target_head_sha", SHA40);
     const reviewId = requiredText(assignment.review_id, "review_id", REVIEW_ID);
-    const verdict = requiredText(assignment.verdict, "verdict", VERDICT);
+    const verdict = requiredText(assignment.review_request_version === "mho253-v1" ? manifest.verdict : assignment.verdict, "verdict", VERDICT);
     if (!Number.isSafeInteger(prNumber) || prNumber < 1 ||
         manifest.repository !== repository || Number(manifest.pr_number) !== prNumber ||
         manifest.linear_issue_id !== linearIssueId || manifest.target_head_sha !== targetHeadSha ||
@@ -174,6 +185,10 @@ async function lease(request: Request, db: D1Database): Promise<Response> {
   if (!assignment || typeof assignment !== "object" || Array.isArray(assignment)) throw new Error("assignment_invalid");
   const metadata = assignment as Json;
   const { repository, prNumber, linearIssueId, targetHeadSha } = assignmentIdentity(laneType, metadata);
+  if (metadata.review_request_version === "mho253-v1") {
+    const ready=await db.prepare("SELECT schema_version FROM factory_schema_meta WHERE schema_name='chat-review-receipts'").first<{schema_version:number}>();
+    if (ready?.schema_version!==1) throw new Error("review_receipts_unready");
+  }
 
   const requestDigest = await digest({ lane_type: laneType, assignment: metadata });
   const existing = await db.prepare(
@@ -206,7 +221,7 @@ async function lease(request: Request, db: D1Database): Promise<Response> {
     throw error;
   }
   const created = await db.prepare(
-    "SELECT assignment_id,lane_id,lease_token,lease_fence,lease_expires_at,status FROM chat_lane_assignments WHERE assignment_id=?",
+    "SELECT assignment_id,request_digest,lane_id,lease_token,lease_fence,lease_expires_at,status FROM chat_lane_assignments WHERE assignment_id=?",
   ).bind(assignmentId).first<Record<string, unknown>>();
   if (!created?.lane_id) throw new Error("lane_allocation_not_confirmed");
   return json({ duplicate: false, ...created }, 201);
@@ -235,14 +250,31 @@ async function transition(request: Request, db: D1Database, assignmentId: string
   } catch (error) {
     return json({ error: error instanceof Error ? error.message : "completion_evidence_required" }, 422);
   }
+  let resultJson: string | null = null;
+  if (requested === "COMPLETED" && assignment.review_request_version === "mho253-v1") {
+    try {
+    const manifest=requiredObject(payload.completion_manifest,"completion_manifest");
+    if (manifest.request_digest!==await digest({lane_type:current.lane_type,assignment})
+      || manifest.canonical_run_id!==assignment.canonical_run_id || manifest.canonical_fence!==assignment.canonical_fence
+      || manifest.contract_digest!==assignment.contract_digest || manifest.prior_review_id!==assignment.prior_review_id) return json({error:"review_request_binding_invalid"},422);
+    const linearDigest=requiredText(manifest.linear_digest,"linear_digest",/^sha256:[0-9a-f]{64}$/);
+    const githubDigest=requiredText(manifest.github_digest,"github_digest",/^sha256:[0-9a-f]{64}$/);
+    resultJson=stable({request_digest:manifest.request_digest,review_id:assignment.review_id,linear_digest:linearDigest,github_digest:githubDigest,
+      verdict:manifest.verdict,target_head_sha:assignment.target_head_sha,linear_output_url:evidence.linearUrl,
+      github_output_url:evidence.githubUrl,output_digest:evidence.outputDigest,
+      canonical_run_id:assignment.canonical_run_id,canonical_fence:assignment.canonical_fence,
+      contract_digest:assignment.contract_digest,prior_review_id:assignment.prior_review_id,
+      attested_by:evidence.attestedBy,attested_at:evidence.attestedAt});
+    } catch { return json({error:"review_result_invalid"},422); }
+  }
   const assignmentStatus = requested === "REPLACE" ? "BLOCKED" : requested;
   const reason = requested === "REPLACE" ? "mho250-v2:replace" : "mho250-v2:operator_transition";
   // The migration trigger owns lane state and event insertion. Its guard raises
   // inside SQLite if the assignment/lane/token/fence/expiry snapshot no longer
   // agrees, which rolls this assignment update back instead of committing a split state.
   const result = await db.prepare(
-    "UPDATE chat_lane_assignments SET status=?,transition_reason=?,linear_output_url=COALESCE(?,linear_output_url),github_output_url=COALESCE(?,github_output_url),output_digest=COALESCE(?,output_digest),verified_at=CASE WHEN ?='COMPLETED' THEN ? ELSE verified_at END,completed_at=CASE WHEN ?='COMPLETED' THEN ? ELSE completed_at END,attested_by=COALESCE(?,attested_by),attested_at=COALESCE(?,attested_at),updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status=? AND lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND EXISTS (SELECT 1 FROM chat_lanes WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND status=?)",
-  ).bind(assignmentStatus, reason, evidence.linearUrl, evidence.githubUrl, evidence.outputDigest, requested, now, requested, now, evidence.attestedBy, evidence.attestedAt, now, assignmentId, leaseToken, current.lease_fence, current.status, current.lane_id, assignmentId, leaseToken, current.lease_fence, current.status).run();
+    `UPDATE chat_lane_assignments SET ${resultJson===null?"":"completion_manifest_json=?,"}status=?,transition_reason=?,linear_output_url=COALESCE(?,linear_output_url),github_output_url=COALESCE(?,github_output_url),output_digest=COALESCE(?,output_digest),verified_at=CASE WHEN ?='COMPLETED' THEN ? ELSE verified_at END,completed_at=CASE WHEN ?='COMPLETED' THEN ? ELSE completed_at END,attested_by=COALESCE(?,attested_by),attested_at=COALESCE(?,attested_at),updated_at=? WHERE assignment_id=? AND lease_token=? AND lease_fence=? AND status=? AND lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND EXISTS (SELECT 1 FROM chat_lanes WHERE lane_id=? AND current_assignment_id=? AND lease_token=? AND lease_fence=? AND status=?)`,
+  ).bind(...(resultJson===null?[]:[resultJson]),assignmentStatus, reason, evidence.linearUrl, evidence.githubUrl, evidence.outputDigest, requested, now, requested, now, evidence.attestedBy, evidence.attestedAt, now, assignmentId, leaseToken, current.lease_fence, current.status, current.lane_id, assignmentId, leaseToken, current.lease_fence, current.status).run();
   if (result.meta.changes < 1) return json({ error: "lease_fenced_or_expired" }, 409);
   const laneStatus = requested === "COMPLETED" ? "IDLE" : requested === "REPLACE" ? "REPLACE" : assignmentStatus;
   return json({ assignment_id: assignmentId, lane_id: current.lane_id, status: assignmentStatus, lane_status: laneStatus });
