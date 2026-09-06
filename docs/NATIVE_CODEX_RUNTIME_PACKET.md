@@ -84,3 +84,26 @@ This change does not seal JavaScript objects against arbitrary in-process code o
 make digests attestations. Inputs still require trusted canonical readback, and
 returned proposals remain inert mutable data with execution/publication disabled.
 No guest tests, credential operations, model calls or runtime activation occurred.
+
+## Canonical recovery source continuation
+
+`readNativeAttempt` now reconstructs only persisted intent/launch/receipt bytes,
+checks their identity and digests, and distinguishes missing acknowledgment,
+unconfirmed stop, quarantined result and unknown accounting. The Worker reconciler
+uses the existing `transitionRun` to record one fenced `needs-human` event without
+resetting the native attempt, changing its head, or releasing its capacity.
+
+Existing expiry recovery calls this seam for claimed native attempts. Lease
+acquisition refuses both a new reservation for that run and takeover of its
+expired slots; ordinary lease release also refuses a native launch claim. These
+checks use existing immutable steps and lease records, without a schema change.
+They apply even when Factory dispatch is disabled. Unclaimed intents retain the
+ordinary expiry recovery path. A malformed readback fails closed with capacity
+retained; it does not authorize a replacement attempt.
+
+All claimed native capacity remains held, including a stopped mock candidate,
+until separately governed human reconciliation. This increment provides no release
+API, real executor, authenticated relay transport or review dispatch. Native
+accounting remains UNKNOWN. The future immediate post-delivery integration must
+invoke the same canonical reconciler; the existing scheduled path handles expired
+attempt recovery today at source level. Source tests do not prove deployed behavior.

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { reserveMockAttempt, deliverMockAttempt, currentNativeGrant } from '../src/native-candidate.ts';
+import { reserveMockAttempt, deliverMockAttempt, currentNativeGrant, readNativeAttempt } from '../src/native-candidate.ts';
 import { runMockCandidate, MOCK_FIXTURE_SHA256 } from '../native/mock-codex-runner.mjs';
 
 const NOW = Date.parse('2026-09-05T12:00:00.000Z');
@@ -17,6 +17,7 @@ class D1 {
     let args=[]; const owner=this;
     return {
       bind(...values) { args=values; return this; },
+      async all() { return {results: owner.raw.prepare(sql).all(...args)}; },
       async first() { return owner.raw.prepare(sql).get(...args) ?? null; },
       async run() {
         owner.before?.(sql,args);
@@ -227,3 +228,60 @@ for(const movement of ['stop','fence','deadline']) test('authority moving during
   assert.equal(receipts(f.raw)[0].disposition,'quarantined');
   assert.equal(receipts(f.raw)[0].result.status,'candidate');
 });
+
+// Readback uses only persisted canonical bytes, including after caller loss.
+test('native readback distinguishes absent, unclaimed and durable candidate',async()=>{
+  const f=fixture(); assert.equal(await readNativeAttempt(f.db,'run-1'),null);
+  const intent=await f.reserve(); assert.equal((await readNativeAttempt(f.db,'run-1')).claimed,false);
+  const delivered=await deliver(f,intent); const observed=await readNativeAttempt(f.db,'run-1');
+  assert.equal(observed.reason,'native_accounting_unverified');
+  assert.equal(observed.receiptDigest,delivered.receiptDigest); assert.equal(observed.publicationAllowed,false);
+  assert.equal(JSON.stringify(observed.intent),JSON.stringify(intent));
+});
+for (const status of ['failed','ambiguous']) test('native readback retains '+status+' hold',async()=>{
+  const f=fixture(), intent=await f.reserve();
+  await deliver(f,intent,async()=>({...candidate(),status,processStopped:status==='failed'}));
+  assert.equal((await readNativeAttempt(f.db,'run-1')).reason,status==='failed'?'native_result_quarantined':'native_stop_unconfirmed');
+});
+test('lost result readback never guesses launch failure or permits resend',async()=>{
+  const f=fixture(), intent=await f.reserve();
+  f.db.after=(sql,args)=>{if(args[0]===PREFIX+'launch')throw Error('lost ack');};
+  await assert.rejects(deliver(f,intent),/lost ack/); f.db.after=null;
+  assert.equal((await readNativeAttempt(f.db,'run-1')).reason,'native_delivery_ambiguous');
+});
+for (const corruption of ['missing-intent','large-intent','wrong-run','wrong-attempt','bad-fence','bad-mode','wrong-launch','large-receipt','wrong-digest','wrong-binding','wrong-launch-digest','publication','bad-time','bad-disposition','bad-status','bad-result-digest','bad-stopped','bad-usage','bad-usage-status']) {
+  test('corrupt canonical readback fails closed: '+corruption,async()=>{
+    const f=fixture(), intent=await f.reserve(); await deliver(f,intent);
+    // Deliberately corrupt a test-only database after removing its immutability
+    // guard. Production guards remain unchanged and are tested above.
+    f.raw.exec('DROP TRIGGER native_candidate_steps_no_update; DROP TRIGGER native_candidate_steps_no_delete');
+    const row=f.raw.prepare("SELECT step_key,result_json FROM factory_steps WHERE step_key LIKE ?").get(PREFIX+'receipt:%');
+    const receipt=JSON.parse(row.result_json);
+    if(corruption==='missing-intent')f.raw.prepare('DELETE FROM factory_steps WHERE step_key=?').run(PREFIX+'intent');
+    else if(corruption==='large-intent')f.raw.prepare('UPDATE factory_steps SET result_json=? WHERE step_key=?').run(' '.repeat(16385),PREFIX+'intent');
+    else if(['wrong-run','wrong-attempt','bad-fence','bad-mode'].includes(corruption)) {
+      if(corruption==='wrong-run')intent.run.run_id='other';
+      if(corruption==='wrong-attempt')intent.attemptId='bad';
+      if(corruption==='bad-fence')intent.run.lease_fence=0;
+      if(corruption==='bad-mode')intent.mode='live';
+      f.raw.prepare('UPDATE factory_steps SET result_json=? WHERE step_key=?').run(JSON.stringify(intent),PREFIX+'intent');
+    } else if(corruption==='wrong-launch')f.raw.prepare('UPDATE factory_steps SET result_json=? WHERE step_key=?').run('{}',PREFIX+'launch');
+    else if(corruption==='large-receipt')f.raw.prepare('UPDATE factory_steps SET result_json=? WHERE step_key=?').run(' '.repeat(32769),row.step_key);
+    else if(corruption==='wrong-digest')f.raw.prepare('UPDATE factory_steps SET result_json=? WHERE step_key=?').run('{}',row.step_key);
+    else {
+      if(corruption==='wrong-binding')receipt.intent.run.run_id='other';
+      if(corruption==='wrong-launch-digest')receipt.launchDigest='bad';
+      if(corruption==='publication')receipt.publicationAllowed=true;
+      if(corruption==='bad-time')receipt.observedAt='now';
+      if(corruption==='bad-disposition')receipt.disposition='published';
+      if(corruption==='bad-status')receipt.result.status='published';
+      if(corruption==='bad-result-digest')receipt.result.resultDigest='bad';
+      if(corruption==='bad-stopped')receipt.result.processStopped='true';
+      if(corruption==='bad-usage')receipt.result.usage=0;
+      if(corruption==='bad-usage-status')receipt.result.usageStatus='OBSERVED';
+      const bytes=JSON.stringify(receipt), hash=createHash('sha256').update(bytes).digest('hex');
+      f.raw.prepare('UPDATE factory_steps SET result_json=?,step_key=? WHERE step_key=?').run(bytes,PREFIX+'receipt:'+hash,row.step_key);
+    }
+    await assert.rejects(readNativeAttempt(f.db,'run-1'),/native_readback_invalid/);
+  });
+}
