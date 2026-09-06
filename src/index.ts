@@ -5,7 +5,7 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 import { handleChatLaneRequest, isChatLaneAdmin, recoverExpiredChatLanes } from "./chat-lane-registry";
-import { readNativeAttempt } from "./native-candidate";
+import { readNativeAttempt, deliverMockAttempt } from "./native-candidate";
 import registryArtifact from "../factory/factory_registry.json";
 
 export { Sandbox } from "@cloudflare/sandbox";
@@ -1207,6 +1207,18 @@ async function reconcileNativeAttempt(db: D1Database, runId: string): Promise<st
   return "needs-human";
 }
 
+/** No live transport: compose the existing mock delivery with canonical readback.
+ * Finally also covers loss of acknowledgment after the durable launch claim.
+ */
+async function deliverAndReconcileNativeMock(...args: Parameters<typeof deliverMockAttempt>) {
+  const runId = args[1].run.run_id;
+  let delivery;
+  let canonicalDisposition;
+  try { delivery = await deliverMockAttempt(...args); }
+  finally { canonicalDisposition = await reconcileNativeAttempt(args[0], runId); }
+  return { ...delivery, canonicalDisposition };
+}
+
 async function recoverStaleLeases(env: Env): Promise<void> {
   const now = new Date().toISOString();
   const rows = await env.DB.prepare("SELECT run_id,repository,collision_group,lease_fence,current_state,workflow_id FROM factory_runs WHERE current_state IN ('leased','running','validating') AND lease_fence IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY updated_at,run_id LIMIT 16").bind(now).all<{ run_id: string; repository: string; collision_group: string; lease_fence: number; current_state: string; workflow_id: string | null }>();
@@ -2256,6 +2268,7 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
 // are not attached to the public fetch surface.
 export const __TEST_ONLY__ = {
   reconcileNativeAttempt,
+  deliverAndReconcileNativeMock,
   sandboxCredentials,
   sandboxRemote,
   trustedSource,

@@ -39,7 +39,8 @@ const candidate={status:'candidate' as const,resultDigest:'c'.repeat(64),headSha
 
 it('canonical candidate readback parks unknown accounting once, keeps receipt and all capacity',async()=>{
   const f=await fixture();
-  await deliverMockAttempt(env.DB,f.intent,async()=>candidate,async()=>true,()=>f.now);
+  const delivered=await control.deliverAndReconcileNativeMock(env.DB,f.intent,async()=>candidate,async()=>true,()=>f.now);
+  expect(delivered).toMatchObject({canonicalDisposition:'needs-human',publicationAllowed:false});
   expect(await control.reconcileNativeAttempt(env.DB,f.id)).toBe('needs-human');
   expect(await control.reconcileNativeAttempt(env.DB,f.id)).toBe('needs-human');
   const row=await env.DB.prepare('SELECT current_state,lease_fence,result_json FROM factory_runs WHERE run_id=?').bind(f.id).first();
@@ -87,4 +88,15 @@ it('expired unclaimed native intent follows the existing lease recovery path',as
   await worker.scheduled({} as never,env);
   expect(await env.DB.prepare('SELECT current_state,lease_fence FROM factory_runs WHERE run_id=?').bind(f.id).first()).toMatchObject({current_state:'needs-human',lease_fence:null});
   expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM factory_leases WHERE dispatch_id=?').bind(f.id).first()).toMatchObject({n:0});
+});
+it('composed failure readback binds the original run despite caller mutation',async()=>{
+  const f=await fixture();
+  const result=await control.deliverAndReconcileNativeMock(env.DB,f.intent,async()=>{
+    f.intent.run.run_id='unrelated'; throw Error('private runner error');
+  },async()=>true,()=>f.now);
+  expect(result).toMatchObject({disposition:'quarantined',canonicalDisposition:'needs-human',publicationAllowed:false});
+  const row=await env.DB.prepare('SELECT current_state,result_json FROM factory_runs WHERE run_id=?').bind(f.id).first();
+  expect(row!.current_state).toBe('needs-human');
+  expect(JSON.parse(row!.result_json as string).reason).toBe('native_stop_unconfirmed');
+  expect(row!.result_json).not.toContain('private runner error');
 });

@@ -104,6 +104,6 @@ retained; it does not authorize a replacement attempt.
 All claimed native capacity remains held, including a stopped mock candidate,
 until separately governed human reconciliation. This increment provides no release
 API, real executor, authenticated relay transport or review dispatch. Native
-accounting remains UNKNOWN. The future immediate post-delivery integration must
-invoke the same canonical reconciler; the existing scheduled path handles expired
-attempt recovery today at source level. Source tests do not prove deployed behavior.
+accounting remains UNKNOWN. The mock delivery composition invokes the same canonical reconciler in a finally
+block, including delivery errors; scheduled recovery handles expired attempts.
+Neither adds a dispatch route or real transport. Source tests do not prove deployed behavior.
