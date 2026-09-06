@@ -10,14 +10,16 @@ export const CONTAINMENT_CASES = Object.freeze([
 ]);
 export const FAKE_CANARY_DIGEST = createHash('sha256').update('MHO253_FAKE_CANARY_NOT_A_CREDENTIAL').digest('hex');
 
+const matches = (pattern, value) => typeof value === 'string' && pattern.test(value);
+
 /** Pure synthetic evidence completeness check. A pass is never host attestation.
  * Missing, duplicated, foreign or malformed receipts fail closed; no raw canary,
  * command, stdout or credential fields are admitted into returned evidence.
  */
 export function assessContainmentContract(receipts, binding) {
   if (!binding || Object.keys(binding).sort().join(',') !== 'environmentId,intentDigest,profileDigest'
-    || !/^disposable-[a-z0-9-]{1,80}$/.test(binding.environmentId)
-    || !/^[a-f0-9]{64}$/.test(binding.intentDigest) || !/^[a-f0-9]{64}$/.test(binding.profileDigest)) {
+    || !matches(/^disposable-[a-z0-9-]{1,80}$/, binding.environmentId)
+    || !matches(/^[a-f0-9]{64}$/, binding.intentDigest) || !matches(/^[a-f0-9]{64}$/, binding.profileDigest)) {
     throw new Error('containment_binding_invalid');
   }
   const passed = new Set();
@@ -27,7 +29,7 @@ export function assessContainmentContract(receipts, binding) {
       || !CONTAINMENT_CASES.includes(r.caseId) || passed.has(r.caseId)
       || r.environmentId !== binding.environmentId || r.intentDigest !== binding.intentDigest
       || r.profileDigest !== binding.profileDigest || r.canaryDigest !== FAKE_CANARY_DIGEST
-      || r.synthetic !== true || r.outcome !== 'pass' || !/^[a-f0-9]{64}$/.test(r.evidenceDigest)) {
+      || r.synthetic !== true || r.outcome !== 'pass' || !matches(/^[a-f0-9]{64}$/, r.evidenceDigest)) {
       valid = false;
       break;
     }

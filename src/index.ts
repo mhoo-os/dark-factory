@@ -5,6 +5,7 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 import { handleChatLaneRequest, isChatLaneAdmin, recoverExpiredChatLanes } from "./chat-lane-registry";
+import { readNativeAttempt, deliverMockAttempt } from "./native-candidate";
 import registryArtifact from "../factory/factory_registry.json";
 
 export { Sandbox } from "@cloudflare/sandbox";
@@ -1041,6 +1042,7 @@ function capacityLeaseScopes(run: Run, limits: ConcurrencyLimits): string[][] {
 }
 
 async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits, expiresNoLaterThan?: number, nowAt = Date.now()): Promise<LeaseReservation | null> {
+  if (await db.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key='native-candidate:v1:launch'").bind(run.run_id).first()) return null;
   const now = new Date(nowAt);
   if (expiresNoLaterThan !== undefined && (!Number.isFinite(expiresNoLaterThan) || expiresNoLaterThan <= now.getTime())) throw new Error("workflow_deadline_exceeded");
   const expiry = new Date(Math.min(now.getTime() + 30 * 60_000, expiresNoLaterThan ?? Number.POSITIVE_INFINITY)).toISOString();
@@ -1053,8 +1055,8 @@ async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits,
     for (const scope of capacityLeaseScopes(run, limits)) {
       let selected: string | null = null;
       for (const key of scope) {
-        const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=?")
-          .bind(key, "workflow", run.run_id, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, 0, expiry, now.toISOString()).run();
+        const result = await db.prepare("INSERT INTO factory_leases(lease_key,owner,dispatch_id,factory_id,registry_version,registry_digest,registry_entry_version,fence,expires_at) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=? AND n.step_key='native-candidate:v1:launch') ON CONFLICT(lease_key) DO UPDATE SET owner=excluded.owner,dispatch_id=excluded.dispatch_id,factory_id=excluded.factory_id,registry_version=excluded.registry_version,registry_digest=excluded.registry_digest,registry_entry_version=excluded.registry_entry_version,fence=factory_leases.fence+1,expires_at=excluded.expires_at WHERE factory_leases.expires_at<=? AND NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=factory_leases.dispatch_id AND n.step_key='native-candidate:v1:launch')")
+          .bind(key, "workflow", run.run_id, run.factory_id, run.registry_version, run.registry_digest, run.registry_entry_version, 0, expiry, run.run_id, now.toISOString()).run();
         if (result.meta.changes === 1) { selected = key; break; }
       }
       if (!selected) return null;
@@ -1075,8 +1077,9 @@ async function acquireLease(db: D1Database, run: Run, limits: ConcurrencyLimits,
 
 async function releaseLease(db: D1Database, run: Run): Promise<void> {
   if (run.lease_fence === null) throw new Error("lease_missing");
+  if (await db.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key='native-candidate:v1:launch'").bind(run.run_id).first()) throw new Error("native_capacity_held");
   const members = await db.prepare("SELECT COUNT(*) AS count FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence).first<{ count: number }>();
-  const result = await db.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?)").bind(run.run_id, run.lease_fence).run();
+  const result = await db.prepare("DELETE FROM factory_leases WHERE dispatch_id=? AND lease_key IN (SELECT lease_key FROM factory_lease_members WHERE reservation_id=?) AND NOT EXISTS (SELECT 1 FROM factory_steps n WHERE n.run_id=factory_leases.dispatch_id AND n.step_key='native-candidate:v1:launch')").bind(run.run_id, run.lease_fence).run();
   if ((members?.count ?? 0) !== result.meta.changes) throw new Error("lease_fenced");
   await db.batch([
     db.prepare("DELETE FROM factory_lease_members WHERE reservation_id=?").bind(run.lease_fence),
@@ -1188,10 +1191,44 @@ function dispatchJob(value: unknown): DispatchJob | null {
   return { kind: "dispatch", dispatchId: item.dispatchId, runId: item.runId, contractDigest: item.contractDigest, contract: item.contract as Contract };
 }
 
+/** Trusted reconciler seam; observations cannot publish, retry or release capacity. */
+async function reconcileNativeAttempt(db: D1Database, runId: string): Promise<string> {
+  const observation = await readNativeAttempt(db, runId);
+  if (!observation || !observation.claimed) return "unclaimed";
+  const run = await runById(db, runId);
+  if (!run || run.lease_fence !== observation.intent.run.lease_fence) return "fenced";
+  if (!["running", "needs-human"].includes(run.current_state)) return "state-held";
+  await transitionRun(db, runId, "needs-human", "reconciler", `native:hold:${observation.intentDigest}`, {
+    leaseFence: observation.intent.run.lease_fence,
+    result: { reason: observation.reason, native_attempt_id: observation.intent.attemptId,
+      native_intent_digest: observation.intentDigest, native_receipt_digest: observation.receiptDigest,
+      usage_status: "UNKNOWN", publication_allowed: false },
+  });
+  return "needs-human";
+}
+
+/** No live transport: compose the existing mock delivery with canonical readback.
+ * Finally also covers loss of acknowledgment after the durable launch claim.
+ */
+async function deliverAndReconcileNativeMock(...args: Parameters<typeof deliverMockAttempt>) {
+  const runId = args[1].run.run_id;
+  let delivery;
+  let canonicalDisposition;
+  try { delivery = await deliverMockAttempt(...args); }
+  finally { canonicalDisposition = await reconcileNativeAttempt(args[0], runId); }
+  return { ...delivery, canonicalDisposition };
+}
+
 async function recoverStaleLeases(env: Env): Promise<void> {
   const now = new Date().toISOString();
   const rows = await env.DB.prepare("SELECT run_id,repository,collision_group,lease_fence,current_state,workflow_id FROM factory_runs WHERE current_state IN ('leased','running','validating') AND lease_fence IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY updated_at,run_id LIMIT 16").bind(now).all<{ run_id: string; repository: string; collision_group: string; lease_fence: number; current_state: string; workflow_id: string | null }>();
   for (const row of rows.results ?? []) {
+    // Native claims are not stopped-state proof. Retain expired capacity even
+    // when the result is missing or malformed; the adapter cannot release it.
+    if (await env.DB.prepare("SELECT 1 FROM factory_steps WHERE run_id=? AND step_key='native-candidate:v1:launch'").bind(row.run_id).first()) {
+      await reconcileNativeAttempt(env.DB, row.run_id);
+      continue;
+    }
     const targetState = row.current_state === "leased" ? "queued" : "needs-human";
     const reason = row.current_state === "leased" && row.workflow_id === null ? "stale_lease_requeued" : "stale_workflow_lease";
     const actor: TransitionActor = targetState === "queued" ? "reconciler" : row.current_state === "validating" ? "validator" : "reconciler";
@@ -2230,6 +2267,8 @@ export class ExecutionWorkflow extends WorkflowEntrypoint<Env, Job> {
 // These pure boundaries are exported only for local Worker-runtime tests. They
 // are not attached to the public fetch surface.
 export const __TEST_ONLY__ = {
+  reconcileNativeAttempt,
+  deliverAndReconcileNativeMock,
   sandboxCredentials,
   sandboxRemote,
   trustedSource,

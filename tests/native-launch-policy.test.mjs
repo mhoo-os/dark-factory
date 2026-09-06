@@ -66,3 +66,20 @@ for(const mutate of [p=>p.filesystem['/arbitrary']='write',p=>p.filesystem['/var
 for(const [field,bad] of [['model','gpt-5.5;sh'],['environmentId','personal-home']])test('reject arbitrary '+field,()=>{
   const value=input();value[field]=bad;assert.throws(()=>buildNativeLaunchPlan(value,NOW),/native_launch_policy_refused/);
 });
+
+for (const field of ['requestDigest', 'mockPin']) {
+  test('signed JSON intent rejects array digest: '+field, () => {
+    const value=input(); value.intent[field]=[value.intent[field]]; resign(value);
+    assert.throws(()=>buildNativeLaunchPlan(JSON.parse(JSON.stringify(value)),NOW),/native_launch_policy_refused/);
+  });
+}
+for (const field of ['model', 'environmentId']) {
+  test('JSON proposal rejects array selector: '+field, () => {
+    const value=input(); value[field]=[value[field]];
+    assert.throws(()=>buildNativeLaunchPlan(JSON.parse(JSON.stringify(value)),NOW),/native_launch_policy_refused/);
+  });
+}
+test('signed JSON intent rejects array result head', () => {
+  const value=input(); value.intent.run.head_sha=['e'.repeat(40)]; resign(value);
+  assert.throws(()=>buildNativeLaunchPlan(JSON.parse(JSON.stringify(value)),NOW),/native_launch_policy_refused/);
+});

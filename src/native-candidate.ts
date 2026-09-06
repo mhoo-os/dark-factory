@@ -156,3 +156,49 @@ export async function deliverMockAttempt(db: D1Database, input: NativeIntent, ru
   await insert(db,intent,"receipt:"+receiptDigest,receipt,clock(),false);
   return { disposition, receiptDigest, publicationAllowed: false };
 }
+
+/** Canonical readback only; never accepts a runner-supplied receipt or verdict.
+ * A launch claim without a durable result is ambiguous, including a crash before
+ * spawn. Even a stopped mock candidate has no verified subscription accounting.
+ */
+export async function readNativeAttempt(db: D1Database, runId: string): Promise<{
+  intent: NativeIntent; intentDigest: string; claimed: boolean;
+  reason: string; receiptDigest: string | null; publicationAllowed: false;
+} | null> {
+  const stored = await step(db,runId,"intent");
+  const launch = await step(db,runId,"launch");
+  if (!stored && !launch) return null;
+  try {
+    if (!stored || stored.result_json.length > 16384) throw new Error();
+    const intent: NativeIntent = JSON.parse(stored.result_json);
+    if (intent.mode !== "mock-only" || intent.attempt !== 0 || intent.run.run_id !== runId
+      || !Number.isSafeInteger(intent.run.lease_fence) || intent.run.lease_fence < 1
+      || intent.attemptId !== await hash(runId+":native-candidate:v1:0")) throw new Error();
+    const intentDigest = await hash(stored.result_json);
+    const result = { intent, intentDigest, claimed: Boolean(launch), reason: "native_unclaimed",
+      receiptDigest: null as string | null, publicationAllowed: false as const };
+    if (!launch) return result;
+    if (launch.result_json !== JSON.stringify({attemptId:intent.attemptId,intentDigest})) throw new Error();
+    const rows = await db.prepare("SELECT step_key,result_json FROM factory_steps WHERE run_id=? AND step_key LIKE ? ORDER BY step_key LIMIT 2")
+      .bind(runId,PREFIX+"receipt:%").all<{step_key: string; result_json: string}>();
+    if (rows.results.length !== 1) return {...result,reason:"native_delivery_ambiguous"};
+    const row = rows.results[0];
+    if (row.result_json.length > 32768) throw new Error();
+    const receiptDigest = await hash(row.result_json);
+    if (row.step_key !== PREFIX+"receipt:"+receiptDigest) throw new Error();
+    const receipt = JSON.parse(row.result_json);
+    if (JSON.stringify(receipt.intent) !== stored.result_json || receipt.launchDigest !== await hash(launch.result_json)
+      || receipt.publicationAllowed !== false || !Number.isSafeInteger(receipt.observedAt)
+      || !["mock-candidate-recorded","quarantined"].includes(receipt.disposition)
+      || !["candidate","failed","ambiguous","cancelled","expired"].includes(receipt.result?.status)
+      || typeof receipt.result.resultDigest !== "string" || !DIGEST.test(receipt.result.resultDigest)
+      || typeof receipt.result.processStopped !== "boolean" || receipt.result.usage !== null
+      || receipt.result.usageStatus !== "UNKNOWN") throw new Error();
+    const reason = !receipt.result.processStopped ? "native_stop_unconfirmed"
+      : receipt.disposition === "quarantined" ? "native_result_quarantined" : "native_accounting_unverified";
+    return {...result,reason,receiptDigest};
+  } catch {
+    // No raw stored bytes or parser error enters logs or canonical state.
+    throw new Error("native_readback_invalid");
+  }
+}
