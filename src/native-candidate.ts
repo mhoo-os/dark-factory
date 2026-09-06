@@ -1,6 +1,6 @@
 /** Source-only mock seam. No route, scheduler, credential, publisher or retry owner. */
 const PREFIX = "native-candidate:v1:";
-const MOCK_PIN = "ba81c1b65d13a573144acda2708f57d870eb176b647715b7d86c294d7f71ef88";
+const MOCK_PIN = "650d0fa2417190dbda426fb89cd1a28d157a0831646a7ec62d657b8ae866e5b2";
 const SHA = /^[0-9a-f]{40}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
 

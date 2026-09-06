@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const MOCK_FIXTURE_SHA256 = 'ba81c1b65d13a573144acda2708f57d870eb176b647715b7d86c294d7f71ef88';
+export const MOCK_FIXTURE_SHA256 = '650d0fa2417190dbda426fb89cd1a28d157a0831646a7ec62d657b8ae866e5b2';
 const fixture = fileURLToPath(new URL('../tests/fixtures/native-codex-mock.mjs', import.meta.url));
 const modes = new Set(['candidate', 'malformed', 'malformed-shape', 'oversized', 'stderr-oversized', 'failed', 'hang', 'stubborn', 'descendant', 'orphan', 'launch-failure']);
 const MAX_OUTPUT = 65536;

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { installNativeClock } from './helpers/native-clock.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
@@ -193,14 +194,15 @@ test('caller mutation during await cannot retarget persisted intent',async()=>{
   assert.equal(result.disposition,'mock-candidate-recorded');assert.deepEqual(receipts(f.raw)[0].intent,original);
 });
 
-test('real disposable mock process produces a persisted pin-bound receipt through the D1 seam',async()=>{
+test('real disposable mock process produces a persisted pin-bound receipt through the D1 seam',{timeout:15000},async t=>{
+  const clock=installNativeClock(t);
   const f=fixture(),now=Date.now();
   const expiry=new Date(now+60_000).toISOString();
   f.raw.prepare('UPDATE factory_runs SET lease_expires_at=?').run(expiry);
   f.raw.prepare('UPDATE factory_leases SET expires_at=?').run(expiry);
   const intent=await reserveMockAttempt(f.db,{...f.request,deadlineMs:now+2000},now);
   assert.equal(intent.mockPin,MOCK_FIXTURE_SHA256);
-  const result=await deliverMockAttempt(f.db,intent,runMockCandidate,async()=>true);
+  const result=await deliverMockAttempt(f.db,intent,options=>runMockCandidate({...options,signal:clock.signal}),async()=>true);
   assert.equal(result.disposition,'mock-candidate-recorded');assert.equal(result.publicationAllowed,false);
   const [receipt]=receipts(f.raw);assert.equal(JSON.stringify(receipt.intent),JSON.stringify(intent));
   assert.equal(receipt.result.processStopped,true);assert.equal(receipt.result.usage,null);

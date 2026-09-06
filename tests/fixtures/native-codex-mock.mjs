@@ -21,6 +21,7 @@ else if (mode === 'failed') process.exitCode = 7;
 else if (mode === 'hang') setInterval(() => {}, 1000);
 else if (mode === 'stubborn') {
   process.on('SIGTERM', () => {});
+  process.stderr.write('stubborn-ready\n');
   setInterval(() => {}, 1000);
 }
 else if (mode === 'descendant' || mode === 'orphan') {
