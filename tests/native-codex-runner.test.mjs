@@ -1,4 +1,4 @@
-import test, { mock } from 'node:test';
+import nodeTest, { beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -7,11 +7,49 @@ import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { runMockCandidate, MOCK_FIXTURE_SHA256 } from '../native/mock-codex-runner.mjs';
 
-const options = overrides => ({ attemptId: 'attempt_1', deadlineMs: Date.now() + 2000, checkCurrentGrant: () => true, ...overrides });
+import { installNativeClock } from './helpers/native-clock.mjs';
+
+// The real watchdog fails hung tests and aborts their runner during teardown.
+const test = (name, fn) => nodeTest(name, { timeout: 15000 }, fn);
+let clock;
+beforeEach(t => { clock = installNativeClock(t); });
+
+// Synchronize on evidence that the child reached the behavior being tested.
+function onFixtureReady(marker, action) {
+  const originalSpawn = childProcess.spawn;
+  mock.method(childProcess, 'spawn', (...args) => {
+    const child = originalSpawn(...args);
+    let text = '';
+    child.stderr.on('data', chunk => {
+      text += chunk;
+      if (text.includes(marker)) { text = ''; action(); }
+    });
+    return child;
+  });
+  syncBuiltinESMExports();
+}
+
+const options = overrides => ({ attemptId: 'attempt_1', signal: clock.signal, deadlineMs: Date.now() + 2000, checkCurrentGrant: () => true, ...overrides });
 
 test('mock fixture is pinned to exact SHA256', async () => {
   const bytes = await readFile(new URL('./fixtures/native-codex-mock.mjs', import.meta.url));
   assert.equal(createHash('sha256').update(bytes).digest('hex'), MOCK_FIXTURE_SHA256);
+});
+
+test('slow preflight beyond two wall seconds does not consume logical deadline', async () => {
+  const originalRead = fs.readFile;
+  const logicalStart = Date.now();
+  mock.method(fs, 'readFile', async (...args) => {
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    return originalRead(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const result = await runMockCandidate(options());
+    assert.equal(Date.now(), logicalStart);
+    assert.equal(result.status, 'candidate');
+    assert.equal(result.processStopped, true);
+  } finally { mock.restoreAll(); syncBuiltinESMExports(); }
 });
 
 test('candidate observation is deterministic and usage remains unknown', async () => {
@@ -60,21 +98,36 @@ async function assertStoppedGroup(run) {
 
 test('cancellation kills ordinary descendants and confirms the group is gone', async () => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 180);
+  onFixtureReady('descendant:', () => controller.abort());
   try {
     const result = await assertStoppedGroup(() => runMockCandidate(options({ testMode: 'descendant', signal: controller.signal })));
     assert.equal(result.status, 'cancelled');
-  } finally { clearTimeout(timer); }
+  } finally { mock.restoreAll(); syncBuiltinESMExports(); }
 });
 
 test('expiry kills ordinary descendants and confirms the group is gone', async () => {
-  const result = await assertStoppedGroup(() => runMockCandidate(options({ testMode: 'descendant', deadlineMs: Date.now() + 180 })));
-  assert.equal(result.status, 'expired');
+  onFixtureReady('descendant:', () => clock.expire());
+  try {
+    const result = await assertStoppedGroup(() => runMockCandidate(options({ testMode: 'descendant' })));
+    assert.equal(result.status, 'expired');
+    assert.equal(result.reason, 'deadline');
+    assert.equal(result.headSha, null);
+  } finally { mock.restoreAll(); syncBuiltinESMExports(); }
 });
 
 test('a mock process ignoring SIGTERM is killed with SIGKILL', async () => {
-  const result = await assertStoppedGroup(() => runMockCandidate(options({ testMode: 'stubborn', deadlineMs: Date.now() + 180 })));
-  assert.equal(result.status, 'expired');
+  onFixtureReady('stubborn-ready', () => clock.expire());
+  const originalKill = process.kill;
+  let killed = false;
+  mock.method(process, 'kill', (pid, signal) => {
+    if (signal === 'SIGKILL') killed = true;
+    return originalKill.call(process, pid, signal);
+  });
+  try {
+    const result = await assertStoppedGroup(() => runMockCandidate(options({ testMode: 'stubborn' })));
+    assert.equal(result.status, 'expired');
+    assert.equal(killed, true, 'ready SIGTERM-ignoring fixture required SIGKILL');
+  } finally { mock.restoreAll(); syncBuiltinESMExports(); }
 });
 
 test('mock environment omits inherited values and has empty home directories', async () => {
@@ -179,7 +232,7 @@ test('cancellation during the initial grant check prevents launch', async () => 
 });
 
 test('deadline during initial grant timeout is expired', async () => {
-  const result = await runMockCandidate(options({ deadlineMs: Date.now() + 30, checkCurrentGrant: () => new Promise(() => {}) }));
+  const result = await runMockCandidate(options({ checkCurrentGrant: () => { clock.advance(); return new Promise(() => {}); } }));
   assert.equal(result.status, 'expired');
 });
 
