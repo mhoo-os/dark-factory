@@ -296,3 +296,50 @@ test("scheduler isolates an unready registry without suppressing existing recove
   assert.match(index, /chat_lane_registry_recovery_failed/);
   assert.match(index, /await recoverStaleLeases\(env\);/);
 });
+
+// MHO-253: synthetic reader + existing lane API, no review/model publication.
+const {readReviewPair}=await import('../src/review-pair.ts');
+const migration9=await readFile(new URL('../migrations/0009_review_result_receipts.sql',import.meta.url),'utf8');
+const reviewRequest=()=>({review_request_version:'mho253-v1',repository:'mhoo-os/dark-factory',pr_number:34,
+  linear_issue_id:'MHO-253',target_head_sha:'a'.repeat(40),review_id:'MHOO-native-review-request-1',
+  canonical_run_id:'run-253',canonical_fence:1,contract_digest:'sha256:'+'b'.repeat(64),prior_review_id:null});
+const reviewApi=(d1,path,payload)=>handleChatLaneRequest(new Request('https://example.test'+path,{method:'POST',body:JSON.stringify(payload)}),d1);
+for(const verdict of ['PASS','REQUEST CHANGES']) test('synthetic paired reviewer returns independent '+verdict+' and immutable receipt',async()=>{
+  const database=db();database.exec(migration9);const d1=new D1(database),request=reviewRequest();
+  const input={lane_type:'review',idempotency_key:'new-review',assignment:request};
+  const allocated=await reviewApi(d1,'/chat-lanes/lease',input); assert.equal(allocated.status,201);
+  const lease=await allocated.json();assert.ok(lease.request_digest);assert.equal('verdict' in JSON.parse(database.prepare('SELECT assignment_json FROM chat_lane_assignments').get().assignment_json),false);
+  const duplicate=await (await reviewApi(d1,'/chat-lanes/lease',input)).json();assert.equal(duplicate.assignment_id,lease.assignment_id);
+  const lurl='https://linear.app/mhoo/issue/MHO-253/review#comment-00000000-0000-4000-8000-000000000001',gurl='https://github.com/mhoo-os/dark-factory/pull/34#issuecomment-1';
+  const packet={...request,request_digest:lease.request_digest,verdict,findings:verdict==='PASS'?[]:[{id:'fix-one',severity:'High'}],digest:'sha256:'+'c'.repeat(64)};
+  const adapter={readPair:async()=>({linear:{...packet,author_id:'reviewer-l',url:lurl,peer_url:gurl},github:{...packet,author_id:'reviewer-g',url:gurl,peer_url:lurl}})};
+  const assessed=await readReviewPair({request,requestDigest:lease.request_digest,trustedAuthors:{linear:'reviewer-l',github:'reviewer-g'},currentHead:request.target_head_sha,currentRunId:request.canonical_run_id,currentContractDigest:request.contract_digest,currentFence:1,stopped:false,nowMs:1,deadlineMs:2,completedRepairRounds:0,maxRepairRounds:3,remainingCostUsd:1,authorizedBlockerIds:['fix-one']},adapter);
+  assert.equal(assessed.liveExecutionAllowed,false);assert.equal(assessed.publicationAllowed,false);assert.equal(assessed.mergeAllowed,false);
+  const path='/chat-lane-assignments/'+lease.assignment_id;
+  assert.equal((await reviewApi(d1,path,{lease_token:lease.lease_token,status:'PUBLISHING'})).status,200);
+  const manifest={...request,...assessed,verification:{method:'authenticated_operator_v1',attested_by:'operator-1',attested_at:'2026-09-06T00:00:00.000Z'}};
+  const completion={lease_token:lease.lease_token,status:'COMPLETED',completion_manifest:manifest,linear_output_url:lurl,github_output_url:gurl,output_digest:'sha256:'+'d'.repeat(64)};
+  for(const key of ['request_digest','canonical_run_id','canonical_fence','contract_digest','prior_review_id']) {
+    const bad=await reviewApi(d1,path,{...completion,completion_manifest:{...manifest,[key]:'wrong'}});assert.equal(bad.status,422);
+  }
+  for(const key of ['linear_digest','github_digest'])assert.equal((await reviewApi(d1,path,{...completion,completion_manifest:{...manifest,[key]:'bad'}})).status,422);
+  assert.equal((await reviewApi(d1,path,completion)).status,200);
+  const stored=JSON.parse(database.prepare('SELECT completion_manifest_json FROM chat_lane_assignments').get().completion_manifest_json);
+  assert.equal(stored.verdict,verdict);assert.equal(stored.request_digest,lease.request_digest);assert.equal(stored.linear_digest,packet.digest);
+  assert.equal((await reviewApi(d1,path,completion)).status,409);
+  assert.equal(database.prepare("SELECT count(*) AS n FROM chat_lane_events WHERE event_type='COMPLETED'").get().n,1);
+  for(const sql of ["UPDATE chat_lane_assignments SET completion_manifest_json='{}'","UPDATE chat_lane_assignments SET assignment_json='{}'","DELETE FROM chat_lane_assignments"])assert.throws(()=>database.exec(sql),/immutable/);
+  database.exec('PRAGMA recursive_triggers=OFF');
+  assert.throws(()=>database.exec('INSERT OR REPLACE INTO chat_lane_assignments SELECT * FROM chat_lane_assignments'),/immutable/);
+  const row=database.prepare('SELECT * FROM chat_lane_assignments').get();row.assignment_id='different-id';
+  assert.throws(()=>database.prepare('INSERT OR REPLACE INTO chat_lane_assignments ('+Object.keys(row).join(',')+') VALUES ('+Object.keys(row).map(()=>'?').join(',')+')').run(...Object.values(row)),/immutable/);
+});
+test('request-mode needs migration and refuses preselected verdict or unknown version',async()=>{
+  const database=db(),d1=new D1(database);
+  await assert.rejects(reviewApi(d1,'/chat-lanes/lease',{lane_type:'review',idempotency_key:'unready',assignment:reviewRequest()}),/review_receipts_unready/);
+  database.exec(migration9);
+  await assert.rejects(reviewApi(d1,'/chat-lanes/lease',{lane_type:'planning',idempotency_key:'invalid',assignment:reviewRequest()}),/review_lane_required/);
+  for(const edit of [{prior_review_id:'MHOO-native-review-request-1'},{verdict:'PASS'},{review_request_version:'future'},{canonical_fence:0},{prior_review_id:'bad'},{contract_digest:'bad'},{canonical_run_id:''}]) {
+    await assert.rejects(reviewApi(d1,'/chat-lanes/lease',{lane_type:'review',idempotency_key:'invalid',assignment:{...reviewRequest(),...edit}}));
+  }
+});
