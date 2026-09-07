@@ -46,6 +46,8 @@ These are historical routing pointers. Check the subsequent explicit handoff
 before using them. The [README evidence snapshot](README.md#evidence-snapshot--2026-09-07)
 records the existing PR heads and remaining gates.
 
+Before continuation or handoff, record the primary issue (or explicitly none), implementation-owning repository, coordinating repo head and retained worker (or none), exact source commit and PR/evidence links, existing run-ledger location, dependencies/blockers and their owners (or explicitly none/unknown), and the authorized next step. Carry this mapping into the handoff and acknowledge the authoritative instructions commit and reading path. Resolve unknown or conflicting ownership with the owning head before dependent work; a project label or issue status does not grant authority or create a new task.
+
 ## Verification and evidence
 
 Use the exact commands in [package.json](package.json) and
