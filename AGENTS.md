@@ -1,8 +1,14 @@
 # Working in dark-factory
 
 Read `README.md`, `FACTORY.md`, `FACTORY_RULES.md`, and the relevant contract in
-`docs/` before changing factory behavior. This repository owns bounded,
-issue-driven factory source; it does not create authority by itself.
+`docs/` before touching retained factory behavior. ADR-0017 in `mhoo-os/mhoo`
+marks this repository superseded by Delivery Room. Preserve it as historical
+source and evidence; do not add new target behavior here.
+
+- Before changing existing controls, classify the work as retained evidence,
+  a bounded extraction into Delivery Room with exact provenance, or a repair
+  needed to preserve current custody. Do not silently resume factory product
+  development or archive/delete source.
 
 - Preserve deterministic admission, the trusted Factory Registry, explicit
   dispatch contracts, stop controls, leases, ledger evidence, idempotency, and
